@@ -1,0 +1,18 @@
+{
+  "name": "elenko",
+  "version": "1.0.0",
+  "description": "Elenko – Node.js app with CouchDB, profiles for Elenko databases",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "express-session": "^1.18.0",
+    "nano": "^11.0.4"
+  }
+}

@@ -1,0 +1,34 @@
+services:
+  couchdb:
+    image: couchdb:3.3
+    container_name: elenko-couchdb
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: admin
+    ports:
+      - "5984:5984"
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+      - ./couchdb/local.d/10-single-node.ini:/opt/couchdb/etc/local.d/10-single-node.ini
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5984/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  app:
+    build: .
+    container_name: elenko-app
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      COUCHDB_URL: http://admin:admin@couchdb:5984
+      COUCHDB_DB: elenko
+    depends_on:
+      couchdb:
+        condition: service_healthy
+
+volumes:
+  couchdb_data:
