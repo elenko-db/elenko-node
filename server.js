@@ -14,6 +14,8 @@ const COUCHDB_DB = process.env.COUCHDB_DB || "elenko";
 const IO_DIR = process.env.IO_DIR || path.join(__dirname, "io");
 const MAX_ENTRIES_PER_PROFILE = 500000;
 const ENTRIES_PAGE_SIZE = 25;
+const SORT_KEY_SPECIAL = ["createdAt", "updatedAt"];
+const SORT_KEY_FIELDS_MAX = 3;
 
 const DEFAULT_ENTRY_VIEW_THEME = {
   background: "#0f1419",
@@ -126,6 +128,20 @@ function escapeRegex(s) {
   return String(s).replace(/[\\^$.*+?()|[\]{}]/g, "\\$&");
 }
 
+function buildSortKey(record, sortKeyFields) {
+  if (!Array.isArray(sortKeyFields) || sortKeyFields.length === 0) return [];
+  const out = [];
+  for (let i = 0; i < Math.min(sortKeyFields.length, SORT_KEY_FIELDS_MAX); i++) {
+    const f = sortKeyFields[i];
+    if (!f || typeof f !== "string" || !f.trim()) continue;
+    let key = f.trim();
+    if (key === "_createdAt") key = "createdAt";
+    if (key === "_updatedAt") key = "updatedAt";
+    out.push(record[key] != null ? String(record[key]) : "");
+  }
+  return out;
+}
+
 const PBKDF2_ITERATIONS = 100000;
 const SALT_LEN = 16;
 const KEY_LEN = 32;
@@ -188,6 +204,31 @@ function requireEditor(req, res, next) {
 
 let db;
 
+const profileListCache = new Map();
+const searchListCache = new Map();
+const SEARCH_CACHE_KEY_SEP = "::";
+
+function clearProfileListCache(profileId) {
+  if (profileId) {
+    profileListCache.delete(profileId);
+    clearSearchListCache(profileId);
+  } else {
+    profileListCache.clear();
+    searchListCache.clear();
+  }
+}
+
+function clearSearchListCache(profileId) {
+  if (!profileId) {
+    searchListCache.clear();
+    return;
+  }
+  const prefix = profileId + SEARCH_CACHE_KEY_SEP;
+  for (const key of searchListCache.keys()) {
+    if (key.startsWith(prefix)) searchListCache.delete(key);
+  }
+}
+
 async function initCouch() {
   const client = nano(COUCHDB_URL);
   const dbName = COUCHDB_DB;
@@ -217,6 +258,16 @@ async function initCouch() {
     await db.createIndex({
       index: { fields: ["type", "profileId", "_id"] },
       name: "records-by-profile-id",
+    });
+  } catch (e) {
+    // Index may already exist
+  }
+
+  // Index for sorting entries by sortKey (profile's sort key fields)
+  try {
+    await db.createIndex({
+      index: { fields: ["type", "profileId", "sortKey"] },
+      name: "records-by-profile-sortkey",
     });
   } catch (e) {
     // Index may already exist
@@ -802,6 +853,11 @@ app.post("/api/import-profile", requireAdmin, async (req, res) => {
         offset += len;
         entry[fieldNames[i]] = part.trim();
       }
+      const now = new Date().toISOString();
+      entry.createdAt = now;
+      entry.updatedAt = now;
+      const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
+      entry.sortKey = buildSortKey(entry, sortKeyFields);
       docs.push(entry);
       sendFlowMessage("profile.import.line", {
         profileId,
@@ -858,7 +914,7 @@ app.get("/profile/:id/edit", requireAdmin, async (req, res) => {
 app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
   try {
     const id = req.params.id;
-    const { _rev, name, description, fieldNames, customCss, entryFormId, theme } = req.body || {};
+    const { _rev, name, description, fieldNames, customCss, entryFormId, theme, sortKeyFields: rawSortKeyFields, sortDirection } = req.body || {};
     if (!_rev || !name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name and _rev are required" });
     }
@@ -875,13 +931,94 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
     doc.fieldNames = fields;
     doc.entryFormId = entryFormId != null && typeof entryFormId === "string" ? entryFormId.trim() : "";
     doc.theme = normalizeProfileTheme(theme);
+    const sortKeyFields = Array.isArray(rawSortKeyFields)
+      ? rawSortKeyFields
+          .filter((f) => typeof f === "string" && f.trim())
+          .slice(0, SORT_KEY_FIELDS_MAX)
+          .map((f) => f.trim())
+          .filter((f) => fields.includes(f) || SORT_KEY_SPECIAL.includes(f))
+      : [];
+    doc.sortKeyFields = sortKeyFields;
+    doc.sortDirection = sortDirection === "desc" ? "desc" : "asc";
     const result = await db.insert(doc);
+    clearProfileListCache(id);
     res.json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
     if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict; refresh and try again" });
     if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
     console.error("Error updating profile:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/profiles/:id/rebuild-sort-keys", requireAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const doc = await db.get(id);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
+    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+    const result = await db.find({
+      selector: { type: "elenko_record", profileId: id },
+      limit: 50000,
+    });
+    const docs = result.docs || [];
+    const now = new Date().toISOString();
+    let updated = 0;
+    for (const rec of docs) {
+      if (!rec.createdAt) rec.createdAt = now;
+      rec.updatedAt = now;
+      rec.sortKey = buildSortKey(rec, sortKeyFields);
+      await db.insert(rec);
+      updated++;
+    }
+    clearProfileListCache(id);
+    res.json({ ok: true, updated });
+  } catch (err) {
+    console.error("Rebuild sort keys error:", err);
+    res.status(500).json({ error: err.message || "Rebuild failed" });
+  }
+});
+
+app.post("/api/profiles/:id/reassign-entries", requireAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const previousProfileId = typeof (req.body && req.body.previousProfileId) === "string" ? req.body.previousProfileId.trim() : "";
+    if (!previousProfileId) {
+      return res.status(400).json({ error: "previousProfileId is required" });
+    }
+    if (previousProfileId === id) {
+      return res.status(400).json({ error: "Previous profile ID is the same as current profile; nothing to reassign." });
+    }
+    const doc = await db.get(id);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
+    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+    const result = await db.find({
+      selector: { type: "elenko_record", profileId: previousProfileId },
+      limit: 50000,
+    });
+    const docs = result.docs || [];
+    const now = new Date().toISOString();
+    let reassigned = 0;
+    for (const rec of docs) {
+      rec.profileId = id;
+      if (!rec.createdAt) rec.createdAt = now;
+      rec.updatedAt = now;
+      rec.sortKey = buildSortKey(rec, sortKeyFields);
+      await db.insert(rec);
+      reassigned++;
+    }
+    clearProfileListCache(id);
+    clearProfileListCache(previousProfileId);
+    res.json({ ok: true, reassigned });
+  } catch (err) {
+    console.error("Reassign entries error:", err);
+    res.status(500).json({ error: err.message || "Reassign failed" });
   }
 });
 
@@ -913,7 +1050,13 @@ app.post("/api/profiles/:id/entries", requireEditor, async (req, res) => {
     for (const fn of fieldNames) {
       record[fn] = values[fn] != null ? String(values[fn]).trim() : "";
     }
+    const now = new Date().toISOString();
+    record.createdAt = now;
+    record.updatedAt = now;
+    const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
+    record.sortKey = buildSortKey(record, sortKeyFields);
     const result = await db.insert(record);
+    clearProfileListCache(profileId);
      sendFlowMessage("entry.created", { id: result.id, profileId, fields: fieldNames });
     res.status(201).json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
@@ -1043,7 +1186,13 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     for (const fn of fieldNames) {
       record[fn] = values[fn] != null ? String(values[fn]).trim() : "";
     }
+    const now = new Date().toISOString();
+    record.updatedAt = now;
+    if (!record.createdAt) record.createdAt = now;
+    const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
+    record.sortKey = buildSortKey(record, sortKeyFields);
     const result = await db.insert(record);
+    clearProfileListCache(profileId);
     res.json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).json({ error: "Entry not found" });
@@ -1083,6 +1232,7 @@ app.post("/api/deletions/:batchId/execute", requireAdmin, async (req, res) => {
       }
     }
     await db.destroy(batchId, batch._rev);
+    clearProfileListCache();
     res.json({ ok: true, deleted: entries.length });
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).json({ error: "Batch not found" });
@@ -1151,6 +1301,11 @@ app.get("/profile/:id", async (req, res) => {
       return res.status(404).send(renderErrorPage("Profile not found"));
     }
     const profileId = doc._id;
+    if (req.query.clearSearch) {
+      clearSearchListCache(profileId);
+      const profileBase = "/profile/" + encodeURIComponent(profileId);
+      return res.redirect(profileBase);
+    }
     const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const searchQuery = (req.query.q || "").trim();
@@ -1162,7 +1317,14 @@ app.get("/profile/:id", async (req, res) => {
       selector.$or = fieldNames.map((fn) => ({ [fn]: { $regex: pattern } }));
     }
 
+    const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
+    const useSortKey = sortKeyFields.length > 0;
+    const sortDirection = doc.sortDirection === "desc" ? "desc" : "asc";
+    const fieldsForFind = fieldNames.length ? ["_id", "_rev", "sortKey", ...fieldNames] : ["_id", "_rev", "sortKey"];
+    const SORT_FETCH_LIMIT = 50000;
+
     let totalPages = null;
+    let allDocs = [];
     if (!searchQuery) {
       try {
         const countResult = await db.view("records", "countByProfile", { key: profileId });
@@ -1173,14 +1335,79 @@ app.get("/profile/:id", async (req, res) => {
       }
     }
 
-    const recordsResult = await db.find({
-      selector,
-      fields: fieldNames.length ? ["_id", "_rev", ...fieldNames] : ["_id", "_rev"],
-      sort: [{ _id: "asc" }],
-      limit: ENTRIES_PAGE_SIZE + 1,
-      skip,
-    });
-    const allDocs = recordsResult.docs || [];
+    if (useSortKey && !searchQuery) {
+      const cacheKey = profileId;
+      const sortConfig = JSON.stringify({ sortKeyFields, sortDirection });
+      const cached = profileListCache.get(cacheKey);
+      if (cached && cached.sortConfig === sortConfig && Array.isArray(cached.docs)) {
+        totalPages = Math.max(1, Math.ceil(cached.docs.length / ENTRIES_PAGE_SIZE));
+        allDocs = cached.docs.slice(skip, skip + ENTRIES_PAGE_SIZE + 1);
+      } else {
+        const sortResult = await db.find({
+          selector,
+          fields: fieldsForFind,
+          limit: SORT_FETCH_LIMIT,
+        });
+        const fullDocs = sortResult.docs || [];
+        // Lexicographic comparison for all tiers (e.g. "01", "02", "10", "A01", "B02"); same direction for every level
+        const cmp = (a, b) => {
+          const sa = Array.isArray(a.sortKey) ? a.sortKey : [];
+          const sb = Array.isArray(b.sortKey) ? b.sortKey : [];
+          for (let i = 0; i < Math.max(sa.length, sb.length); i++) {
+            const va = sa[i] != null ? String(sa[i]) : "";
+            const vb = sb[i] != null ? String(sb[i]) : "";
+            const c = va.localeCompare(vb, undefined, { sensitivity: "base" });
+            if (c !== 0) return sortDirection === "desc" ? -c : c;
+          }
+          return 0;
+        };
+        fullDocs.sort(cmp);
+        profileListCache.set(cacheKey, { docs: fullDocs, sortConfig });
+        totalPages = Math.max(1, Math.ceil(fullDocs.length / ENTRIES_PAGE_SIZE));
+        allDocs = fullDocs.slice(skip, skip + ENTRIES_PAGE_SIZE + 1);
+      }
+    } else if (useSortKey && searchQuery) {
+      // Search with sort-key profile: use cached sorted docs or fetch, sort, cache, then paginate
+      const sortConfig = JSON.stringify({ sortKeyFields, sortDirection });
+      const searchCacheKey = profileId + SEARCH_CACHE_KEY_SEP + sortConfig + SEARCH_CACHE_KEY_SEP + searchQuery;
+      const cached = searchListCache.get(searchCacheKey);
+      if (cached && Array.isArray(cached.docs)) {
+        totalPages = Math.max(1, Math.ceil(cached.docs.length / ENTRIES_PAGE_SIZE));
+        allDocs = cached.docs.slice(skip, skip + ENTRIES_PAGE_SIZE + 1);
+      } else {
+        const sortResult = await db.find({
+          selector,
+          fields: fieldsForFind,
+          limit: SORT_FETCH_LIMIT,
+        });
+        const fullDocs = sortResult.docs || [];
+        const cmp = (a, b) => {
+          const sa = Array.isArray(a.sortKey) ? a.sortKey : [];
+          const sb = Array.isArray(b.sortKey) ? b.sortKey : [];
+          for (let i = 0; i < Math.max(sa.length, sb.length); i++) {
+            const va = sa[i] != null ? String(sa[i]) : "";
+            const vb = sb[i] != null ? String(sb[i]) : "";
+            const c = va.localeCompare(vb, undefined, { sensitivity: "base" });
+            if (c !== 0) return sortDirection === "desc" ? -c : c;
+          }
+          return 0;
+        };
+        fullDocs.sort(cmp);
+        searchListCache.set(searchCacheKey, { docs: fullDocs });
+        totalPages = Math.max(1, Math.ceil(fullDocs.length / ENTRIES_PAGE_SIZE));
+        allDocs = fullDocs.slice(skip, skip + ENTRIES_PAGE_SIZE + 1);
+      }
+    } else {
+      const recordsResult = await db.find({
+        selector,
+        fields: fieldsForFind,
+        sort: [{ _id: "asc" }],
+        limit: ENTRIES_PAGE_SIZE + 1,
+        skip,
+      });
+      allDocs = recordsResult.docs || [];
+      if (searchQuery && allDocs.length > 0) totalPages = null; // unknown total for search without sort key
+    }
     const records = allDocs.slice(0, ENTRIES_PAGE_SIZE);
     const hasNext = allDocs.length > ENTRIES_PAGE_SIZE;
     const hasPrev = page > 1;
@@ -1894,6 +2121,8 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .search-bar input[type="search"]:focus { outline: none; border-color: var(--profile-link, #58a6ff); }
     .search-bar .btn-search { padding: 0.5rem 0.75rem; background: var(--profile-table-header-bg, #21262d); color: var(--profile-link, #58a6ff); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
     .search-bar .btn-search:hover { background: #30363d; }
+    .search-bar .btn-clear { padding: 0.5rem 0.75rem; background: transparent; color: var(--profile-label, #8b949e); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
+    .search-bar .btn-clear:hover { background: #30363d; color: var(--profile-text, #e6edf3); }
     .pagination { margin-bottom: 1rem; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
     .pagination .btn-pag { display: inline-block; padding: 0.5rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.875rem; }
     .pagination .btn-pag-prev, .pagination .btn-pag-next { background: var(--profile-table-header-bg, #21262d); color: var(--profile-link, #58a6ff); }
@@ -1911,6 +2140,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     <input type="search" name="q" value="${escapeHtml(searchQuery)}" placeholder="Search entries…" aria-label="Search entries">
     <input type="hidden" name="page" value="1">
     <button type="submit" class="btn-search">Search</button>
+    ${searchQuery ? `<a href="${profileBase}?clearSearch=1" class="btn-clear">Clear</a>` : ""}
   </form>
   <div class="pagination">
     ${hasPrev ? `<a href="${prevUrl}" class="btn-pag btn-pag-prev">← Previous</a>` : `<span class="btn-pag btn-pag-prev disabled">← Previous</span>`}
@@ -2543,7 +2773,7 @@ function renderAllDocumentsPage(docs) {
             } else if (d.type === "elenko_record" && d.profileId) {
               const profile = profileMap[d.profileId];
               const profileName = profile ? (profile.name || d.profileId) : d.profileId;
-              summary = escapeHtml(profileName);
+              summary = escapeHtml(profileName) + " <span class=\"profile-id-hint\" title=\"Profile ID on this entry\">(ID: " + escapeHtml(d.profileId) + ")</span>";
             } else if (d.type === "elenko_entry_form") {
               summary = escapeHtml(d.name || "—");
             } else {
@@ -2586,6 +2816,7 @@ function renderAllDocumentsPage(docs) {
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
+    .profile-id-hint { font-size: 0.85em; color: #8b949e; font-weight: normal; }
   </style>
 </head>
 <body>
@@ -2755,6 +2986,15 @@ function renderEditProfilePage(doc, forms = []) {
   const entryFormOptions = (forms || [])
     .map((f) => `<option value="${escapeHtml(f._id)}" ${entryFormId === f._id ? "selected" : ""}>${escapeHtml(f.name || f._id)}</option>`)
     .join("");
+  const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
+  const sortDirectionValue = doc.sortDirection === "desc" ? "desc" : "asc";
+  function sortKeySelect(name, id, selected) {
+    const fieldOpts = fieldNames.map((fn) => `<option value="${escapeHtml(fn)}"${selected === fn ? " selected" : ""}>${escapeHtml(fn)}</option>`).join("");
+    return `<select id="${id}" name="${name}"><option value="">— None —</option>${fieldOpts}<option value="createdAt"${selected === "createdAt" ? " selected" : ""}>Creation date</option><option value="updatedAt"${selected === "updatedAt" ? " selected" : ""}>Update date</option></select>`;
+  }
+  const sortKeySelect1 = sortKeySelect("sortKeyField1", "sortKeyField1", sortKeyFields[0]);
+  const sortKeySelect2 = sortKeySelect("sortKeyField2", "sortKeyField2", sortKeyFields[1]);
+  const sortKeySelect3 = sortKeySelect("sortKeyField3", "sortKeyField3", sortKeyFields[2]);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2790,17 +3030,25 @@ function renderEditProfilePage(doc, forms = []) {
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
+  <div class="actions"><a href="/">← Profiles</a></div>
   <h1>Elenko</h1>
   <p class="sub">Edit profile</p>
+  <p class="sub" style="margin-bottom:0.5rem;"><strong>Profile ID:</strong> <code id="profile-id-value">${escapeHtml(doc._id)}</code> <button type="button" class="btn btn-secondary" id="copy-profile-id" style="padding:0.25rem 0.5rem;font-size:0.8rem;">Copy</button></p>
   <form id="edit-form">
     <input type="hidden" id="rev" name="_rev" value="${rev}">
     <label for="name">Name</label>
     <input type="text" id="name" name="name" required placeholder="Profile name" value="${name}">
     <label for="description">Description</label>
     <textarea id="description" name="description" placeholder="Optional description">${description}</textarea>
+    <label class="field-list-label">Field names</label>
+    <div class="field-list" id="field-list"></div>
+    <button type="button" class="btn btn-secondary" id="add-field">+ Add field</button>
     <label>Theme (colours)</label>
     <p class="sub" style="margin-top:0.25rem;">Colours for the full database (list) view: background, table, links, etc. Click the swatch to open the colour picker.</p>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem 1rem;margin-top:0.5rem;">
@@ -2823,9 +3071,26 @@ function renderEditProfilePage(doc, forms = []) {
       ${entryFormOptions}
     </select>
     <p class="sub" style="margin-top:0.25rem;">Optional. Choose a form to control colours and layout of the single-entry (read-only) view. <a href="${entryFormId ? "/entry-forms/" + encodeURIComponent(entryFormId) + "/edit" : "/entry-forms"}" id="entry-form-link" class="btn btn-secondary" style="display:inline-block;margin-top:0.25rem;">${entryFormId ? "Edit form" : "Entry forms"}</a></p>
-    <label class="field-list-label">Field names</label>
-    <div class="field-list" id="field-list"></div>
-    <button type="button" class="btn btn-secondary" id="add-field">+ Add field</button>
+    <label style="margin-top:1.5rem;">Sort key fields (up to 3)</label>
+    <p class="sub" style="margin-top:0.25rem;">Entry list is sorted by these fields in order (CouchDB index). Use profile fields or Creation/Update date.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:center;margin-top:0.5rem;">
+      <div><label for="sortKeyField1" style="margin:0;font-size:0.875rem;">1</label><br>${sortKeySelect1}</div>
+      <div><label for="sortKeyField2" style="margin:0;font-size:0.875rem;">2</label><br>${sortKeySelect2}</div>
+      <div><label for="sortKeyField3" style="margin:0;font-size:0.875rem;">3</label><br>${sortKeySelect3}</div>
+    </div>
+    <label for="sortDirection" style="margin-top:0.75rem;">Sort direction</label>
+    <select id="sortDirection" name="sortDirection">
+      <option value="asc"${sortDirectionValue === "asc" ? " selected" : ""}>Ascending</option>
+      <option value="desc"${sortDirectionValue === "desc" ? " selected" : ""}>Descending</option>
+    </select>
+    <p style="margin-top:0.5rem;"><button type="button" class="btn btn-secondary" id="rebuild-sort-keys-btn">Rebuild sort keys for existing entries</button> <span id="rebuild-msg"></span></p>
+    <label style="margin-top:1.5rem;">Recover entries</label>
+    <p class="sub" style="margin-top:0.25rem;">If entries show in All documents but not on this profile, they may have a different profile ID (e.g. after a restore). In <a href="/documents">All documents</a>, open an entry row and copy the ID in parentheses from the Summary column. Paste it below and click Reassign to attach those entries to this profile.</p>
+    <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;flex-wrap:wrap;">
+      <input type="text" id="previous-profile-id" placeholder="Paste previous profile ID" style="max-width:20rem;padding:0.5rem;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;">
+      <button type="button" class="btn btn-secondary" id="reassign-entries-btn">Reassign entries to this profile</button>
+      <span id="reassign-msg"></span>
+    </div>
     <div>
       <button type="submit" class="btn btn-primary">Save</button>
       <a href="/" class="btn btn-secondary" style="margin-left: 0.5rem;">Cancel</a>
@@ -2875,6 +3140,46 @@ function renderEditProfilePage(doc, forms = []) {
         entryFormLink.textContent = val ? 'Edit form' : 'Entry forms';
       });
     }
+    const rebuildBtn = document.getElementById('rebuild-sort-keys-btn');
+    const rebuildMsg = document.getElementById('rebuild-msg');
+    if (rebuildBtn && rebuildMsg) {
+      rebuildBtn.onclick = async () => {
+        rebuildMsg.textContent = '';
+        rebuildBtn.disabled = true;
+        try {
+          const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/rebuild-sort-keys', { method: 'POST' });
+          const data = await r.json();
+          if (r.ok) { rebuildMsg.textContent = 'Rebuilt ' + (data.updated || 0) + ' entries.'; rebuildMsg.style.color = '#3fb950'; }
+          else { rebuildMsg.textContent = data.error || 'Failed'; rebuildMsg.style.color = '#f85149'; }
+        } catch (e) { rebuildMsg.textContent = e.message || 'Request failed'; rebuildMsg.style.color = '#f85149'; }
+        rebuildBtn.disabled = false;
+      };
+    }
+    const copyProfileIdBtn = document.getElementById('copy-profile-id');
+    if (copyProfileIdBtn) {
+      copyProfileIdBtn.onclick = () => {
+        const el = document.getElementById('profile-id-value');
+        if (el) { navigator.clipboard.writeText(el.textContent).then(() => { copyProfileIdBtn.textContent = 'Copied'; setTimeout(() => { copyProfileIdBtn.textContent = 'Copy'; }, 1500); }); }
+      };
+    }
+    const reassignBtn = document.getElementById('reassign-entries-btn');
+    const reassignMsg = document.getElementById('reassign-msg');
+    const previousProfileIdInput = document.getElementById('previous-profile-id');
+    if (reassignBtn && reassignMsg && previousProfileIdInput) {
+      reassignBtn.onclick = async () => {
+        const prevId = previousProfileIdInput.value.trim();
+        if (!prevId) { reassignMsg.textContent = 'Enter the previous profile ID.'; reassignMsg.style.color = '#f85149'; return; }
+        reassignMsg.textContent = '';
+        reassignBtn.disabled = true;
+        try {
+          const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/reassign-entries', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ previousProfileId: prevId }) });
+          const data = await r.json();
+          if (r.ok) { reassignMsg.textContent = 'Reassigned ' + (data.reassigned || 0) + ' entries.'; reassignMsg.style.color = '#3fb950'; if ((data.reassigned || 0) > 0) setTimeout(() => window.location.href = '/profile/' + encodeURIComponent(profileId), 1500); }
+          else { reassignMsg.textContent = data.error || 'Failed'; reassignMsg.style.color = '#f85149'; }
+        } catch (e) { reassignMsg.textContent = e.message || 'Request failed'; reassignMsg.style.color = '#f85149'; }
+        reassignBtn.disabled = false;
+      };
+    }
 
     function toHex6Sync(val) {
       const m = (val || '').trim().match(/^#?([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$/);
@@ -2919,7 +3224,7 @@ function renderEditProfilePage(doc, forms = []) {
         const r = await fetch('/api/profiles/' + encodeURIComponent(profileId), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ _rev, name, description, customCss, fieldNames, entryFormId: document.getElementById('entryFormId').value, theme })
+          body: JSON.stringify({ _rev, name, description, customCss, fieldNames, entryFormId: document.getElementById('entryFormId').value, theme, sortKeyFields: [document.getElementById('sortKeyField1').value, document.getElementById('sortKeyField2').value, document.getElementById('sortKeyField3').value].filter(Boolean), sortDirection: document.getElementById('sortDirection').value })
         });
         const data = await r.json();
         if (!r.ok) { msgEl.textContent = data.error || 'Failed'; msgEl.className = 'msg err'; return; }
