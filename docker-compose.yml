@@ -26,6 +26,12 @@ services:
       NODE_ENV: development
       COUCHDB_URL: http://admin:admin@couchdb:5984
       COUCHDB_DB: elenko
+      PORT: 3000
+      FLOW_LOG_FILE: /app/logs/flow.log
+    
+    volumes:
+      - ./logs:/app/logs
+
     depends_on:
       couchdb:
         condition: service_healthy
