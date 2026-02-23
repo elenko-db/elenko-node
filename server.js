@@ -1,6 +1,7 @@
+const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, ".env"), override: true });
 const crypto = require("crypto");
 const { Worker } = require("worker_threads");
-const path = require("path");
 const fs = require("fs");
 const express = require("express");
 const session = require("express-session");
@@ -11,6 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const COUCHDB_URL = process.env.COUCHDB_URL || "http://admin:admin@localhost:5984";
 const COUCHDB_DB = process.env.COUCHDB_DB || "elenko";
+const ELENKO_CONFIG_DB = process.env.ELENKO_CONFIG_DB || "elenko_config";
 const IO_DIR = process.env.IO_DIR || path.join(__dirname, "io");
 const MAX_ENTRIES_PER_PROFILE = 500000;
 const ENTRIES_PAGE_SIZE = 25;
@@ -97,7 +99,7 @@ function normalizeEntryFormDoc(body) {
     });
   const flowButtonEnabled = !!(body.flowButtonEnabled === true || body.flowButtonEnabled === "true");
   const flowTargetRaw = typeof body.flowTarget === "string" ? body.flowTarget.trim() : "";
-  const flowTarget = flowTargetRaw === "log" ? "log" : "log"; // only "log" for now; expand later
+  const flowTarget = flowTargetRaw === "localDb" ? "localDb" : flowTargetRaw === "api" ? "api" : "log";
   const flowButtonLabel = typeof body.flowButtonLabel === "string" ? body.flowButtonLabel.trim() : "";
   const flowButtonParam = typeof body.flowButtonParam === "string" ? body.flowButtonParam.trim() : "";
 
@@ -142,15 +144,99 @@ function buildSortKey(record, sortKeyFields) {
   return out;
 }
 
+function getProfileEntryFormIds(profileDoc) {
+  if (!profileDoc || typeof profileDoc !== "object") return [];
+  const fromArray = Array.isArray(profileDoc.entryFormIds) ? profileDoc.entryFormIds : [];
+  const cleaned = fromArray
+    .filter((id) => typeof id === "string" && id.trim())
+    .map((id) => id.trim());
+  const single = typeof profileDoc.entryFormId === "string" ? profileDoc.entryFormId.trim() : "";
+  if (single && !cleaned.includes(single)) cleaned.unshift(single);
+  return cleaned;
+}
+
+function getProfileDefaultEntryFormId(profileDoc) {
+  const ids = getProfileEntryFormIds(profileDoc);
+  return ids.length > 0 ? ids[0] : "";
+}
+
 const PBKDF2_ITERATIONS = 100000;
 const SALT_LEN = 16;
 const KEY_LEN = 32;
 
 let flowWorker;
+let apiWorker;
+
+function startApiWorker() {
+  const workerPath = path.join(__dirname, "apiWorker.js");
+  apiWorker = new Worker(workerPath);
+  apiWorker.on("error", (err) => {
+    console.error("API worker error:", err);
+  });
+  apiWorker.on("exit", (code) => {
+    if (code !== 0) {
+      console.error(`API worker exited with code ${code}`);
+    }
+  });
+  apiWorker.on("message", (msg) => {
+    if (msg.kind !== "apiResponse") return;
+    const { entryId, profileId, success, statusCode, body, error, responseTarget } = msg;
+    const bodyForLog = body != null ? (typeof body === "string" ? body : JSON.stringify(body)) : null;
+    const bodyTruncated = bodyForLog && bodyForLog.length > 2048 ? bodyForLog.slice(0, 2048) + "…[truncated]" : bodyForLog;
+    sendFlowMessage("api.response", {
+      entryId,
+      profileId,
+      success: !!success,
+      statusCode: statusCode ?? null,
+      body: bodyTruncated,
+      error: error ?? null,
+      responseTarget: responseTarget || "update",
+    });
+    (async () => {
+      try {
+        if (!configDb || !db) return;
+        const target = (responseTarget === "create" ? "create" : "update") || "update";
+        const now = new Date().toISOString();
+        const lastApiResponse = { statusCode: statusCode ?? null, body: body ?? null, ts: now, success: !!success, error: error ?? null };
+        if (target === "update") {
+          const record = await db.get(entryId);
+          if (!record || record.type !== "elenko_record" || record.profileId !== profileId) return;
+          record.lastApiResponse = lastApiResponse;
+          await db.insert(record);
+          clearProfileListCache(profileId);
+        } else {
+          const profile = await db.get(profileId);
+          if (!profile || profile.type !== "elenko_profile") return;
+          const fieldNames = Array.isArray(profile.fieldNames) ? profile.fieldNames : [];
+          const newRecord = {
+            type: "elenko_record",
+            profileId,
+            sourceDocId: entryId,
+            lastApiResponse,
+          };
+          for (const fn of fieldNames) {
+            newRecord[fn] = "";
+          }
+          newRecord.createdAt = now;
+          newRecord.updatedAt = now;
+          newRecord.sortKey = buildSortKey(newRecord, Array.isArray(profile.sortKeyFields) ? profile.sortKeyFields : []);
+          const profileFormIds = getProfileEntryFormIds(profile);
+          if (profileFormIds.length > 0) newRecord.entryFormId = profileFormIds[0];
+          await db.insert(newRecord);
+          clearProfileListCache(profileId);
+        }
+      } catch (err) {
+        console.error("API worker: apiResponse handling failed:", err);
+      }
+    })();
+  });
+}
 
 function startFlowWorker() {
   const workerPath = path.join(__dirname, "flowWorker.js");
-  flowWorker = new Worker(workerPath);
+  flowWorker = new Worker(workerPath, {
+    workerData: { envPath: path.join(__dirname, ".env") },
+  });
   flowWorker.on("error", (err) => {
     console.error("Flow worker error:", err);
   });
@@ -158,6 +244,112 @@ function startFlowWorker() {
     if (code !== 0) {
       console.error(`Flow worker exited with code ${code}`);
     }
+  });
+  flowWorker.on("message", (msg) => {
+    if (msg.kind === "callApi") {
+      const apiDocId = (msg.apiDocId != null ? String(msg.apiDocId) : "").trim();
+      if (!apiDocId || !apiWorker) {
+        if (!apiDocId) console.error("Flow worker: callApi missing apiDocId");
+        return;
+      }
+      (async () => {
+        try {
+          let apiDoc = null;
+          try {
+            apiDoc = await configDb.get(apiDocId);
+          } catch (e) {
+            if (e.statusCode !== 404) throw e;
+          }
+          if (!apiDoc || apiDoc.type !== "elenko_api") {
+            const byName = await configDb.find({ selector: { type: "elenko_api", name: apiDocId }, limit: 1 });
+            apiDoc = byName.docs && byName.docs[0];
+          }
+          if (!apiDoc || apiDoc.type !== "elenko_api") {
+            console.error("Flow worker: callApi API doc not found:", apiDocId);
+            return;
+          }
+          sendFlowMessage("api.request", {
+            apiDocId,
+            apiName: apiDoc.name,
+            entryId: msg.entryId,
+            profileId: msg.profileId,
+            url: apiDoc.url,
+            method: apiDoc.method || "GET",
+            responseTarget: apiDoc.responseTarget || "update",
+            dataset: msg.dataset,
+          });
+          let apiKey = null;
+          if (apiDoc.apiKeyRef && typeof apiDoc.apiKeyRef === "string" && apiDoc.apiKeyRef.trim()) {
+            try {
+              const keyDoc = await configDb.get(apiDoc.apiKeyRef.trim());
+              if (keyDoc && (keyDoc.key != null || keyDoc.value != null)) apiKey = keyDoc.key != null ? String(keyDoc.key) : String(keyDoc.value);
+            } catch (_) {}
+          }
+          apiWorker.postMessage({
+            kind: "apiRequest",
+            apiDoc: { url: apiDoc.url, method: apiDoc.method, responseTarget: apiDoc.responseTarget },
+            apiKey,
+            dataset: msg.dataset,
+            entryId: msg.entryId,
+            profileId: msg.profileId,
+          });
+        } catch (err) {
+          console.error("Flow worker: callApi failed:", err);
+        }
+      })();
+      return;
+    }
+    if (msg.kind !== "createEntryInProfile") return;
+    const targetProfileId = (msg.targetProfileId != null ? String(msg.targetProfileId) : "").trim();
+    if (!targetProfileId) {
+      console.error("Flow worker: createEntryInProfile missing targetProfileId");
+      return;
+    }
+    (async () => {
+      try {
+        let targetProfile = null;
+        try {
+          targetProfile = await db.get(targetProfileId);
+        } catch (e) {
+          if (e.statusCode !== 404) throw e;
+        }
+        if (!targetProfile || targetProfile.type !== "elenko_profile") {
+          const byName = await db.find({
+            selector: { type: "elenko_profile", name: targetProfileId },
+            limit: 1,
+          });
+          targetProfile = byName.docs && byName.docs[0];
+        }
+        if (!targetProfile || targetProfile.type !== "elenko_profile") {
+          console.error("Flow worker: createEntryInProfile target not found or not a profile:", targetProfileId);
+          return;
+        }
+        const resolvedProfileId = targetProfile._id;
+        const fieldNames = Array.isArray(targetProfile.fieldNames) ? targetProfile.fieldNames : [];
+        const dataset = msg.dataset && typeof msg.dataset === "object" ? msg.dataset : {};
+        const record = {
+          type: "elenko_record",
+          profileId: resolvedProfileId,
+          sourceDocId: msg.sourceDocId != null ? String(msg.sourceDocId) : "",
+        };
+        for (const fn of fieldNames) {
+          record[fn] = dataset[fn] != null ? String(dataset[fn]).trim() : "";
+        }
+        const now = new Date().toISOString();
+        record.createdAt = now;
+        record.updatedAt = now;
+        const sortKeyFields = Array.isArray(targetProfile.sortKeyFields) ? targetProfile.sortKeyFields : [];
+        record.sortKey = buildSortKey(record, sortKeyFields);
+        const profileFormIds = getProfileEntryFormIds(targetProfile);
+        if (profileFormIds.length > 0) {
+          record.entryFormId = profileFormIds[0];
+        }
+        await db.insert(record);
+        clearProfileListCache(resolvedProfileId);
+      } catch (err) {
+        console.error("Flow worker: createEntryInProfile failed:", err);
+      }
+    })();
   });
 }
 
@@ -203,6 +395,7 @@ function requireEditor(req, res, next) {
 }
 
 let db;
+let configDb;
 
 const profileListCache = new Map();
 const searchListCache = new Map();
@@ -242,6 +435,26 @@ async function initCouch() {
     }
   }
   db = client.db.use(dbName);
+
+  const configDbName = ELENKO_CONFIG_DB;
+  try {
+    await client.db.get(configDbName);
+  } catch (err) {
+    if (err?.statusCode === 404) {
+      await client.db.create(configDbName);
+    } else {
+      throw err;
+    }
+  }
+  configDb = client.db.use(configDbName);
+  try {
+    await configDb.createIndex({
+      index: { fields: ["type", "name"] },
+      name: "apis-by-type-name",
+    });
+  } catch (e) {
+    // Index may already exist
+  }
 
   // Ensure Mango index for querying and sorting profiles (sort requires index on sort fields)
   try {
@@ -720,6 +933,197 @@ app.put("/api/entry-forms/:id", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/api/apis", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const result = await configDb.find({
+      selector: { type: "elenko_api" },
+      fields: ["_id", "_rev", "name", "description", "url", "method"],
+      sort: [{ name: "asc" }],
+      limit: 500,
+    });
+    res.json({ apis: result.docs || [] });
+  } catch (err) {
+    console.error("Error loading APIs:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/apis", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    const result = await configDb.find({
+      selector: { type: "elenko_api" },
+      fields: ["_id", "name", "description", "url", "method"],
+      sort: [{ name: "asc" }],
+      limit: 500,
+    });
+    const apis = result.docs || [];
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderApisListPage(apis));
+  } catch (err) {
+    console.error("Error loading APIs:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/apis/create", requireAdmin, (req, res) => {
+  res.set("Content-Type", "text/html; charset=utf-8");
+  res.send(renderEditApiPage(null, null, req.originalUrl || "/apis/create"));
+});
+
+app.get("/apis/:id/edit", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    const doc = await configDb.get(req.params.id);
+    if (!doc || doc.type !== "elenko_api") {
+      return res.status(404).send(renderErrorPage("API not found"));
+    }
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderEditApiPage(doc, null, req.originalUrl || "/apis/" + encodeURIComponent(req.params.id) + "/edit"));
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("API not found"));
+    console.error("Error loading API:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/apis", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const body = req.body || {};
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return res.status(400).json({ error: "Name is required." });
+    const doc = {
+      type: "elenko_api",
+      name,
+      description: typeof body.description === "string" ? body.description.trim() : "",
+      url: typeof body.url === "string" ? body.url.trim() : "",
+      method: (body.method === "POST" || body.method === "PUT" || body.method === "PATCH") ? body.method : "GET",
+      apiKeyRef: typeof body.apiKeyRef === "string" ? body.apiKeyRef.trim() : "",
+      responseTarget: body.responseTarget === "create" ? "create" : "update",
+    };
+    const result = await configDb.insert(doc);
+    res.status(201).json({ ok: true, id: result.id, rev: result.rev });
+  } catch (err) {
+    console.error("Error creating API:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/apis/:id", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const doc = await configDb.get(id);
+    if (!doc || doc.type !== "elenko_api") {
+      return res.status(404).json({ error: "API not found" });
+    }
+    const body = req.body || {};
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return res.status(400).json({ error: "Name is required." });
+    doc.name = name;
+    doc.description = typeof body.description === "string" ? body.description.trim() : "";
+    doc.url = typeof body.url === "string" ? body.url.trim() : "";
+    doc.method = (body.method === "POST" || body.method === "PUT" || body.method === "PATCH") ? body.method : "GET";
+    doc.apiKeyRef = typeof body.apiKeyRef === "string" ? body.apiKeyRef.trim() : "";
+    doc.responseTarget = body.responseTarget === "create" ? "create" : "update";
+    const result = await configDb.insert(doc);
+    res.json({ ok: true, id: result.id, rev: result.rev });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "API not found" });
+    console.error("Error updating API:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/apis/:id/copy", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const doc = await configDb.get(id);
+    if (!doc || doc.type !== "elenko_api") {
+      return res.status(404).json({ error: "API not found" });
+    }
+    const copy = { ...doc };
+    delete copy._id;
+    delete copy._rev;
+    copy.name = "Copy of " + (doc.name || doc._id || "API");
+    const result = await configDb.insert(copy);
+    res.status(201).json({ ok: true, id: result.id, rev: result.rev });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "API not found" });
+    console.error("Error copying API:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/apis/keys/create", requireAdmin, (req, res) => {
+  res.set("Content-Type", "text/html; charset=utf-8");
+  const defaultName = typeof req.query.defaultName === "string" ? req.query.defaultName.trim() : "";
+  res.send(renderEditApiKeyPage(null, null, req.query.returnTo, defaultName));
+});
+
+app.post("/api/apis/keys", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const name = typeof (req.body && req.body.name) === "string" ? req.body.name.trim() : "";
+    if (!name) return res.status(400).json({ error: "Name is required." });
+    const key = typeof (req.body && req.body.key) === "string" ? req.body.key : "";
+    const id = slugifyForApiKeyId(name);
+    let doc = { type: "elenko_api_key", name, key };
+    try {
+      const existing = await configDb.get(id);
+      doc._id = existing._id;
+      doc._rev = existing._rev;
+      if (key !== "") doc.key = key;
+      else if (existing.key != null) doc.key = existing.key;
+    } catch (e) {
+      if (e.statusCode !== 404) throw e;
+      doc._id = id;
+    }
+    const result = await configDb.insert(doc);
+    res.status(201).json({ ok: true, id: result.id, rev: result.rev });
+  } catch (err) {
+    console.error("Error creating/updating API key:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/apis/keys/:id/edit", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    const doc = await configDb.get(req.params.id);
+    const hasKey = doc && (doc.key != null || doc.value != null);
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderEditApiKeyPage(doc, null, req.query.returnTo, ""));
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("API key not found"));
+    console.error("Error loading API key:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.put("/api/apis/keys/:id", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const doc = await configDb.get(id);
+    const name = typeof (req.body && req.body.name) === "string" ? req.body.name.trim() : "";
+    if (!name) return res.status(400).json({ error: "Name is required." });
+    const keyRaw = req.body && req.body.key;
+    doc.name = name;
+    if (typeof keyRaw === "string" && keyRaw !== "") doc.key = keyRaw;
+    else if (doc.key == null && doc.value != null) doc.key = doc.value;
+    const result = await configDb.insert(doc);
+    res.json({ ok: true, id: result.id, rev: result.rev });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "API key not found" });
+    console.error("Error updating API key:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/profile/create", requireAdmin, (req, res) => {
   res.set("Content-Type", "text/html; charset=utf-8");
   res.send(renderCreateProfilePage());
@@ -858,6 +1262,10 @@ app.post("/api/import-profile", requireAdmin, async (req, res) => {
       entry.updatedAt = now;
       const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
       entry.sortKey = buildSortKey(entry, sortKeyFields);
+      const profileFormIds = getProfileEntryFormIds(profileDoc);
+      if (profileFormIds.length > 0) {
+        entry.entryFormId = profileFormIds[0];
+      }
       docs.push(entry);
       sendFlowMessage("profile.import.line", {
         profileId,
@@ -914,7 +1322,18 @@ app.get("/profile/:id/edit", requireAdmin, async (req, res) => {
 app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
   try {
     const id = req.params.id;
-    const { _rev, name, description, fieldNames, customCss, entryFormId, theme, sortKeyFields: rawSortKeyFields, sortDirection } = req.body || {};
+    const {
+      _rev,
+      name,
+      description,
+      fieldNames,
+      customCss,
+      entryFormId,
+      entryFormIds,
+      theme,
+      sortKeyFields: rawSortKeyFields,
+      sortDirection,
+    } = req.body || {};
     if (!_rev || !name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name and _rev are required" });
     }
@@ -929,7 +1348,24 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
     doc.description = description != null ? String(description).trim() : "";
     doc.customCss = customCss != null ? String(customCss) : "";
     doc.fieldNames = fields;
-    doc.entryFormId = entryFormId != null && typeof entryFormId === "string" ? entryFormId.trim() : "";
+    let updatedEntryFormIds;
+    if (Array.isArray(entryFormIds)) {
+      updatedEntryFormIds = entryFormIds
+        .filter((f) => typeof f === "string" && f.trim())
+        .map((f) => f.trim());
+    } else {
+      updatedEntryFormIds = Array.isArray(doc.entryFormIds) ? doc.entryFormIds : [];
+    }
+    doc.entryFormIds = updatedEntryFormIds;
+    const requestedEntryFormId =
+      entryFormId != null && typeof entryFormId === "string" ? entryFormId.trim() : undefined;
+    if (updatedEntryFormIds.length > 0) {
+      doc.entryFormId = updatedEntryFormIds[0];
+    } else if (requestedEntryFormId !== undefined) {
+      doc.entryFormId = requestedEntryFormId;
+    } else {
+      doc.entryFormId = "";
+    }
     doc.theme = normalizeProfileTheme(theme);
     const sortKeyFields = Array.isArray(rawSortKeyFields)
       ? rawSortKeyFields
@@ -948,6 +1384,71 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
     if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
     console.error("Error updating profile:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/profiles/:id/entry-forms/clone-default", requireAdmin, async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const nameRaw = req.body && typeof req.body.name === "string" ? req.body.name.trim() : "";
+    if (!nameRaw) {
+      return res.status(400).json({ error: "Name is required" });
+    }
+    const profile = await db.get(profileId);
+    if (!profile || profile.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const formIds = getProfileEntryFormIds(profile);
+    if (!formIds.length) {
+      return res.status(400).json({ error: "Profile does not have a default entry form to clone." });
+    }
+    const defaultFormId = formIds[0];
+    let baseForm;
+    try {
+      baseForm = await db.get(defaultFormId);
+    } catch (e) {
+      return res.status(404).json({ error: "Default entry form not found" });
+    }
+    if (!baseForm || baseForm.type !== "elenko_entry_form") {
+      return res.status(404).json({ error: "Default entry form not found" });
+    }
+    const newFormDoc = {
+      type: "elenko_entry_form",
+      name: nameRaw,
+      labels: Array.isArray(baseForm.labels) ? baseForm.labels : [],
+      theme: baseForm.theme && typeof baseForm.theme === "object" ? baseForm.theme : DEFAULT_ENTRY_VIEW_THEME,
+      layout: baseForm.layout === "grid" || baseForm.layout === "stack" ? baseForm.layout : "table",
+      fieldLayout: Array.isArray(baseForm.fieldLayout) ? baseForm.fieldLayout : [],
+      customCss: baseForm.customCss != null ? String(baseForm.customCss) : "",
+      flowButtonEnabled: !!baseForm.flowButtonEnabled,
+      flowTarget: typeof baseForm.flowTarget === "string" ? baseForm.flowTarget : "log",
+      flowButtonLabel:
+        typeof baseForm.flowButtonLabel === "string" && baseForm.flowButtonLabel.trim()
+          ? baseForm.flowButtonLabel.trim()
+          : "Send to Flow",
+      flowButtonParam: typeof baseForm.flowButtonParam === "string" ? baseForm.flowButtonParam : "",
+    };
+    const formResult = await db.insert(newFormDoc);
+    let latestProfile = await db.get(profileId);
+    if (!latestProfile || latestProfile.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found after creating form" });
+    }
+    const updatedIds = getProfileEntryFormIds(latestProfile);
+    if (!updatedIds.includes(formResult.id)) {
+      updatedIds.push(formResult.id);
+    }
+    latestProfile.entryFormIds = updatedIds;
+    if (updatedIds.length > 0) {
+      latestProfile.entryFormId = updatedIds[0];
+    }
+    const profileResult = await db.insert(latestProfile);
+    clearProfileListCache(profileId);
+    res.status(201).json({ ok: true, id: formResult.id, rev: formResult.rev, profileRev: profileResult.rev });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
+    if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict; refresh and try again" });
+    console.error("Error cloning default entry form:", err);
+    res.status(500).json({ error: err.message || "Clone failed" });
   }
 });
 
@@ -1055,6 +1556,13 @@ app.post("/api/profiles/:id/entries", requireEditor, async (req, res) => {
     record.updatedAt = now;
     const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
     record.sortKey = buildSortKey(record, sortKeyFields);
+    const requestedEntryFormId = typeof values.entryFormId === "string" ? values.entryFormId.trim() : "";
+    const profileFormIds = getProfileEntryFormIds(doc);
+    if (requestedEntryFormId && profileFormIds.includes(requestedEntryFormId)) {
+      record.entryFormId = requestedEntryFormId;
+    } else if (profileFormIds.length > 0) {
+      record.entryFormId = profileFormIds[0];
+    }
     const result = await db.insert(record);
     clearProfileListCache(profileId);
      sendFlowMessage("entry.created", { id: result.id, profileId, fields: fieldNames });
@@ -1079,15 +1587,22 @@ app.post("/api/profile/:id/entry/:entryId/send-to-flow", requireAuth, async (req
       return res.status(404).json({ error: "Entry not found" });
     }
     let formDoc = null;
-    if (doc.entryFormId && typeof doc.entryFormId === "string" && doc.entryFormId.trim()) {
+    const profileFormIds = getProfileEntryFormIds(doc);
+    let formId = "";
+    if (record.entryFormId && typeof record.entryFormId === "string" && record.entryFormId.trim()) {
+      formId = record.entryFormId.trim();
+    } else if (profileFormIds.length > 0) {
+      formId = profileFormIds[0];
+    }
+    if (formId) {
       try {
-        const loaded = await db.get(doc.entryFormId.trim());
+        const loaded = await db.get(formId);
         if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
       } catch (e) {
         // form missing
       }
     }
-    const target = formDoc && formDoc.flowTarget === "log" ? "log" : "log";
+    const target = formDoc && (formDoc.flowTarget === "api" || formDoc.flowTarget === "localDb" || formDoc.flowTarget === "log") ? formDoc.flowTarget : "log";
     const flowButtonParam = formDoc && typeof formDoc.flowButtonParam === "string" ? formDoc.flowButtonParam : "";
     sendFlowMessage("entry.sendToFlow", {
       target,
@@ -1118,9 +1633,16 @@ app.get("/profile/:id/entry/:entryId", async (req, res) => {
       return res.status(404).send(renderErrorPage("Entry not found"));
     }
     let formDoc = null;
-    if (doc.entryFormId && typeof doc.entryFormId === "string" && doc.entryFormId.trim()) {
+    const profileFormIds = getProfileEntryFormIds(doc);
+    let formId = "";
+    if (record.entryFormId && typeof record.entryFormId === "string" && record.entryFormId.trim()) {
+      formId = record.entryFormId.trim();
+    } else if (profileFormIds.length > 0) {
+      formId = profileFormIds[0];
+    }
+    if (formId) {
       try {
-        const loaded = await db.get(doc.entryFormId.trim());
+        const loaded = await db.get(formId);
         if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
       } catch (e) {
         // form missing or not found – use default
@@ -1149,16 +1671,45 @@ app.get("/profile/:id/entry/:entryId/edit", requireEditor, async (req, res) => {
     if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
       return res.status(404).send(renderErrorPage("Entry not found"));
     }
+    const profileFormIds = getProfileEntryFormIds(doc);
     let formDoc = null;
-    if (doc.entryFormId) {
+    let currentFormId = "";
+    if (record.entryFormId && typeof record.entryFormId === "string" && record.entryFormId.trim()) {
+      currentFormId = record.entryFormId.trim();
+    } else if (profileFormIds.length > 0) {
+      currentFormId = profileFormIds[0];
+    }
+    if (currentFormId) {
       try {
-        const loaded = await db.get(doc.entryFormId);
+        const loaded = await db.get(currentFormId);
         if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
-      } catch (_) {}
+      } catch (_) {
+        // ignore
+      }
+    }
+    const formChoices = [];
+    const seenIds = new Set();
+    if (currentFormId && formDoc) {
+      formChoices.push({ _id: formDoc._id, name: formDoc.name || formDoc._id });
+      seenIds.add(formDoc._id);
+    }
+    for (const fid of profileFormIds) {
+      if (!fid || typeof fid !== "string") continue;
+      const trimmed = fid.trim();
+      if (!trimmed || seenIds.has(trimmed)) continue;
+      try {
+        const f = await db.get(trimmed);
+        if (f && f.type === "elenko_entry_form") {
+          formChoices.push({ _id: f._id, name: f.name || f._id });
+          seenIds.add(f._id);
+        }
+      } catch (_) {
+        // ignore missing
+      }
     }
     const returnQuery = { q: req.query.q, page: req.query.page };
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditEntryPage(doc, record, formDoc, returnQuery));
+    res.send(renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices, currentFormId));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Entry not found"));
     console.error("Error loading entry:", err);
@@ -1182,9 +1733,27 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     if (values._rev && values._rev !== record._rev) {
       return res.status(409).json({ error: "Entry was modified elsewhere; refresh and try again" });
     }
-    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+    const profileFieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+    let formDoc = null;
+    const profileFormIds = getProfileEntryFormIds(doc);
+    const formId = (record.entryFormId && typeof record.entryFormId === "string" && record.entryFormId.trim())
+      ? record.entryFormId.trim()
+      : (profileFormIds.length > 0 ? profileFormIds[0] : "");
+    if (formId) {
+      try {
+        const loaded = await db.get(formId);
+        if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
+      } catch (_) {}
+    }
+    const formFieldNames = getFieldNamesFromFormLayout(formDoc);
+    const fieldNames = [...new Set([...profileFieldNames, ...formFieldNames])];
     for (const fn of fieldNames) {
       record[fn] = values[fn] != null ? String(values[fn]).trim() : "";
+    }
+    if (Object.prototype.hasOwnProperty.call(values, "entryFormId")) {
+      const newEntryFormId =
+        typeof values.entryFormId === "string" ? values.entryFormId.trim() : "";
+      record.entryFormId = newEntryFormId;
     }
     const now = new Date().toISOString();
     record.updatedAt = now;
@@ -1523,6 +2092,13 @@ function renderCreateEntryPage(doc) {
 </html>`;
 }
 
+function getFieldNamesFromFormLayout(formDoc) {
+  if (!formDoc || !Array.isArray(formDoc.fieldLayout)) return [];
+  return formDoc.fieldLayout
+    .filter((item) => item && typeof item.fieldName === "string" && item.fieldName.trim())
+    .map((item) => item.fieldName.trim());
+}
+
 function buildOrderedItems(profileFieldNames, formDoc) {
   const names = Array.isArray(profileFieldNames) ? profileFieldNames : [];
   const set = new Set(names);
@@ -1538,7 +2114,7 @@ function buildOrderedItems(profileFieldNames, formDoc) {
 
   const byFieldName = {};
   for (const item of formDoc.fieldLayout) {
-    if (item && item.fieldName && set.has(item.fieldName)) byFieldName[item.fieldName] = item;
+    if (item && item.fieldName) byFieldName[item.fieldName] = item;
   }
   const seenFields = new Set();
   const seenLabels = new Set();
@@ -1548,7 +2124,7 @@ function buildOrderedItems(profileFieldNames, formDoc) {
     .sort((a, b) => (a.order != null ? Number(a.order) : 0) - (b.order != null ? Number(b.order) : 0));
 
   for (const item of sorted) {
-    if (item.fieldName && set.has(item.fieldName) && !seenFields.has(item.fieldName)) {
+    if (item.fieldName && !seenFields.has(item.fieldName)) {
       seenFields.add(item.fieldName);
       ordered.push({
         type: "field",
@@ -1638,6 +2214,7 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   const formCustomCss = formDoc && formDoc.customCss ? formDoc.customCss : "";
   const showFlowButton = !!(formDoc && formDoc.flowButtonEnabled);
   const flowButtonLabel = formDoc && typeof formDoc.flowButtonLabel === "string" && formDoc.flowButtonLabel.trim() ? formDoc.flowButtonLabel.trim() : "Send to Flow";
+  const formLabel = formDoc && (formDoc.name || formDoc._id) ? String(formDoc.name || formDoc._id) : "";
 
   const themeVars = `
     :root {
@@ -1778,6 +2355,7 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   <div class="actions"><a href="${escapeHtml(backUrl)}">← Back to database</a>${canEdit ? ` <a href="${editUrl}">Edit</a>` : ""}</div>
   ${showFlowButton ? `<div class="actions" style="margin-top:0.5rem;"><button type="button" id="send-to-flow-btn" class="btn-flow" data-profile-id="${escapeHtml(profileId)}" data-entry-id="${escapeHtml(entryId)}">${escapeHtml(flowButtonLabel)}</button></div><div id="flow-msg" class="flow-msg"></div>` : ""}
   <h1>${title}</h1>
+  ${formLabel ? `<p class="sub">Form: ${escapeHtml(formLabel)}</p>` : ""}
   ${contentHtml}
   ${showFlowButton ? `
   <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; background: #238636; color: #fff; }.btn-flow:hover { background: #2ea043; }.btn-flow:disabled { opacity: 0.6; cursor: not-allowed; }.flow-msg { margin-top: 0.5rem; font-size: 0.875rem; }.flow-msg.ok { color: #3fb950; }.flow-msg.err { color: #f85149; }</style>
@@ -1809,7 +2387,7 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
 </html>`;
 }
 
-function renderEditEntryPage(doc, record, formDoc, returnQuery) {
+function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = [], currentFormId = "") {
   const title = escapeHtml(doc.name || "Elenko database");
   const profileFieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
   const profileId = doc._id;
@@ -1933,6 +2511,20 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery) {
   }
 
   const orderedFieldNamesJson = JSON.stringify(orderedFieldNames);
+  const formChoicesHtml =
+    Array.isArray(formChoices) && formChoices.length > 0
+      ? '<span style="margin-left:1rem;font-size:0.875rem;">Form: <select id="entryFormSelect" name="entryFormId" style="padding:0.25rem 0.5rem;background:var(--entry-field-bg-edit,#161b22);border:1px solid #30363d;border-radius:4px;color:var(--entry-text-edit,#e6edf3);">' +
+        formChoices
+          .map(
+            (f) =>
+              `<option value="${escapeHtml(f._id)}"${
+                currentFormId === f._id ? " selected" : ""
+              }>${escapeHtml(f.name || f._id)}</option>`
+          )
+          .join("") +
+        "</select></span>"
+      : "";
+  const formLabel = formDoc && (formDoc.name || formDoc._id) ? String(formDoc.name || formDoc._id) : "";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1978,22 +2570,23 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery) {
   ${formCustomCss ? `<style>${formCustomCss}</style>` : ""}
 </head>
 <body>
-  <div class="actions"><a href="${escapeHtml(backUrl)}">← Back to database</a></div>
+  <div class="actions">
+    <a href="${escapeHtml(backUrl)}">← Back to database</a>
+    ${formChoicesHtml}
+    <button type="submit" form="entry-form" class="btn" style="margin-left:1rem;">Save</button>
+    <a href="${escapeHtml(backUrl)}" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
+  </div>
   <h1>${title}</h1>
-  <p class="sub">Edit entry:</p>
+  <p class="sub">Edit entry${formLabel ? ` – Form: ${escapeHtml(formLabel)}` : ""}</p>
   <form id="entry-form">
     <input type="hidden" id="rev" value="${rev}">
     ${contentHtml}
-    <div>
-      <button type="submit" class="btn">Save</button>
-      <a href="${escapeHtml(backUrl)}" class="btn btn-secondary" style="margin-left: 0.5rem;">Cancel</a>
-    </div>
-  </form>
   <div id="msg"></div>
   <script>
     const profileId = ${JSON.stringify(profileId)};
     const entryId = ${JSON.stringify(entryId)};
     const orderedFieldNames = ${orderedFieldNamesJson};
+    const entryFormSelect = document.getElementById('entryFormSelect');
     const form = document.getElementById('entry-form');
     const msgEl = document.getElementById('msg');
 
@@ -2003,6 +2596,9 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery) {
       msgEl.className = 'msg';
       const inputs = form.querySelectorAll('.entry-field');
       const data = { _rev: document.getElementById('rev').value };
+      if (entryFormSelect) {
+        data.entryFormId = entryFormSelect.value;
+      }
       orderedFieldNames.forEach((fn, i) => { data[fn] = (inputs[i] && inputs[i].value) ? String(inputs[i].value).trim() : ''; });
       try {
         const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/entries/' + encodeURIComponent(entryId), {
@@ -2291,6 +2887,315 @@ function renderEntryFormsListPage(forms) {
 </html>`;
 }
 
+function renderApisListPage(apis) {
+  const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
+  const rows =
+    apis.length > 0
+      ? apis
+          .map(
+            (a) => `
+        <tr>
+          <td><a href="/apis/${encodeURIComponent(a._id)}/edit">${escapeHtml(a.name || a._id)}</a></td>
+          <td>${escapeHtml(truncate(a.description || "", 40))}</td>
+          <td>${escapeHtml(a.method || "GET")}</td>
+          <td>${escapeHtml(truncate(a.url || "", 50))}</td>
+          <td><a href="/apis/${encodeURIComponent(a._id)}/edit" class="edit-link">Edit</a> <a href="#" class="copy-link" data-id="${escapeHtml(a._id)}">Copy</a></td>
+        </tr>`
+          )
+          .join("")
+      : `
+        <tr>
+          <td colspan="5" class="empty">No APIs yet. Create one to use the &quot;Call API&quot; flow target.</td>
+        </tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – APIs</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 56rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: #8b949e; margin-bottom: 1.5rem; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: #58a6ff; text-decoration: none; margin-right: 1rem; }
+    .actions a:hover { text-decoration: underline; }
+    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
+    .btn:hover { background: #2ea043; text-decoration: none; }
+    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #21262d; }
+    th { background: #21262d; color: #8b949e; font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    .edit-link, .copy-link { color: #58a6ff; margin-right: 0.5rem; }
+    .empty { color: #8b949e; font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="actions"><a href="/">← Start</a><a href="/apis/create" class="btn">Create API</a></div>
+  <h1>APIs</h1>
+  <p class="sub">Configure REST API targets for the &quot;Call API&quot; flow. Use the API document ID or name in the entry form flow parameter.</p>
+  <table>
+    <thead><tr><th>Name</th><th>Description</th><th>Method</th><th>URL</th><th>Actions</th></tr></thead>
+    <tbody>${rows}
+    </tbody>
+  </table>
+  <div id="msg" class="msg"></div>
+  <script>
+    document.querySelectorAll('.copy-link').forEach(function(link) {
+      link.onclick = function(e) {
+        e.preventDefault();
+        var id = link.getAttribute('data-id');
+        var msg = document.getElementById('msg');
+        msg.textContent = '';
+        msg.className = 'msg';
+        fetch('/api/apis/' + encodeURIComponent(id) + '/copy', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            if (data.id) { window.location.href = '/apis/' + encodeURIComponent(data.id) + '/edit'; }
+            else { msg.textContent = data.error || 'Failed'; msg.className = 'msg err'; }
+          })
+          .catch(function(err) { msg.textContent = err.message || 'Request failed'; msg.className = 'msg err'; });
+      };
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function renderEditApiPage(doc, err, returnTo) {
+  const isEdit = !!(doc && doc._id);
+  const id = doc && doc._id;
+  const rev = doc && doc._rev;
+  const nameVal = doc && typeof doc.name === "string" ? escapeHtml(doc.name) : "";
+  const descVal = doc && typeof doc.description === "string" ? escapeHtml(doc.description) : "";
+  const urlVal = doc && typeof doc.url === "string" ? escapeHtml(doc.url) : "";
+  const methodVal = doc && doc.method === "POST" ? "POST" : doc && doc.method === "PUT" ? "PUT" : doc && doc.method === "PATCH" ? "PATCH" : "GET";
+  const apiKeyRefVal = doc && typeof doc.apiKeyRef === "string" ? escapeHtml(doc.apiKeyRef) : "";
+  const responseTargetVal = doc && doc.responseTarget === "create" ? "create" : "update";
+  const returnToRaw = (typeof returnTo === "string" && returnTo.trim()) ? returnTo.trim() : "";
+  const defaultNameForKey = nameVal ? encodeURIComponent(nameVal) : "";
+  const keyEditHref = apiKeyRefVal
+    ? "/apis/keys/" + encodeURIComponent(doc.apiKeyRef) + "/edit" + (returnToRaw ? "?returnTo=" + encodeURIComponent(returnToRaw) : "")
+    : "/apis/keys/create" + (returnToRaw ? "?returnTo=" + encodeURIComponent(returnToRaw) : "") + (defaultNameForKey ? "&defaultName=" + defaultNameForKey : "");
+  const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+  const title = isEdit ? "Edit API" : "Create API";
+  const submitLabel = isEdit ? "Save" : "Create";
+  const revInput = rev ? `<input type="hidden" id="rev" value="${escapeHtml(rev)}">` : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – ${title}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 42rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .actions { margin-bottom: 1rem; }
+    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a:hover { text-decoration: underline; }
+    label { display: block; margin-top: 0.75rem; }
+    input, select, textarea { width: 100%; max-width: 28rem; padding: 0.5rem; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; }
+    .btn { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; border: none; }
+    .btn-primary { background: #238636; color: #fff; }
+    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; display: inline-block; margin-left: 0.5rem; }
+    .msg { margin-top: 1rem; }
+    .msg.err { color: #f85149; }
+    .msg.ok { color: #3fb950; }
+    .sub { color: #8b949e; font-size: 0.9rem; margin-top: 0.25rem; }
+  </style>
+</head>
+<body>
+  <div class="actions"><a href="/apis">← APIs</a></div>
+  <h1>${title}</h1>
+  ${errHtml}
+  <form id="api-form">
+    ${revInput}
+    <input type="hidden" id="apiId" value="${id ? escapeHtml(id) : ""}">
+    <label for="name">Name</label>
+    <input type="text" id="name" name="name" required placeholder="API label (or use _id in flow param)" value="${nameVal}">
+    <label for="description">Description</label>
+    <input type="text" id="description" name="description" placeholder="Optional" value="${descVal}">
+    <label for="url">URL</label>
+    <input type="text" id="url" name="url" placeholder="https://..." value="${urlVal}">
+    <label for="method">Method</label>
+    <select id="method" name="method">
+      <option value="GET"${methodVal === "GET" ? " selected" : ""}>GET</option>
+      <option value="POST"${methodVal === "POST" ? " selected" : ""}>POST</option>
+      <option value="PUT"${methodVal === "PUT" ? " selected" : ""}>PUT</option>
+      <option value="PATCH"${methodVal === "PATCH" ? " selected" : ""}>PATCH</option>
+    </select>
+    <label for="apiKeyRef">API key document ID <span class="sub">(set from API name below, or enter manually)</span></label>
+    <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+      <input type="text" id="apiKeyRef" name="apiKeyRef" placeholder="key_..." value="${apiKeyRefVal}" style="max-width:20rem;">
+      <a href="#" id="createEditKeyLink" class="btn btn-secondary" style="margin-top:0;">Create / Edit API key document</a>
+    </div>
+    <div id="apiKeyRefNotice" class="msg" style="margin-top:0.25rem;" aria-live="polite"></div>
+    <label for="responseTarget">Response target</label>
+    <select id="responseTarget" name="responseTarget">
+      <option value="update"${responseTargetVal === "update" ? " selected" : ""}>Update same entry (lastApiResponse)</option>
+      <option value="create"${responseTargetVal === "create" ? " selected" : ""}>Create new entry in same profile</option>
+    </select>
+    <div>
+      <button type="submit" class="btn btn-primary">${submitLabel}</button>
+      <a href="/apis" class="btn btn-secondary">Cancel</a>
+    </div>
+  </form>
+  <div id="msg"></div>
+  <script>
+    function slugifyForKeyId(name) {
+      var s = String(name == null ? '' : name).trim().toLowerCase();
+      var slug = s.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'key';
+      return 'key_' + (slug.slice(0, 80) || 'key');
+    }
+    function syncApiKeyRefFromName() {
+      var nameEl = document.getElementById('name');
+      var refEl = document.getElementById('apiKeyRef');
+      if (nameEl && refEl) {
+        var n = (nameEl.value || '').trim();
+        refEl.value = n ? slugifyForKeyId(n) : '';
+      }
+    }
+    var form = document.getElementById('api-form');
+    var formId = document.getElementById('apiId').value;
+    syncApiKeyRefFromName();
+    document.getElementById('name').addEventListener('input', syncApiKeyRefFromName);
+    document.getElementById('name').addEventListener('blur', syncApiKeyRefFromName);
+    var createEditKeyLink = document.getElementById('createEditKeyLink');
+    if (createEditKeyLink) {
+      createEditKeyLink.addEventListener('click', function(e) {
+        e.preventDefault();
+        var name = (document.getElementById('name').value || '').trim();
+        var returnTo = window.location.pathname + window.location.search;
+        var q = returnTo ? '?returnTo=' + encodeURIComponent(returnTo) : '';
+        if (name) q += (q ? '&' : '?') + 'defaultName=' + encodeURIComponent(name);
+        window.location.href = '/apis/keys/create' + q;
+      });
+    }
+    form.onsubmit = async function(e) {
+      e.preventDefault();
+      var msgEl = document.getElementById('msg');
+      var name = (document.getElementById('name').value || '').trim();
+      var description = (document.getElementById('description').value || '').trim();
+      var url = (document.getElementById('url').value || '').trim();
+      var method = document.getElementById('method').value || 'GET';
+      var apiKeyRef = (document.getElementById('apiKeyRef').value || '').trim();
+      var responseTarget = document.getElementById('responseTarget').value || 'update';
+      var urlApi = formId ? '/api/apis/' + encodeURIComponent(formId) : '/api/apis';
+      var methodHttp = formId ? 'PUT' : 'POST';
+      var body = { name: name, description: description, url: url, method: method, apiKeyRef: apiKeyRef, responseTarget: responseTarget };
+      try {
+        var r = await fetch(urlApi, { method: methodHttp, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        var data = await r.json();
+        if (!r.ok) { msgEl.textContent = data.error || 'Failed'; msgEl.className = 'msg err'; return; }
+        msgEl.textContent = formId ? 'Saved.' : 'Created.';
+        msgEl.className = 'msg ok';
+        if (!formId) setTimeout(function() { window.location.href = '/apis'; }, 800);
+        else { document.getElementById('rev').value = data.rev; }
+      } catch (err) {
+        msgEl.textContent = err.message || 'Request failed';
+        msgEl.className = 'msg err';
+      }
+    };
+  </script>
+</body>
+</html>`;
+}
+
+function renderEditApiKeyPage(doc, err, returnTo, defaultName) {
+  const isEdit = !!(doc && doc._id);
+  const id = doc && doc._id;
+  const rev = doc && doc._rev;
+  const nameVal = doc && typeof doc.name === "string" ? escapeHtml(doc.name) : (typeof defaultName === "string" && defaultName ? escapeHtml(defaultName) : "");
+  const keyPlaceholder = isEdit ? "Leave blank to keep current key" : "API key / secret";
+  const returnToVal = typeof returnTo === "string" && returnTo.trim() ? escapeHtml(returnTo.trim()) : "";
+  const returnToInput = returnToVal ? `<input type="hidden" name="returnTo" id="returnTo" value="${returnToVal}">` : "";
+  const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+  const title = isEdit ? "Edit API key" : "Create API key";
+  const submitLabel = isEdit ? "Save" : "Create";
+  const revInput = rev ? `<input type="hidden" id="rev" value="${escapeHtml(rev)}">` : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – ${title}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 42rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .actions { margin-bottom: 1rem; }
+    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a:hover { text-decoration: underline; }
+    label { display: block; margin-top: 0.75rem; }
+    input { width: 100%; max-width: 28rem; padding: 0.5rem; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; }
+    .btn { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; border: none; }
+    .btn-primary { background: #238636; color: #fff; }
+    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; display: inline-block; margin-left: 0.5rem; }
+    .msg { margin-top: 1rem; }
+    .msg.err { color: #f85149; }
+    .msg.ok { color: #3fb950; }
+    .sub { color: #8b949e; font-size: 0.9rem; margin-top: 0.25rem; }
+  </style>
+</head>
+<body>
+  <div class="actions"><a href="/apis">← APIs</a></div>
+  <h1>${title}</h1>
+  <p class="sub">Stored in the config store. The document ID is derived from the name (e.g. &quot;My Service&quot; → key_my-service). Use this ID in the API form as &quot;API key document ID&quot;.</p>
+  ${errHtml}
+  <form id="api-key-form">
+    ${revInput}
+    ${returnToInput}
+    <input type="hidden" id="keyId" value="${id ? escapeHtml(id) : ""}">
+    <label for="name">Descriptive name</label>
+    <input type="text" id="name" name="name" required placeholder="e.g. OpenWeather API key" value="${nameVal}">
+    <label for="key">API key / secret</label>
+    <input type="password" id="key" name="key" placeholder="${escapeHtml(keyPlaceholder)}" autocomplete="off">
+    <div>
+      <button type="submit" class="btn btn-primary">${submitLabel}</button>
+      <a href="/apis" class="btn btn-secondary">Cancel</a>
+    </div>
+  </form>
+  <div id="msg"></div>
+  <script>
+    var form = document.getElementById('api-key-form');
+    var keyId = document.getElementById('keyId').value;
+    var returnToEl = document.getElementById('returnTo');
+    var returnToVal = returnToEl ? returnToEl.value : '';
+    form.onsubmit = async function(e) {
+      e.preventDefault();
+      var msgEl = document.getElementById('msg');
+      var name = (document.getElementById('name').value || '').trim();
+      var key = (document.getElementById('key').value || '');
+      var urlApi = keyId ? '/api/apis/keys/' + encodeURIComponent(keyId) : '/api/apis/keys';
+      var methodHttp = keyId ? 'PUT' : 'POST';
+      var body = { name: name };
+      if (key) body.key = key;
+      try {
+        var r = await fetch(urlApi, { method: methodHttp, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        var data = await r.json();
+        if (!r.ok) { msgEl.textContent = data.error || 'Failed'; msgEl.className = 'msg err'; return; }
+        msgEl.textContent = keyId ? 'Saved.' : 'Created.';
+        msgEl.className = 'msg ok';
+        if (returnToVal && data.id) {
+          var sep = returnToVal.indexOf('?') !== -1 ? '&' : '?';
+          setTimeout(function() { window.location.href = returnToVal + sep + 'apiKeyRef=' + encodeURIComponent(data.id); }, 500);
+        } else if (!keyId) setTimeout(function() { window.location.href = '/apis'; }, 800);
+        else { document.getElementById('rev').value = data.rev; }
+      } catch (err) {
+        msgEl.textContent = err.message || 'Request failed';
+        msgEl.className = 'msg err';
+      }
+    };
+  </script>
+</body>
+</html>`;
+}
+
 function renderCreateEntryFormPage(err) {
   return renderEntryFormPage(null, null, err);
 }
@@ -2403,7 +3308,7 @@ function renderEntryFormPage(doc, rev, err) {
   const layout = doc && (doc.layout === "grid" || doc.layout === "stack") ? doc.layout : "table";
   const customCss = doc ? escapeHtml(doc.customCss || "") : "";
   const flowButtonChecked = doc && doc.flowButtonEnabled ? " checked" : "";
-  const flowTargetValue = doc && doc.flowTarget === "log" ? "log" : "log";
+  const flowTargetValue = doc && doc.flowTarget === "api" ? "api" : doc && doc.flowTarget === "localDb" ? "localDb" : "log";
   const flowButtonLabelValue = doc && typeof doc.flowButtonLabel === "string" ? escapeHtml(doc.flowButtonLabel) : "Send to Flow";
   const flowButtonParamValue = doc && typeof doc.flowButtonParam === "string" ? escapeHtml(doc.flowButtonParam) : "";
   const labelsArr = (doc && Array.isArray(doc.labels) ? doc.labels : []);
@@ -2538,6 +3443,8 @@ function renderEntryFormPage(doc, rev, err) {
       <label for="flowTarget" style="margin-top:0;">Target</label>
       <select id="flowTarget" name="flowTarget">
         <option value="log"${flowTargetValue === "log" ? " selected" : ""}>Log file</option>
+        <option value="localDb"${flowTargetValue === "localDb" ? " selected" : ""}>Send to Local Database</option>
+        <option value="api"${flowTargetValue === "api" ? " selected" : ""}>Call API</option>
       </select>
     </div>
     <div style="margin-top:0.75rem;">
@@ -2545,8 +3452,8 @@ function renderEntryFormPage(doc, rev, err) {
       <input type="text" id="flowButtonLabel" name="flowButtonLabel" placeholder="Send to Flow" value="${flowButtonLabelValue}">
     </div>
     <div style="margin-top:0.75rem;">
-      <label for="flowButtonParam">Additional parameter (for later use)</label>
-      <input type="text" id="flowButtonParam" name="flowButtonParam" placeholder="Optional" value="${flowButtonParamValue}">
+      <label for="flowButtonParam">Additional parameter</label>
+      <input type="text" id="flowButtonParam" name="flowButtonParam" placeholder="For Log: optional. For Local Database: target profile ID. For Call API: API document ID or name" value="${flowButtonParamValue}">
     </div>
     <label for="customCss">Custom CSS (entry view and edit)</label>
     <p class="sub" style="margin-top:0;">Optional CSS applied to single-entry view and edit entry page. <a href="/entry-forms/css-help" target="_blank" rel="noopener noreferrer">CSS parameters reference</a></p>
@@ -2911,7 +3818,7 @@ function renderStartPage(profiles, role) {
           <td colspan="${isAdmin ? 4 : 2}" class="empty">No Elenko database profiles yet.${isAdmin ? ' Add documents with <code>type: "elenko_profile"</code> in CouchDB.' : ""}</td>
         </tr>`;
 
-  const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko profile</a> <a href="/deletions" class="link-secondary">Marked for deletion</a> <a href="/entry-forms" class="link-secondary">Entry forms</a> <a href="/documents" class="link-secondary">All documents</a> ';
+  const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko profile</a> <a href="/deletions" class="link-secondary">Marked for deletion</a> <a href="/entry-forms" class="link-secondary">Entry forms</a> <a href="/apis" class="link-secondary">APIs</a> <a href="/documents" class="link-secondary">All documents</a> ';
   const actionsUser = "";
   const actionsCommon = '<a href="/account/change-password" class="link-secondary">Change password</a> ' + (isAdmin ? '<a href="/account/users" class="link-secondary">Manage users</a> <a href="/account/users/create" class="link-secondary">Create user</a> ' : '') + '<a href="/logout" class="link-secondary">Log out</a>';
   const theadAdmin = "<tr><th>Name</th><th>Description</th><th>Document ID</th><th>Actions</th></tr>";
@@ -2973,7 +3880,9 @@ function renderEditProfilePage(doc, forms = []) {
   const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
   const rev = escapeHtml(doc._rev || "");
   const customCss = doc.customCss || "";
-  const entryFormId = doc.entryFormId || "";
+  const entryFormIds = Array.isArray(doc.entryFormIds)
+    ? doc.entryFormIds.filter((id) => typeof id === "string" && id.trim()).map((id) => id.trim())
+    : [];
   const theme = normalizeProfileTheme(doc.theme);
   const themeBg = toHex6(theme.background);
   const themeText = toHex6(theme.text);
@@ -2983,9 +3892,15 @@ function renderEditProfilePage(doc, forms = []) {
   const themeTableHeaderBg = toHex6(theme.tableHeaderBg);
   const themeTableHeaderText = toHex6(theme.tableHeaderText);
   const themeTableBorder = toHex6(theme.tableBorder);
-  const entryFormOptions = (forms || [])
-    .map((f) => `<option value="${escapeHtml(f._id)}" ${entryFormId === f._id ? "selected" : ""}>${escapeHtml(f.name || f._id)}</option>`)
-    .join("");
+  const allEntryForms = Array.isArray(forms)
+    ? forms.map((f) => ({ id: f._id, name: f.name || f._id }))
+    : [];
+  const initialEntryFormIds =
+    entryFormIds.length > 0
+      ? entryFormIds
+      : (typeof doc.entryFormId === "string" && doc.entryFormId.trim()
+          ? [doc.entryFormId.trim()]
+          : []);
   const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
   const sortDirectionValue = doc.sortDirection === "desc" ? "desc" : "asc";
   function sortKeySelect(name, id, selected) {
@@ -3036,7 +3951,11 @@ function renderEditProfilePage(doc, forms = []) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Profiles</a></div>
+  <div class="actions">
+    <a href="/">← Profiles</a>
+    <button type="submit" form="edit-form" class="btn btn-primary" style="margin-left:1rem;">Save</button>
+    <a href="/" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
+  </div>
   <h1>Elenko</h1>
   <p class="sub">Edit profile</p>
   <p class="sub" style="margin-bottom:0.5rem;"><strong>Profile ID:</strong> <code id="profile-id-value">${escapeHtml(doc._id)}</code> <button type="button" class="btn btn-secondary" id="copy-profile-id" style="padding:0.25rem 0.5rem;font-size:0.8rem;">Copy</button></p>
@@ -3065,12 +3984,12 @@ function renderEditProfilePage(doc, forms = []) {
     <textarea id="customCss" name="customCss" placeholder="Optional CSS applied to the full database (list) view only">${customCss}</textarea>
     <label for="customCssFile">Load CSS from file</label>
     <input type="file" id="customCssFile" accept=".css,text/css">
-    <label for="entryFormId">Entry view form</label>
-    <select id="entryFormId" name="entryFormId">
-      <option value="">Default</option>
-      ${entryFormOptions}
-    </select>
-    <p class="sub" style="margin-top:0.25rem;">Optional. Choose a form to control colours and layout of the single-entry (read-only) view. <a href="${entryFormId ? "/entry-forms/" + encodeURIComponent(entryFormId) + "/edit" : "/entry-forms"}" id="entry-form-link" class="btn btn-secondary" style="display:inline-block;margin-top:0.25rem;">${entryFormId ? "Edit form" : "Entry forms"}</a></p>
+    <label class="field-list-label" style="margin-top:1.5rem;">Entry view forms</label>
+    <p class="sub" style="margin-top:0.25rem;">First form is the default. Entries can switch between these forms in edit mode.</p>
+    <div class="field-list" id="entry-forms-list"></div>
+    <button type="button" class="btn btn-secondary" id="add-entry-form">+ Add existing form</button>
+    <button type="button" class="btn btn-secondary" id="clone-entry-form" style="margin-left:0.5rem;">+ New form from default</button>
+    <p class="sub" style="margin-top:0.25rem;">Use the <a href="/entry-forms">Entry forms</a> page or the link opened after cloning to adjust layout and colours.</p>
     <label style="margin-top:1.5rem;">Sort key fields (up to 3)</label>
     <p class="sub" style="margin-top:0.25rem;">Entry list is sorted by these fields in order (CouchDB index). Use profile fields or Creation/Update date.</p>
     <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:center;margin-top:0.5rem;">
@@ -3090,10 +4009,6 @@ function renderEditProfilePage(doc, forms = []) {
       <input type="text" id="previous-profile-id" placeholder="Paste previous profile ID" style="max-width:20rem;padding:0.5rem;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;">
       <button type="button" class="btn btn-secondary" id="reassign-entries-btn">Reassign entries to this profile</button>
       <span id="reassign-msg"></span>
-    </div>
-    <div>
-      <button type="submit" class="btn btn-primary">Save</button>
-      <a href="/" class="btn btn-secondary" style="margin-left: 0.5rem;">Cancel</a>
     </div>
   </form>
   <div id="msg"></div>
@@ -3131,14 +4046,78 @@ function renderEditProfilePage(doc, forms = []) {
       });
     }
 
-    const entryFormSelect = document.getElementById('entryFormId');
-    const entryFormLink = document.getElementById('entry-form-link');
-    if (entryFormSelect && entryFormLink) {
-      entryFormSelect.addEventListener('change', () => {
-        const val = entryFormSelect.value;
-        entryFormLink.href = val ? '/entry-forms/' + encodeURIComponent(val) + '/edit' : '/entry-forms';
-        entryFormLink.textContent = val ? 'Edit form' : 'Entry forms';
+    const entryFormsList = document.getElementById('entry-forms-list');
+    const addEntryFormBtn = document.getElementById('add-entry-form');
+    const cloneEntryFormBtn = document.getElementById('clone-entry-form');
+    const allEntryForms = ${JSON.stringify(allEntryForms)};
+    const initialEntryFormIds = ${JSON.stringify(initialEntryFormIds)};
+
+    function addEntryFormRow(selectedId) {
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      const select = document.createElement('select');
+      select.name = 'entryFormIds';
+      const placeholderOpt = document.createElement('option');
+      placeholderOpt.value = '';
+      placeholderOpt.textContent = '— Choose form —';
+      select.appendChild(placeholderOpt);
+      allEntryForms.forEach((f) => {
+        const opt = document.createElement('option');
+        opt.value = f.id;
+        opt.textContent = f.name || f.id;
+        if (selectedId && selectedId === f.id) opt.selected = true;
+        select.appendChild(opt);
       });
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn btn-remove';
+      removeBtn.textContent = 'Remove';
+      removeBtn.onclick = () => row.remove();
+      row.appendChild(select);
+      row.appendChild(removeBtn);
+      entryFormsList.appendChild(row);
+    }
+
+    (initialEntryFormIds.length ? initialEntryFormIds : []).forEach((id) => addEntryFormRow(id));
+    if (!entryFormsList.children.length) {
+      addEntryFormRow('');
+    }
+
+    if (addEntryFormBtn) {
+      addEntryFormBtn.onclick = () => addEntryFormRow('');
+    }
+
+    if (cloneEntryFormBtn) {
+      cloneEntryFormBtn.onclick = async () => {
+        const defaultSelect = entryFormsList.querySelector('select[name="entryFormIds"]');
+        if (!defaultSelect || !defaultSelect.value) {
+          alert('Please choose a default entry form (first row) before cloning.');
+          return;
+        }
+        const newName = (prompt('New entry form name:') || '').trim();
+        if (!newName) return;
+        cloneEntryFormBtn.disabled = true;
+        try {
+          const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/entry-forms/clone-default', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: newName })
+          });
+          const data = await r.json();
+          if (!r.ok) {
+            alert(data.error || 'Failed to create form.');
+            return;
+          }
+          const newId = data.id;
+          allEntryForms.push({ id: newId, name: newName });
+          addEntryFormRow(newId);
+          window.open('/entry-forms/' + encodeURIComponent(newId) + '/edit', '_blank');
+        } catch (e) {
+          alert(e.message || 'Request failed');
+        } finally {
+          cloneEntryFormBtn.disabled = false;
+        }
+      };
     }
     const rebuildBtn = document.getElementById('rebuild-sort-keys-btn');
     const rebuildMsg = document.getElementById('rebuild-msg');
@@ -3210,6 +4189,9 @@ function renderEditProfilePage(doc, forms = []) {
       const customCss = document.getElementById('customCss').value;
       const _rev = document.getElementById('rev').value;
       const fieldNames = Array.from(document.querySelectorAll('input[name="fieldNames"]')).map(i => i.value.trim()).filter(Boolean);
+      const entryFormIds = Array.from(document.querySelectorAll('select[name="entryFormIds"]'))
+        .map((s) => s.value.trim())
+        .filter(Boolean);
       const theme = {
         background: toHex6Sync(document.getElementById('theme-background-hex')?.value) || document.getElementById('theme-background')?.value || '#0f1419',
         text: toHex6Sync(document.getElementById('theme-text-hex')?.value) || document.getElementById('theme-text')?.value || '#e6edf3',
@@ -3224,7 +4206,22 @@ function renderEditProfilePage(doc, forms = []) {
         const r = await fetch('/api/profiles/' + encodeURIComponent(profileId), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ _rev, name, description, customCss, fieldNames, entryFormId: document.getElementById('entryFormId').value, theme, sortKeyFields: [document.getElementById('sortKeyField1').value, document.getElementById('sortKeyField2').value, document.getElementById('sortKeyField3').value].filter(Boolean), sortDirection: document.getElementById('sortDirection').value })
+          body: JSON.stringify({
+            _rev,
+            name,
+            description,
+            customCss,
+            fieldNames,
+            entryFormId: entryFormIds[0] || '',
+            entryFormIds,
+            theme,
+            sortKeyFields: [
+              document.getElementById('sortKeyField1').value,
+              document.getElementById('sortKeyField2').value,
+              document.getElementById('sortKeyField3').value
+            ].filter(Boolean),
+            sortDirection: document.getElementById('sortDirection').value
+          })
         });
         const data = await r.json();
         if (!r.ok) { msgEl.textContent = data.error || 'Failed'; msgEl.className = 'msg err'; return; }
@@ -3759,8 +4756,15 @@ function escapeHtml(s) {
     .replace(/'/g, "&#39;");
 }
 
+function slugifyForApiKeyId(name) {
+  const s = String(name == null ? "" : name).trim().toLowerCase();
+  const slug = s.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "key";
+  return "key_" + (slug.slice(0, 80) || "key");
+}
+
 async function main() {
   await initCouch();
+  startApiWorker();
   startFlowWorker();
   // Log a startup event so we always get at least one line in the flow log.
   sendFlowMessage("system.start", { pid: process.pid, port: PORT });
