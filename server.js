@@ -6,6 +6,7 @@ const fs = require("fs");
 const express = require("express");
 const session = require("express-session");
 const iconv = require("iconv-lite");
+const marked = require("marked");
 const nano = require("nano");
 
 const app = express();
@@ -18,6 +19,37 @@ const MAX_ENTRIES_PER_PROFILE = 500000;
 const ENTRIES_PAGE_SIZE = 25;
 const SORT_KEY_SPECIAL = ["createdAt", "updatedAt"];
 const SORT_KEY_FIELDS_MAX = 3;
+const DEFAULT_VALUE_SOURCES = ["", "createdAt", "updatedAt", "currentUser"];
+
+function normalizeFieldDefaultSources(fieldNames, raw) {
+  const len = Array.isArray(fieldNames) ? fieldNames.length : 0;
+  const arr = Array.isArray(raw) ? raw : [];
+  const allowed = new Set(DEFAULT_VALUE_SOURCES);
+  const result = [];
+  for (let i = 0; i < len; i++) {
+    const v = arr[i];
+    const s = typeof v === "string" ? v.trim() : "";
+    result.push(allowed.has(s) ? s : "");
+  }
+  return result;
+}
+
+function formatDateTimeLocal(d) {
+  const date = d instanceof Date ? d : new Date();
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const h = String(date.getHours()).padStart(2, "0");
+  const min = String(date.getMinutes()).padStart(2, "0");
+  const s = String(date.getSeconds()).padStart(2, "0");
+  return `${y}-${m}-${day} ${h}:${min}:${s}`;
+}
+
+function resolveDefaultValue(source, req) {
+  if (source === "createdAt" || source === "updatedAt") return formatDateTimeLocal(new Date());
+  if (source === "currentUser") return req && req.session && req.session.user ? String(req.session.user) : "";
+  return "";
+}
 
 const DEFAULT_ENTRY_VIEW_THEME = {
   background: "#0f1419",
@@ -93,7 +125,8 @@ function normalizeEntryFormDoc(body) {
         ...(height != null && { height }),
       };
       if (typeof item.fieldName === "string" && item.fieldName.trim()) {
-        return { ...base, fieldName: item.fieldName.trim() };
+        const fieldType = item.fieldType === "markdown" ? "markdown" : "text";
+        return { ...base, fieldName: item.fieldName.trim(), fieldType };
       }
       return { ...base, labelId: item.labelId.trim() };
     });
@@ -102,6 +135,23 @@ function normalizeEntryFormDoc(body) {
   const flowTarget = flowTargetRaw === "localDb" ? "localDb" : flowTargetRaw === "api" ? "api" : "log";
   const flowButtonLabel = typeof body.flowButtonLabel === "string" ? body.flowButtonLabel.trim() : "";
   const flowButtonParam = typeof body.flowButtonParam === "string" ? body.flowButtonParam.trim() : "";
+
+  function normalizeFlowConfigItem(item) {
+    if (!item || typeof item !== "object") return null;
+    const enabled = !!(item.enabled === true || item.enabled === "true");
+    const targetRaw = typeof item.target === "string" ? item.target.trim() : "";
+    const target = targetRaw === "localDb" ? "localDb" : targetRaw === "api" ? "api" : "log";
+    const label = typeof item.label === "string" ? item.label.trim() : "";
+    const param = typeof item.param === "string" ? item.param.trim() : "";
+    return { enabled, target, label: label || "Send to Flow", param };
+  }
+
+  let flowConfigs;
+  if (Array.isArray(body.flowConfigs) && body.flowConfigs.length > 0) {
+    flowConfigs = body.flowConfigs.map(normalizeFlowConfigItem).filter(Boolean);
+  } else {
+    flowConfigs = [{ enabled: flowButtonEnabled, target: flowTarget, label: flowButtonLabel || "Send to Flow", param: flowButtonParam }];
+  }
 
   return {
     name,
@@ -119,10 +169,11 @@ function normalizeEntryFormDoc(body) {
     layout,
     fieldLayout,
     customCss,
-    flowButtonEnabled,
-    flowTarget,
-    flowButtonLabel: flowButtonLabel || "Send to Flow",
-    flowButtonParam,
+    flowButtonEnabled: flowConfigs.length > 0 ? flowConfigs[0].enabled : false,
+    flowTarget: flowConfigs.length > 0 ? flowConfigs[0].target : "log",
+    flowButtonLabel: flowConfigs.length > 0 ? flowConfigs[0].label : "Send to Flow",
+    flowButtonParam: flowConfigs.length > 0 ? flowConfigs[0].param : "",
+    flowConfigs,
   };
 }
 
@@ -180,7 +231,7 @@ function startApiWorker() {
   });
   apiWorker.on("message", (msg) => {
     if (msg.kind !== "apiResponse") return;
-    const { entryId, profileId, success, statusCode, body, error, responseTarget } = msg;
+    const { entryId, profileId, success, statusCode, body, error, responseTarget, responseField, responseStart, responseEnd } = msg;
     const bodyForLog = body != null ? (typeof body === "string" ? body : JSON.stringify(body)) : null;
     const bodyTruncated = bodyForLog && bodyForLog.length > 2048 ? bodyForLog.slice(0, 2048) + "…[truncated]" : bodyForLog;
     sendFlowMessage("api.response", {
@@ -197,11 +248,25 @@ function startApiWorker() {
         if (!configDb || !db) return;
         const target = (responseTarget === "create" ? "create" : "update") || "update";
         const now = new Date().toISOString();
-        const lastApiResponse = { statusCode: statusCode ?? null, body: body ?? null, ts: now, success: !!success, error: error ?? null };
+        const bodyStr = (body === undefined || body === null) ? "" : (typeof body === "string" ? body : JSON.stringify(body));
+        let bodyToStore = bodyStr;
+        if ((responseStart || responseEnd) && bodyStr) {
+          const start = typeof responseStart === "string" && responseStart ? bodyStr.indexOf(responseStart) : 0;
+          const startIdx = start === -1 ? 0 : start + (typeof responseStart === "string" && responseStart ? responseStart.length : 0);
+          const endIdx = (typeof responseEnd === "string" && responseEnd)
+            ? (bodyStr.indexOf(responseEnd, startIdx) === -1 ? bodyStr.length : bodyStr.indexOf(responseEnd, startIdx))
+            : bodyStr.length;
+          bodyToStore = bodyStr.slice(startIdx, endIdx).trim();
+        }
+        const lastApiResponse = { statusCode: statusCode ?? null, body: bodyToStore, ts: now, success: !!success, error: error ?? null };
         if (target === "update") {
           const record = await db.get(entryId);
           if (!record || record.type !== "elenko_record" || record.profileId !== profileId) return;
           record.lastApiResponse = lastApiResponse;
+          if (responseField && typeof responseField === "string" && responseField.trim()) {
+            const fieldName = responseField.trim();
+            record[fieldName] = bodyToStore;
+          }
           await db.insert(record);
           clearProfileListCache(profileId);
         } else {
@@ -249,7 +314,15 @@ function startFlowWorker() {
     if (msg.kind === "callApi") {
       const apiDocId = (msg.apiDocId != null ? String(msg.apiDocId) : "").trim();
       if (!apiDocId || !apiWorker) {
-        if (!apiDocId) console.error("Flow worker: callApi missing apiDocId");
+        if (!apiDocId) {
+          console.error("Flow worker: callApi missing apiDocId");
+          sendFlowMessage("api.callRejected", {
+            reason: "missing apiDocId",
+            hint: "Set the entry form Additional parameter to the API document ID or name (Call API target).",
+            entryId: msg.entryId,
+            profileId: msg.profileId,
+          });
+        }
         return;
       }
       (async () => {
@@ -266,6 +339,12 @@ function startFlowWorker() {
           }
           if (!apiDoc || apiDoc.type !== "elenko_api") {
             console.error("Flow worker: callApi API doc not found:", apiDocId);
+            sendFlowMessage("api.callRejected", {
+              reason: "apiDoc not found",
+              apiDocId,
+              entryId: msg.entryId,
+              profileId: msg.profileId,
+            });
             return;
           }
           sendFlowMessage("api.request", {
@@ -287,7 +366,7 @@ function startFlowWorker() {
           }
           apiWorker.postMessage({
             kind: "apiRequest",
-            apiDoc: { url: apiDoc.url, method: apiDoc.method, responseTarget: apiDoc.responseTarget },
+            apiDoc: { url: apiDoc.url, method: apiDoc.method, responseTarget: apiDoc.responseTarget, template: apiDoc.template, responseField: apiDoc.responseField, responseStart: apiDoc.responseStart, responseEnd: apiDoc.responseEnd },
             apiKey,
             dataset: msg.dataset,
             entryId: msg.entryId,
@@ -879,6 +958,7 @@ app.post("/api/entry-forms", requireAdmin, async (req, res) => {
       flowTarget: normalized.flowTarget,
       flowButtonLabel: normalized.flowButtonLabel,
       flowButtonParam: normalized.flowButtonParam,
+      flowConfigs: normalized.flowConfigs,
     };
     const result = await db.insert(doc);
     res.status(201).json({ ok: true, id: result.id, rev: result.rev });
@@ -924,6 +1004,7 @@ app.put("/api/entry-forms/:id", requireAdmin, async (req, res) => {
     doc.flowTarget = normalized.flowTarget;
     doc.flowButtonLabel = normalized.flowButtonLabel;
     doc.flowButtonParam = normalized.flowButtonParam;
+    doc.flowConfigs = normalized.flowConfigs;
     const result = await db.insert(doc);
     res.json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
@@ -1002,6 +1083,10 @@ app.post("/api/apis", requireAdmin, async (req, res) => {
       method: (body.method === "POST" || body.method === "PUT" || body.method === "PATCH") ? body.method : "GET",
       apiKeyRef: typeof body.apiKeyRef === "string" ? body.apiKeyRef.trim() : "",
       responseTarget: body.responseTarget === "create" ? "create" : "update",
+      template: typeof body.template === "string" ? body.template.trim() : "",
+      responseField: typeof body.responseField === "string" ? body.responseField.trim() : "",
+      responseStart: typeof body.responseStart === "string" ? body.responseStart : "",
+      responseEnd: typeof body.responseEnd === "string" ? body.responseEnd : "",
     };
     const result = await configDb.insert(doc);
     res.status(201).json({ ok: true, id: result.id, rev: result.rev });
@@ -1028,6 +1113,10 @@ app.put("/api/apis/:id", requireAdmin, async (req, res) => {
     doc.method = (body.method === "POST" || body.method === "PUT" || body.method === "PATCH") ? body.method : "GET";
     doc.apiKeyRef = typeof body.apiKeyRef === "string" ? body.apiKeyRef.trim() : "";
     doc.responseTarget = body.responseTarget === "create" ? "create" : "update";
+    doc.template = typeof body.template === "string" ? body.template.trim() : "";
+    doc.responseField = typeof body.responseField === "string" ? body.responseField.trim() : "";
+    doc.responseStart = typeof body.responseStart === "string" ? body.responseStart : "";
+    doc.responseEnd = typeof body.responseEnd === "string" ? body.responseEnd : "";
     const result = await configDb.insert(doc);
     res.json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
@@ -1131,7 +1220,7 @@ app.get("/profile/create", requireAdmin, (req, res) => {
 
 app.post("/api/profiles", requireAdmin, async (req, res) => {
   try {
-    const { name, description, fieldNames, customCss } = req.body || {};
+    const { name, description, fieldNames, fieldDefaultSources, customCss } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name is required" });
     }
@@ -1144,6 +1233,7 @@ app.post("/api/profiles", requireAdmin, async (req, res) => {
       description: description != null ? String(description).trim() : "",
       customCss: customCss != null ? String(customCss) : "",
       fieldNames: fields,
+      fieldDefaultSources: normalizeFieldDefaultSources(fields, fieldDefaultSources),
       createdAt: new Date().toISOString(),
     };
     const result = await db.insert(doc);
@@ -1337,17 +1427,18 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
     if (!_rev || !name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name and _rev are required" });
     }
-    const fields = Array.isArray(fieldNames)
-      ? fieldNames.filter((f) => typeof f === "string" && f.trim()).map((f) => f.trim())
-      : [];
     const doc = await db.get(id);
     if (doc.type !== "elenko_profile") {
       return res.status(404).json({ error: "Profile not found" });
     }
+    const fields = Array.isArray(fieldNames)
+      ? fieldNames.filter((f) => typeof f === "string" && f.trim()).map((f) => f.trim())
+      : (Array.isArray(doc.fieldNames) ? doc.fieldNames : []);
     doc.name = name.trim();
     doc.description = description != null ? String(description).trim() : "";
     doc.customCss = customCss != null ? String(customCss) : "";
     doc.fieldNames = fields;
+    doc.fieldDefaultSources = normalizeFieldDefaultSources(fields, req.body.fieldDefaultSources);
     let updatedEntryFormIds;
     if (Array.isArray(entryFormIds)) {
       updatedEntryFormIds = entryFormIds
@@ -1427,6 +1518,14 @@ app.post("/api/profiles/:id/entry-forms/clone-default", requireAdmin, async (req
           ? baseForm.flowButtonLabel.trim()
           : "Send to Flow",
       flowButtonParam: typeof baseForm.flowButtonParam === "string" ? baseForm.flowButtonParam : "",
+      flowConfigs: Array.isArray(baseForm.flowConfigs) && baseForm.flowConfigs.length > 0
+        ? baseForm.flowConfigs.map((c) => ({
+            enabled: !!(c && c.enabled),
+            target: (c && c.target === "localDb") ? "localDb" : (c && c.target === "api") ? "api" : "log",
+            label: (c && typeof c.label === "string" && c.label.trim()) ? c.label.trim() : "Send to Flow",
+            param: (c && typeof c.param === "string") ? c.param.trim() : "",
+          }))
+        : [{ enabled: !!baseForm.flowButtonEnabled, target: typeof baseForm.flowTarget === "string" ? baseForm.flowTarget : "log", label: (typeof baseForm.flowButtonLabel === "string" && baseForm.flowButtonLabel.trim()) ? baseForm.flowButtonLabel.trim() : "Send to Flow", param: typeof baseForm.flowButtonParam === "string" ? baseForm.flowButtonParam : "" }],
     };
     const formResult = await db.insert(newFormDoc);
     let latestProfile = await db.get(profileId);
@@ -1529,8 +1628,17 @@ app.get("/profile/:id/entry/new", requireEditor, async (req, res) => {
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).send(renderErrorPage("Profile not found"));
     }
+    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+    const sources = Array.isArray(doc.fieldDefaultSources) ? doc.fieldDefaultSources : [];
+    const now = new Date().toISOString();
+    const currentUser = req.session && req.session.user ? String(req.session.user) : "";
+    const initialValues = {};
+    for (let i = 0; i < fieldNames.length; i++) {
+      const src = sources[i];
+      initialValues[fieldNames[i]] = resolveDefaultValue(src, req);
+    }
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderCreateEntryPage(doc));
+    res.send(renderCreateEntryPage(doc, initialValues));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Profile not found"));
     console.error("Error loading profile:", err);
@@ -1554,6 +1662,13 @@ app.post("/api/profiles/:id/entries", requireEditor, async (req, res) => {
     const now = new Date().toISOString();
     record.createdAt = now;
     record.updatedAt = now;
+    const sources = Array.isArray(doc.fieldDefaultSources) ? doc.fieldDefaultSources : [];
+    for (let i = 0; i < fieldNames.length; i++) {
+      const src = sources[i];
+      if (src === "createdAt" || src === "updatedAt" || src === "currentUser") {
+        record[fieldNames[i]] = resolveDefaultValue(src, req);
+      }
+    }
     const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
     record.sortKey = buildSortKey(record, sortKeyFields);
     const requestedEntryFormId = typeof values.entryFormId === "string" ? values.entryFormId.trim() : "";
@@ -1602,8 +1717,13 @@ app.post("/api/profile/:id/entry/:entryId/send-to-flow", requireAuth, async (req
         // form missing
       }
     }
-    const target = formDoc && (formDoc.flowTarget === "api" || formDoc.flowTarget === "localDb" || formDoc.flowTarget === "log") ? formDoc.flowTarget : "log";
-    const flowButtonParam = formDoc && typeof formDoc.flowButtonParam === "string" ? formDoc.flowButtonParam : "";
+    const flowIndex = req.body && typeof req.body.flowIndex === "number" ? req.body.flowIndex : (req.body && typeof req.body.flowIndex === "string" ? parseInt(req.body.flowIndex, 10) : undefined);
+    const flowConfigs = Array.isArray(formDoc && formDoc.flowConfigs) ? formDoc.flowConfigs : [];
+    const flowConfig = (typeof flowIndex === "number" && flowIndex >= 0 && flowConfigs[flowIndex]) ? flowConfigs[flowIndex] : null;
+    const target = flowConfig
+      ? (flowConfig.target === "api" || flowConfig.target === "localDb" || flowConfig.target === "log" ? flowConfig.target : "log")
+      : (formDoc && (formDoc.flowTarget === "api" || formDoc.flowTarget === "localDb" || formDoc.flowTarget === "log") ? formDoc.flowTarget : "log");
+    const flowButtonParam = flowConfig ? (typeof flowConfig.param === "string" ? flowConfig.param : "") : (formDoc && typeof formDoc.flowButtonParam === "string" ? formDoc.flowButtonParam : "");
     sendFlowMessage("entry.sendToFlow", {
       target,
       profileId,
@@ -1767,6 +1887,33 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     if (err?.statusCode === 404) return res.status(404).json({ error: "Entry not found" });
     if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict; refresh and try again" });
     console.error("Error updating entry:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const entryId = req.params.entryId;
+    const doc = await db.get(profileId);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const record = await db.get(entryId);
+    if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
+      return res.status(404).json({ error: "Entry not found" });
+    }
+    await db.destroy(entryId, record._rev);
+    clearProfileListCache(profileId);
+    const returnParts = [];
+    if (req.query.page) returnParts.push("page=" + encodeURIComponent(String(req.query.page)));
+    if (req.query.q) returnParts.push("q=" + encodeURIComponent(req.query.q));
+    const returnQueryStr = returnParts.length > 0 ? "?" + returnParts.join("&") : "";
+    const redirect = "/profile/" + encodeURIComponent(profileId) + returnQueryStr;
+    res.json({ ok: true, redirect });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Entry not found" });
+    console.error("Error deleting entry:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1990,7 +2137,7 @@ app.get("/profile/:id", async (req, res) => {
   }
 });
 
-function renderCreateEntryPage(doc) {
+function renderCreateEntryPage(doc, initialValues = {}) {
   const title = escapeHtml(doc.name || "Elenko database");
   const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
   const profileId = doc._id;
@@ -2001,11 +2148,14 @@ function renderCreateEntryPage(doc) {
     fieldNames.length > 0
       ? fieldNames
           .map(
-            (fn) => `
+            (fn) => {
+              const val = initialValues[fn] != null ? String(initialValues[fn]) : "";
+              return `
         <tr>
           <td class="label">${escapeHtml(fn)}</td>
-          <td><input type="text" class="entry-field" name="${escapeHtml(fn)}" placeholder="${escapeHtml(fn)}"></td>
-        </tr>`
+          <td><input type="text" class="entry-field" name="${escapeHtml(fn)}" placeholder="${escapeHtml(fn)}" value="${escapeHtml(val)}"></td>
+        </tr>`;
+            }
           )
           .join("")
       : `<tr><td colspan="2" class="empty">No fields defined. Edit the profile to add field names.</td></tr>`;
@@ -2081,7 +2231,8 @@ function renderCreateEntryPage(doc) {
         if (!r.ok) { msgEl.textContent = result.error || 'Failed'; msgEl.className = 'msg err'; return; }
         msgEl.textContent = 'Entry created.';
         msgEl.className = 'msg ok';
-        setTimeout(() => { window.location.href = ${JSON.stringify(backUrl)}; }, 800);
+        const entryViewUrl = '/profile/' + encodeURIComponent(profileId) + '/entry/' + encodeURIComponent(result.id);
+        setTimeout(() => { window.location.href = entryViewUrl; }, 800);
       } catch (err) {
         msgEl.textContent = err.message || 'Request failed';
         msgEl.className = 'msg err';
@@ -2133,6 +2284,7 @@ function buildOrderedItems(profileFieldNames, formDoc) {
         x: item.x,
         y: item.y,
         height: item.height,
+        fieldType: item.fieldType === "markdown" ? "markdown" : "text",
       });
     } else if (item.labelId && labelsById[item.labelId] !== undefined && !seenLabels.has(item.labelId)) {
       seenLabels.add(item.labelId);
@@ -2157,6 +2309,7 @@ function buildOrderedItems(profileFieldNames, formDoc) {
         x: item && item.x,
         y: item && item.y,
         height: item && item.height,
+        fieldType: item && item.fieldType === "markdown" ? "markdown" : "text",
       });
     }
   }
@@ -2212,8 +2365,18 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   const fieldBg = theme.fieldBackground || DEFAULT_ENTRY_VIEW_THEME.fieldBackground;
   const layout = formDoc && (formDoc.layout === "grid" || formDoc.layout === "stack") ? formDoc.layout : "table";
   const formCustomCss = formDoc && formDoc.customCss ? formDoc.customCss : "";
-  const showFlowButton = !!(formDoc && formDoc.flowButtonEnabled);
-  const flowButtonLabel = formDoc && typeof formDoc.flowButtonLabel === "string" && formDoc.flowButtonLabel.trim() ? formDoc.flowButtonLabel.trim() : "Send to Flow";
+  const flowConfigsArray = Array.isArray(formDoc && formDoc.flowConfigs) && formDoc.flowConfigs.length > 0
+    ? formDoc.flowConfigs
+    : (formDoc && formDoc.flowButtonEnabled ? [{ enabled: true, label: (formDoc.flowButtonLabel && typeof formDoc.flowButtonLabel === "string" && formDoc.flowButtonLabel.trim()) ? formDoc.flowButtonLabel.trim() : "Send to Flow" }] : []);
+  const flowButtonsHtml = flowConfigsArray.map((c, i) => {
+    const enabled = c && (c.enabled === true || c.enabled === "true");
+    if (!enabled) return "";
+    const label = (c && typeof c.label === "string" && c.label.trim()) ? c.label.trim() : "Send to Flow";
+    const hasIndex = Array.isArray(formDoc.flowConfigs) && formDoc.flowConfigs.length > 0;
+    const dataIndex = hasIndex ? ' data-flow-index="' + i + '"' : "";
+    return '<button type="button" class="btn-flow" data-profile-id="' + escapeHtml(profileId) + '" data-entry-id="' + escapeHtml(entryId) + '"' + dataIndex + '>' + escapeHtml(label) + '</button>';
+  }).join("");
+  const hasFlowButtons = flowButtonsHtml.length > 0;
   const formLabel = formDoc && (formDoc.name || formDoc._id) ? String(formDoc.name || formDoc._id) : "";
 
   const themeVars = `
@@ -2240,6 +2403,19 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     const val = record[o.fieldName];
     return val != null ? String(val) : "";
   }
+  function formatValueHtml(o, value) {
+    if (o.type === "label") return "";
+    if (o.fieldType === "markdown" && value) {
+      try {
+        const withNewlines = String(value).replace(/\\n/g, "\n").replace(/\\r/g, "\r");
+        const html = marked.parse(withNewlines);
+        return typeof html === "string" ? html : escapeHtml(value);
+      } catch (_) {
+        return escapeHtml(value);
+      }
+    }
+    return escapeHtml(value);
+  }
 
   let contentHtml;
   if (orderedItems.length === 0) {
@@ -2261,10 +2437,12 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
         </div>`;
           }
+          const valueHtml = formatValueHtml(o, value);
+          const valueClass = o.fieldType === "markdown" ? " value entry-value-markdown" : " value";
           return `
         <div class="entry-field-block"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
-          <div class="value">${escapeHtml(value)}</div>
+          <div class="${valueClass}">${valueHtml}</div>
         </div>`;
         })
         .join("") +
@@ -2287,10 +2465,12 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
         </div>`;
           }
+          const valueHtml = formatValueHtml(o, value);
+          const valueClass = o.fieldType === "markdown" ? " value entry-value-markdown" : " value";
           return `
         <div class="entry-grid-cell"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
-          <div class="value">${escapeHtml(value)}</div>
+          <div class="${valueClass}">${valueHtml}</div>
         </div>`;
         })
         .join("") +
@@ -2309,10 +2489,12 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
           <td class="${lc}" colspan="2"${w}>${escapeHtml(itemLabel(o))}</td>
         </tr>`;
           }
+          const valueHtml = formatValueHtml(o, value);
+          const valueClass = o.fieldType === "markdown" ? " value entry-value-markdown" : " value";
           return `
         <tr>
           <td class="${lc}">${escapeHtml(itemLabel(o))}</td>
-          <td class="value">${escapeHtml(value)}</td>
+          <td class="${valueClass}">${valueHtml}</td>
         </tr>`;
         })
         .join("");
@@ -2346,6 +2528,15 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .entry-view-grid { display: grid; gap: 1rem; }
     .entry-grid-cell .label { display: block; margin-bottom: 0.25rem; color: var(--entry-label, #8b949e); }
     .entry-grid-cell .value { background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 6px; padding: 0.75rem 1rem; }
+    .entry-value-markdown { line-height: 1.5; }
+    .entry-value-markdown p { margin: 0 0 0.75rem 0; }
+    .entry-value-markdown p:last-child { margin-bottom: 0; }
+    .entry-value-markdown ul, .entry-value-markdown ol { margin: 0 0 0.75rem 0; padding-left: 1.5rem; }
+    .entry-value-markdown h1, .entry-value-markdown h2, .entry-value-markdown h3 { margin: 1rem 0 0.5rem 0; font-weight: 600; }
+    .entry-value-markdown h1 { font-size: 1.25rem; }
+    .entry-value-markdown h2 { font-size: 1.1rem; }
+    .entry-value-markdown h3 { font-size: 1rem; }
+    .entry-value-markdown a { color: var(--entry-link, #58a6ff); }
     .entry-grid-cell.entry-label-only .label { white-space: nowrap; }
     .entry-label-row .label { white-space: nowrap; }
   </style>
@@ -2353,36 +2544,15 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
 </head>
 <body>
   <div class="actions"><a href="${escapeHtml(backUrl)}">← Back to database</a>${canEdit ? ` <a href="${editUrl}">Edit</a>` : ""}</div>
-  ${showFlowButton ? `<div class="actions" style="margin-top:0.5rem;"><button type="button" id="send-to-flow-btn" class="btn-flow" data-profile-id="${escapeHtml(profileId)}" data-entry-id="${escapeHtml(entryId)}">${escapeHtml(flowButtonLabel)}</button></div><div id="flow-msg" class="flow-msg"></div>` : ""}
+  <div class="actions entry-flow-actions" style="margin-top:0.5rem;display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;">
+    ${flowButtonsHtml}
+    <button type="button" id="refresh-entry-btn" class="btn-flow btn-flow-secondary" style="${hasFlowButtons ? "margin-left:0;" : ""}">Refresh</button>
+  </div>
+  ${hasFlowButtons ? '<div id="flow-msg" class="flow-msg"></div>' : ""}
   <h1>${title}</h1>
   ${formLabel ? `<p class="sub">Form: ${escapeHtml(formLabel)}</p>` : ""}
   ${contentHtml}
-  ${showFlowButton ? `
-  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; background: #238636; color: #fff; }.btn-flow:hover { background: #2ea043; }.btn-flow:disabled { opacity: 0.6; cursor: not-allowed; }.flow-msg { margin-top: 0.5rem; font-size: 0.875rem; }.flow-msg.ok { color: #3fb950; }.flow-msg.err { color: #f85149; }</style>
-  <script>
-    (function() {
-      var btn = document.getElementById('send-to-flow-btn');
-      var msgEl = document.getElementById('flow-msg');
-      if (!btn || !msgEl) return;
-      btn.onclick = function() {
-        var pid = btn.getAttribute('data-profile-id');
-        var eid = btn.getAttribute('data-entry-id');
-        if (!pid || !eid) return;
-        btn.disabled = true;
-        msgEl.textContent = '';
-        msgEl.className = 'flow-msg';
-        var url = '/api/profile/' + encodeURIComponent(pid) + '/entry/' + encodeURIComponent(eid) + '/send-to-flow';
-        fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
-          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-          .then(function(o) {
-            if (o.ok) { msgEl.textContent = 'Sent to Flow.'; msgEl.className = 'flow-msg ok'; }
-            else { msgEl.textContent = o.data.error || 'Failed'; msgEl.className = 'flow-msg err'; }
-            btn.disabled = false;
-          })
-          .catch(function(e) { msgEl.textContent = e.message || 'Request failed'; msgEl.className = 'flow-msg err'; btn.disabled = false; });
-      };
-    })();
-  </script>` : ""}
+  ${hasFlowButtons ? "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; background: #238636; color: #fff; }.btn-flow:hover { background: #2ea043; }.btn-flow:disabled { opacity: 0.6; cursor: not-allowed; }.btn-flow-secondary { background: #21262d; }.btn-flow-secondary:hover { background: #30363d; }.flow-msg { margin-top: 0.5rem; font-size: 0.875rem; }.flow-msg.ok { color: #3fb950; }.flow-msg.err { color: #f85149; }</style>\n  <script>\n    (function() {\n      var msgEl = document.getElementById(\"flow-msg\");\n      document.querySelectorAll(\".entry-flow-actions .btn-flow[data-entry-id]\").forEach(function(btn) {\n        if (btn.id === \"refresh-entry-btn\") return;\n        btn.onclick = function() {\n          var pid = btn.getAttribute(\"data-profile-id\");\n          var eid = btn.getAttribute(\"data-entry-id\");\n          if (!pid || !eid) return;\n          btn.disabled = true;\n          if (msgEl) { msgEl.textContent = \"\"; msgEl.className = \"flow-msg\"; }\n          var body = {};\n          var idx = btn.getAttribute(\"data-flow-index\");\n          if (idx !== null && idx !== \"\") body.flowIndex = parseInt(idx, 10);\n          var url = \"/api/profile/\" + encodeURIComponent(pid) + \"/entry/\" + encodeURIComponent(eid) + \"/send-to-flow\";\n          fetch(url, { method: \"POST\", headers: { \"Content-Type\": \"application/json\" }, body: JSON.stringify(body) })\n            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })\n            .then(function(o) {\n              if (o.ok && msgEl) { msgEl.textContent = \"Sent to Flow.\"; msgEl.className = \"flow-msg ok\"; }\n              else if (msgEl) { msgEl.textContent = o.data.error || \"Failed\"; msgEl.className = \"flow-msg err\"; }\n              btn.disabled = false;\n            })\n            .catch(function(e) { if (msgEl) { msgEl.textContent = e.message || \"Request failed\"; msgEl.className = \"flow-msg err\"; } btn.disabled = false; });\n        };\n      });\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>" : "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }.btn-flow-secondary { background: #21262d; color: #e6edf3; }.btn-flow-secondary:hover { background: #30363d; }</style>\n  <script>\n    (function() {\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>"}
 </body>
 </html>`;
 }
@@ -2562,6 +2732,8 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     .btn:hover { background: #2ea043; }
     .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; }
     .btn-secondary:hover { background: #30363d; }
+    .btn-delete { background: #da3633; color: #fff; }
+    .btn-delete:hover { background: #f85149; }
     .empty { color: var(--entry-label, #8b949e); font-style: italic; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
@@ -2575,6 +2747,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     ${formChoicesHtml}
     <button type="submit" form="entry-form" class="btn" style="margin-left:1rem;">Save</button>
     <a href="${escapeHtml(backUrl)}" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
+    <button type="button" class="btn btn-delete" id="delete-entry-btn" style="margin-left:0.5rem;">Delete</button>
   </div>
   <h1>${title}</h1>
   <p class="sub">Edit entry${formLabel ? ` – Form: ${escapeHtml(formLabel)}` : ""}</p>
@@ -2617,6 +2790,24 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
         msgEl.className = 'msg err';
       }
     };
+
+    const deleteBtn = document.getElementById('delete-entry-btn');
+    if (deleteBtn) {
+      deleteBtn.onclick = async () => {
+        if (!confirm('Are you sure you want to delete this entry? This cannot be undone.')) return;
+        deleteBtn.disabled = true;
+        try {
+          const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/entries/' + encodeURIComponent(entryId), { method: 'DELETE' });
+          const result = await r.json();
+          if (!r.ok) { msgEl.textContent = result.error || 'Delete failed'; msgEl.className = 'msg err'; deleteBtn.disabled = false; return; }
+          window.location.href = ${JSON.stringify(backUrl)};
+        } catch (err) {
+          msgEl.textContent = err.message || 'Request failed';
+          msgEl.className = 'msg err';
+          deleteBtn.disabled = false;
+        }
+      };
+    }
   </script>
 </body>
 </html>`;
@@ -2675,9 +2866,9 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             const escaped = escapeHtml(text);
             if (i === 0) {
               const entryUrl = "/profile/" + encodeURIComponent(doc._id) + "/entry/" + encodeURIComponent(rec._id) + returnQueryStr;
-              return `<td class="entry-link-cell"><a href="${entryUrl}">${escaped}</a></td>`;
+              return `<td class="entry-link-cell"><span class="entry-cell-clamp"><a href="${entryUrl}">${escaped}</a></span></td>`;
             }
-            return `<td>${escaped}</td>`;
+            return `<td><span class="entry-cell-clamp">${escaped}</span></td>`;
           });
           return `\n        <tr>${cells.join("")}</tr>`;
         })
@@ -2706,9 +2897,10 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; }
     .btn:hover { background: #2ea043; text-decoration: none; }
     table { width: 100%; table-layout: fixed; border-collapse: collapse; background: var(--profile-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--profile-table-border, #21262d); }
+    th, td { padding: 0.35rem 1rem; text-align: left; border-bottom: 1px solid var(--profile-table-border, #21262d); line-height: 1.35; }
     th { background: var(--profile-table-header-bg, #21262d); color: var(--profile-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
+    .entry-cell-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
     .entry-link-cell a { color: var(--profile-link, #58a6ff); text-decoration: none; }
     .entry-link-cell a:hover { text-decoration: underline; }
     .empty { color: var(--profile-label, #8b949e); font-style: italic; }
@@ -2896,6 +3088,7 @@ function renderApisListPage(apis) {
             (a) => `
         <tr>
           <td><a href="/apis/${encodeURIComponent(a._id)}/edit">${escapeHtml(a.name || a._id)}</a></td>
+          <td><code class="id-cell">${escapeHtml(a._id || "")}</code></td>
           <td>${escapeHtml(truncate(a.description || "", 40))}</td>
           <td>${escapeHtml(a.method || "GET")}</td>
           <td>${escapeHtml(truncate(a.url || "", 50))}</td>
@@ -2905,7 +3098,7 @@ function renderApisListPage(apis) {
           .join("")
       : `
         <tr>
-          <td colspan="5" class="empty">No APIs yet. Create one to use the &quot;Call API&quot; flow target.</td>
+          <td colspan="6" class="empty">No APIs yet. Create one to use the &quot;Call API&quot; flow target.</td>
         </tr>`;
 
   return `<!DOCTYPE html>
@@ -2930,6 +3123,7 @@ function renderApisListPage(apis) {
     tr:last-child td { border-bottom: none; }
     .edit-link, .copy-link { color: #58a6ff; margin-right: 0.5rem; }
     .empty { color: #8b949e; font-style: italic; }
+    .id-cell { font-size: 0.85em; color: #8b949e; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -2937,7 +3131,7 @@ function renderApisListPage(apis) {
   <h1>APIs</h1>
   <p class="sub">Configure REST API targets for the &quot;Call API&quot; flow. Use the API document ID or name in the entry form flow parameter.</p>
   <table>
-    <thead><tr><th>Name</th><th>Description</th><th>Method</th><th>URL</th><th>Actions</th></tr></thead>
+    <thead><tr><th>Name</th><th>ID</th><th>Description</th><th>Method</th><th>URL</th><th>Actions</th></tr></thead>
     <tbody>${rows}
     </tbody>
   </table>
@@ -2974,6 +3168,10 @@ function renderEditApiPage(doc, err, returnTo) {
   const methodVal = doc && doc.method === "POST" ? "POST" : doc && doc.method === "PUT" ? "PUT" : doc && doc.method === "PATCH" ? "PATCH" : "GET";
   const apiKeyRefVal = doc && typeof doc.apiKeyRef === "string" ? escapeHtml(doc.apiKeyRef) : "";
   const responseTargetVal = doc && doc.responseTarget === "create" ? "create" : "update";
+  const templateVal = doc && typeof doc.template === "string" ? escapeHtml(doc.template) : "";
+  const responseFieldVal = doc && typeof doc.responseField === "string" ? escapeHtml(doc.responseField) : "";
+  const responseStartVal = doc && typeof doc.responseStart === "string" ? escapeHtml(doc.responseStart) : "";
+  const responseEndVal = doc && typeof doc.responseEnd === "string" ? escapeHtml(doc.responseEnd) : "";
   const returnToRaw = (typeof returnTo === "string" && returnTo.trim()) ? returnTo.trim() : "";
   const defaultNameForKey = nameVal ? encodeURIComponent(nameVal) : "";
   const keyEditHref = apiKeyRefVal
@@ -3009,7 +3207,11 @@ function renderEditApiPage(doc, err, returnTo) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/apis">← APIs</a></div>
+  <div class="actions">
+    <a href="/apis">← APIs</a>
+    <button type="submit" form="api-form" class="btn btn-primary" style="margin-left:1rem;">${submitLabel}</button>
+    <a href="/apis" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
+  </div>
   <h1>${title}</h1>
   ${errHtml}
   <form id="api-form">
@@ -3028,6 +3230,14 @@ function renderEditApiPage(doc, err, returnTo) {
       <option value="PUT"${methodVal === "PUT" ? " selected" : ""}>PUT</option>
       <option value="PATCH"${methodVal === "PATCH" ? " selected" : ""}>PATCH</option>
     </select>
+    <label for="template">Template <span class="sub">(optional) API call with placeholders: use #fieldName# for Elenko document fields, e.g. {directory-query:'#customer#'}</span></label>
+    <textarea id="template" name="template" placeholder='e.g. {"query":"#customer#"}' rows="4" style="width:100%;max-width:28rem;font-family:monospace;">${templateVal}</textarea>
+    <label for="responseField">Response field <span class="sub">(optional) Elenko document field name where the raw API response body will be stored when updating the same entry)</span></label>
+    <input type="text" id="responseField" name="responseField" placeholder="e.g. apiResponse" value="${responseFieldVal}">
+    <label for="responseStart">Response start <span class="sub">(optional) Character sequence that marks the start of the useful text; everything before and including it is removed)</span></label>
+    <input type="text" id="responseStart" name="responseStart" placeholder='e.g. "content":"' value="${responseStartVal}" style="font-family:monospace;">
+    <label for="responseEnd">Response end <span class="sub">(optional) Character sequence that marks the end of the useful text; it and everything after it is removed)</span></label>
+    <input type="text" id="responseEnd" name="responseEnd" placeholder='e.g. "}}]}' value="${responseEndVal}" style="font-family:monospace;">
     <label for="apiKeyRef">API key document ID <span class="sub">(set from API name below, or enter manually)</span></label>
     <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
       <input type="text" id="apiKeyRef" name="apiKeyRef" placeholder="key_..." value="${apiKeyRefVal}" style="max-width:20rem;">
@@ -3039,10 +3249,7 @@ function renderEditApiPage(doc, err, returnTo) {
       <option value="update"${responseTargetVal === "update" ? " selected" : ""}>Update same entry (lastApiResponse)</option>
       <option value="create"${responseTargetVal === "create" ? " selected" : ""}>Create new entry in same profile</option>
     </select>
-    <div>
-      <button type="submit" class="btn btn-primary">${submitLabel}</button>
-      <a href="/apis" class="btn btn-secondary">Cancel</a>
-    </div>
+    <p class="sub" style="margin-top:0.25rem;">When updating the same entry, <code>lastApiResponse</code> on the document will contain the full API response (statusCode, body, timestamp, success, error).</p>
   </form>
   <div id="msg"></div>
   <script>
@@ -3084,17 +3291,20 @@ function renderEditApiPage(doc, err, returnTo) {
       var method = document.getElementById('method').value || 'GET';
       var apiKeyRef = (document.getElementById('apiKeyRef').value || '').trim();
       var responseTarget = document.getElementById('responseTarget').value || 'update';
+      var template = (document.getElementById('template').value || '').trim();
+      var responseField = (document.getElementById('responseField').value || '').trim();
+      var responseStart = (document.getElementById('responseStart').value || '');
+      var responseEnd = (document.getElementById('responseEnd').value || '');
       var urlApi = formId ? '/api/apis/' + encodeURIComponent(formId) : '/api/apis';
       var methodHttp = formId ? 'PUT' : 'POST';
-      var body = { name: name, description: description, url: url, method: method, apiKeyRef: apiKeyRef, responseTarget: responseTarget };
+      var body = { name: name, description: description, url: url, method: method, template: template, responseField: responseField, responseStart: responseStart, responseEnd: responseEnd, apiKeyRef: apiKeyRef, responseTarget: responseTarget };
       try {
         var r = await fetch(urlApi, { method: methodHttp, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         var data = await r.json();
         if (!r.ok) { msgEl.textContent = data.error || 'Failed'; msgEl.className = 'msg err'; return; }
         msgEl.textContent = formId ? 'Saved.' : 'Created.';
         msgEl.className = 'msg ok';
-        if (!formId) setTimeout(function() { window.location.href = '/apis'; }, 800);
-        else { document.getElementById('rev').value = data.rev; }
+        setTimeout(function() { window.location.href = '/apis'; }, formId ? 600 : 800);
       } catch (err) {
         msgEl.textContent = err.message || 'Request failed';
         msgEl.className = 'msg err';
@@ -3143,7 +3353,11 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/apis">← APIs</a></div>
+  <div class="actions">
+    <a href="/apis">← APIs</a>
+    <button type="submit" form="api-key-form" class="btn btn-primary" style="margin-left:1rem;">${submitLabel}</button>
+    <a href="/apis" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
+  </div>
   <h1>${title}</h1>
   <p class="sub">Stored in the config store. The document ID is derived from the name (e.g. &quot;My Service&quot; → key_my-service). Use this ID in the API form as &quot;API key document ID&quot;.</p>
   ${errHtml}
@@ -3155,10 +3369,6 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName) {
     <input type="text" id="name" name="name" required placeholder="e.g. OpenWeather API key" value="${nameVal}">
     <label for="key">API key / secret</label>
     <input type="password" id="key" name="key" placeholder="${escapeHtml(keyPlaceholder)}" autocomplete="off">
-    <div>
-      <button type="submit" class="btn btn-primary">${submitLabel}</button>
-      <a href="/apis" class="btn btn-secondary">Cancel</a>
-    </div>
   </form>
   <div id="msg"></div>
   <script>
@@ -3184,8 +3394,9 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName) {
         if (returnToVal && data.id) {
           var sep = returnToVal.indexOf('?') !== -1 ? '&' : '?';
           setTimeout(function() { window.location.href = returnToVal + sep + 'apiKeyRef=' + encodeURIComponent(data.id); }, 500);
-        } else if (!keyId) setTimeout(function() { window.location.href = '/apis'; }, 800);
-        else { document.getElementById('rev').value = data.rev; }
+        } else {
+          setTimeout(function() { window.location.href = '/apis'; }, keyId ? 600 : 800);
+        }
       } catch (err) {
         msgEl.textContent = err.message || 'Request failed';
         msgEl.className = 'msg err';
@@ -3307,10 +3518,10 @@ function renderEntryFormPage(doc, rev, err) {
   const textEdit = escapeHtml(themeTextEditHex);
   const layout = doc && (doc.layout === "grid" || doc.layout === "stack") ? doc.layout : "table";
   const customCss = doc ? escapeHtml(doc.customCss || "") : "";
-  const flowButtonChecked = doc && doc.flowButtonEnabled ? " checked" : "";
-  const flowTargetValue = doc && doc.flowTarget === "api" ? "api" : doc && doc.flowTarget === "localDb" ? "localDb" : "log";
-  const flowButtonLabelValue = doc && typeof doc.flowButtonLabel === "string" ? escapeHtml(doc.flowButtonLabel) : "Send to Flow";
-  const flowButtonParamValue = doc && typeof doc.flowButtonParam === "string" ? escapeHtml(doc.flowButtonParam) : "";
+  const flowConfigs = Array.isArray(doc && doc.flowConfigs) && doc.flowConfigs.length > 0
+    ? doc.flowConfigs
+    : [{ enabled: !!(doc && doc.flowButtonEnabled), target: (doc && doc.flowTarget === "api") ? "api" : (doc && doc.flowTarget === "localDb") ? "localDb" : "log", label: (doc && typeof doc.flowButtonLabel === "string" && doc.flowButtonLabel.trim()) ? doc.flowButtonLabel.trim() : "Send to Flow", param: (doc && typeof doc.flowButtonParam === "string") ? doc.flowButtonParam : "" }];
+  const initialFlowConfigsJson = JSON.stringify(flowConfigs);
   const labelsArr = (doc && Array.isArray(doc.labels) ? doc.labels : []);
   const fieldLayout = (doc && Array.isArray(doc.fieldLayout) ? doc.fieldLayout : []);
   const revInput = rev ? `<input type="hidden" id="rev" value="${escapeHtml(rev)}">` : "";
@@ -3340,10 +3551,15 @@ function renderEntryFormPage(doc, rev, err) {
             const xVal = item.x != null ? String(item.x) : "";
             const yVal = item.y != null ? String(item.y) : "";
             const hVal = item.height != null ? String(item.height) : "";
+            const fieldTypeVal = item.fieldType === "markdown" ? "markdown" : "text";
+            const typeSelect = item.fieldName
+              ? `<select class="fl-type"><option value="text"${fieldTypeVal === "text" ? " selected" : ""}>Text</option><option value="markdown"${fieldTypeVal === "markdown" ? " selected" : ""}>Markdown</option></select>`
+              : "<span class=\"sub\">—</span>";
             return `
         <tr class="field-layout-row">
           <td><input type="text" class="fl-field" placeholder="Field name or label id" value="${escapeHtml(fieldOrLabel)}"></td>
           <td><input type="number" class="fl-order" min="0" value="${item.order != null ? Number(item.order) : idx}"></td>
+          <td>${typeSelect}</td>
           <td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="${escapeHtml(item.width || "100%")}"></td>
           <td><input type="number" class="fl-x" step="any" placeholder="—" value="${escapeHtml(xVal)}"></td>
           <td><input type="number" class="fl-y" step="any" placeholder="—" value="${escapeHtml(yVal)}"></td>
@@ -3386,10 +3602,20 @@ function renderEntryFormPage(doc, rev, err) {
     .theme-row label { margin: 0; flex: 0 0 10rem; }
     .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid #30363d; border-radius: 4px; background: #161b22; }
     .theme-row input[type="text"] { flex: 1; min-width: 8.5rem; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.875rem; }
+    .flow-config-table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
+    .flow-config-table th, .flow-config-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #21262d; }
+    .flow-config-table th { color: #8b949e; font-weight: 600; font-size: 0.875rem; }
+    .flow-config-table tbody tr:last-child td { border-bottom: none; }
+    .flow-config-table input[type="text"] { margin: 0; }
+    .flow-config-table select { margin: 0; min-width: 10rem; }
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/entry-forms" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem;">← Entry forms</a></div>
+  <div class="actions">
+    <a href="/entry-forms" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem;">← Entry forms</a>
+    <button type="submit" form="entry-form-form" class="btn btn-primary" style="margin-left:1rem;">${submitLabel}</button>
+    <a href="/entry-forms" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
+  </div>
   <h1>${title}</h1>
   <p class="sub">Used to style the single-entry (read-only) view: colours and field positions/sizes.</p>
   ${errHtml}
@@ -3423,45 +3649,32 @@ function renderEntryFormPage(doc, rev, err) {
       </tbody>
     </table>
     <button type="button" class="btn btn-secondary" id="add-label" style="margin-top:0.5rem;">+ Add label</button>
-    <label class="field-list-label" style="margin-top:1.5rem;">Field layout (optional: field name or label id, order, width, position)</label>
-    <p class="sub" style="margin-top:0;">Use a profile field name or a label id from above. Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning; Grid uses width as column size only.</p>
+    <label class="field-list-label" style="margin-top:1.5rem;">Field layout (optional: field name or label id, order, type, width, position)</label>
+    <p class="sub" style="margin-top:0;">Use a profile field name or a label id from above. Type: Text (plain) or Markdown (rendered in view mode). Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning; Grid uses width as column size only.</p>
     <table class="field-layout-table">
-      <thead><tr><th>Field name or label id</th><th>Order</th><th>Width</th><th>X (ch)</th><th>Y (em)</th><th>Height (em)</th><th></th></tr></thead>
+      <thead><tr><th>Field name or label id</th><th>Order</th><th>Type</th><th>Width</th><th>X (ch)</th><th>Y (em)</th><th>Height (em)</th><th></th></tr></thead>
       <tbody id="field-layout-tbody">${fieldLayoutRows}
       </tbody>
     </table>
     <button type="button" class="btn btn-secondary" id="add-field-layout" style="margin-top:0.5rem;">+ Add row</button>
-    <label style="margin-top:1.5rem;">Flow button (single-entry view)</label>
-    <p class="sub" style="margin-top:0;">When enabled, a button appears on the single-entry view that sends the current entry dataset to the Flow facility.</p>
-    <div style="margin-top:0.5rem;">
-      <label style="display:inline-flex;align-items:center;gap:0.5rem;margin:0;cursor:pointer;">
-        <input type="checkbox" id="flowButtonEnabled" name="flowButtonEnabled"${flowButtonChecked}>
-        <span>Show &quot;Send to Flow&quot; button</span>
-      </label>
-    </div>
-    <div style="margin-top:0.75rem;">
-      <label for="flowTarget" style="margin-top:0;">Target</label>
-      <select id="flowTarget" name="flowTarget">
-        <option value="log"${flowTargetValue === "log" ? " selected" : ""}>Log file</option>
-        <option value="localDb"${flowTargetValue === "localDb" ? " selected" : ""}>Send to Local Database</option>
-        <option value="api"${flowTargetValue === "api" ? " selected" : ""}>Call API</option>
-      </select>
-    </div>
-    <div style="margin-top:0.75rem;">
-      <label for="flowButtonLabel">Button title</label>
-      <input type="text" id="flowButtonLabel" name="flowButtonLabel" placeholder="Send to Flow" value="${flowButtonLabelValue}">
-    </div>
-    <div style="margin-top:0.75rem;">
-      <label for="flowButtonParam">Additional parameter</label>
-      <input type="text" id="flowButtonParam" name="flowButtonParam" placeholder="For Log: optional. For Local Database: target profile ID. For Call API: API document ID or name" value="${flowButtonParamValue}">
-    </div>
+    <label style="margin-top:1.5rem;">Flow buttons (single-entry view)</label>
+    <p class="sub" style="margin-top:0;">Each row adds a button on the single-entry view that sends the entry dataset to the Flow facility. First column enables the button.</p>
+    <table class="flow-config-table" style="margin-top:0.5rem;">
+      <thead>
+        <tr>
+          <th style="width:4rem;">Enabled</th>
+          <th style="min-width:10rem;">Target</th>
+          <th style="min-width:10rem;">Button title</th>
+          <th>Additional parameter</th>
+          <th style="width:5rem;"></th>
+        </tr>
+      </thead>
+      <tbody id="flow-config-tbody"></tbody>
+    </table>
+    <button type="button" class="btn btn-secondary" id="add-flow-config" style="margin-top:0.5rem;">+ Add flow</button>
     <label for="customCss">Custom CSS (entry view and edit)</label>
     <p class="sub" style="margin-top:0;">Optional CSS applied to single-entry view and edit entry page. <a href="/entry-forms/css-help" target="_blank" rel="noopener noreferrer">CSS parameters reference</a></p>
     <textarea id="customCss" name="customCss" placeholder="Optional CSS">${customCss}</textarea>
-    <div>
-      <button type="submit" class="btn btn-primary">${submitLabel}</button>
-      <a href="/entry-forms" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
-    </div>
   </form>
   <div id="msg"></div>
   <script>
@@ -3473,6 +3686,23 @@ function renderEntryFormPage(doc, rev, err) {
     const msgEl = document.getElementById('msg');
     const formId = ${isEdit ? JSON.stringify(doc._id) : "null"};
 
+    const flowConfigTbody = document.getElementById('flow-config-tbody');
+    const addFlowConfigBtn = document.getElementById('add-flow-config');
+    const initialFlowConfigs = ${initialFlowConfigsJson};
+    function addFlowConfigRow(cfg) {
+      const tr = document.createElement('tr');
+      tr.className = 'flow-config-row';
+      const enabled = !!cfg.enabled;
+      const target = (cfg.target === 'localDb' || cfg.target === 'api') ? cfg.target : 'log';
+      const label = (cfg && cfg.label != null) ? String(cfg.label).replace(/"/g, '&quot;') : '';
+      const param = (cfg && cfg.param != null) ? String(cfg.param).replace(/"/g, '&quot;') : '';
+      tr.innerHTML = '<td><input type="checkbox" class="flow-cfg-enabled" ' + (enabled ? 'checked' : '') + '></td><td><select class="flow-cfg-target"><option value="log"' + (target === 'log' ? ' selected' : '') + '>Log file</option><option value="localDb"' + (target === 'localDb' ? ' selected' : '') + '>Send to Local Database</option><option value="api"' + (target === 'api' ? ' selected' : '') + '>Call API</option></select></td><td><input type="text" class="flow-cfg-label" placeholder="Send to Flow" value="' + label + '"></td><td><input type="text" class="flow-cfg-param" placeholder="Profile ID or API id" value="' + param + '"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
+      tr.querySelector('.btn-remove').onclick = () => tr.remove();
+      flowConfigTbody.appendChild(tr);
+    }
+    (Array.isArray(initialFlowConfigs) && initialFlowConfigs.length ? initialFlowConfigs : [{ enabled: false, target: 'log', label: '', param: '' }]).forEach(c => addFlowConfigRow(c));
+    if (addFlowConfigBtn) addFlowConfigBtn.onclick = () => addFlowConfigRow({ enabled: false, target: 'log', label: '', param: '' });
+
     function addLabelRow(id, text) {
       const tr = document.createElement('tr');
       tr.className = 'labels-row';
@@ -3482,21 +3712,22 @@ function renderEntryFormPage(doc, rev, err) {
     }
     addLabelBtn.onclick = () => addLabelRow('', '');
 
-    function addRow(fieldName, order, width, x, y, height) {
+    function addRow(fieldName, order, width, x, y, height, fieldType) {
       const tr = document.createElement('tr');
       tr.className = 'field-layout-row';
       const n = tbody.querySelectorAll('.field-layout-row').length;
       const xv = (x != null && x !== '') ? String(x) : '';
       const yv = (y != null && y !== '') ? String(y) : '';
       const hv = (height != null && height !== '') ? String(height) : '';
-      tr.innerHTML = '<td><input type="text" class="fl-field" placeholder="Field name or label id" value="' + (fieldName || '').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-order" min="0" value="' + (order != null ? order : n) + '"></td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' + (width || '100%').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-x" step="any" placeholder="—"></td><td><input type="number" class="fl-y" step="any" placeholder="—"></td><td><input type="number" class="fl-height" step="any" placeholder="—" min="0"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
+      const typeVal = (fieldType === 'markdown') ? 'markdown' : 'text';
+      tr.innerHTML = '<td><input type="text" class="fl-field" placeholder="Field name or label id" value="' + (fieldName || '').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-order" min="0" value="' + (order != null ? order : n) + '"></td><td><select class="fl-type"><option value="text"' + (typeVal === 'text' ? ' selected' : '') + '>Text</option><option value="markdown"' + (typeVal === 'markdown' ? ' selected' : '') + '>Markdown</option></select></td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' + (width || '100%').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-x" step="any" placeholder="—"></td><td><input type="number" class="fl-y" step="any" placeholder="—"></td><td><input type="number" class="fl-height" step="any" placeholder="—" min="0"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
       tr.querySelector('.fl-x').value = xv;
       tr.querySelector('.fl-y').value = yv;
       tr.querySelector('.fl-height').value = hv;
       tr.querySelector('.btn-remove').onclick = () => tr.remove();
       tbody.appendChild(tr);
     }
-    addBtn.onclick = () => addRow('', tbody.querySelectorAll('.field-layout-row').length, '100%');
+    addBtn.onclick = () => addRow('', tbody.querySelectorAll('.field-layout-row').length, '100%', '', '', '', 'text');
 
     function toHex6Sync(val) {
       const m = (val || '').trim().match(/^#?([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$/);
@@ -3557,16 +3788,23 @@ function renderEntryFormPage(doc, rev, err) {
         if (x != null) item.x = x;
         if (y != null) item.y = y;
         if (h != null) item.height = h;
-        if (labelIds.has(firstCol)) item.labelId = firstCol; else item.fieldName = firstCol;
+        if (labelIds.has(firstCol)) item.labelId = firstCol; else {
+          item.fieldName = firstCol;
+          const typeEl = tr.querySelector('.fl-type');
+          item.fieldType = (typeEl && typeEl.value === 'markdown') ? 'markdown' : 'text';
+        }
         return item;
       }).filter(Boolean);
-      const flowButtonEnabled = document.getElementById('flowButtonEnabled').checked;
-      const flowTarget = document.getElementById('flowTarget').value || 'log';
-      const flowButtonLabel = (document.getElementById('flowButtonLabel') && document.getElementById('flowButtonLabel').value.trim()) || 'Send to Flow';
-      const flowButtonParam = (document.getElementById('flowButtonParam') && document.getElementById('flowButtonParam').value.trim()) || '';
+      const flowConfigs = Array.from(flowConfigTbody.querySelectorAll('.flow-config-row')).map((tr) => {
+        const enabled = tr.querySelector('.flow-cfg-enabled') && tr.querySelector('.flow-cfg-enabled').checked;
+        const target = (tr.querySelector('.flow-cfg-target') && tr.querySelector('.flow-cfg-target').value) || 'log';
+        const label = (tr.querySelector('.flow-cfg-label') && tr.querySelector('.flow-cfg-label').value.trim()) || 'Send to Flow';
+        const param = (tr.querySelector('.flow-cfg-param') && tr.querySelector('.flow-cfg-param').value.trim()) || '';
+        return { enabled, target, label, param };
+      });
       const url = formId ? '/api/entry-forms/' + encodeURIComponent(formId) : '/api/entry-forms';
       const method = formId ? 'PUT' : 'POST';
-      const body = { name, labels, theme, layout, fieldLayout, customCss, flowButtonEnabled, flowTarget, flowButtonLabel, flowButtonParam };
+      const body = { name, labels, theme, layout, fieldLayout, customCss, flowConfigs };
       if (formId) body._rev = document.getElementById('rev').value;
       try {
         const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -3574,8 +3812,7 @@ function renderEntryFormPage(doc, rev, err) {
         if (!r.ok) { msgEl.textContent = data.error || 'Failed'; msgEl.className = 'msg err'; return; }
         msgEl.textContent = formId ? 'Saved.' : 'Created.';
         msgEl.className = 'msg ok';
-        if (!formId) setTimeout(() => { window.location.href = '/entry-forms'; }, 800);
-        else { document.getElementById('rev').value = data.rev; }
+        setTimeout(function() { window.location.href = '/entry-forms'; }, formId ? 600 : 800);
       } catch (err) {
         msgEl.textContent = err.message || 'Request failed';
         msgEl.className = 'msg err';
@@ -3818,9 +4055,11 @@ function renderStartPage(profiles, role) {
           <td colspan="${isAdmin ? 4 : 2}" class="empty">No Elenko database profiles yet.${isAdmin ? ' Add documents with <code>type: "elenko_profile"</code> in CouchDB.' : ""}</td>
         </tr>`;
 
-  const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko profile</a> <a href="/deletions" class="link-secondary">Marked for deletion</a> <a href="/entry-forms" class="link-secondary">Entry forms</a> <a href="/apis" class="link-secondary">APIs</a> <a href="/documents" class="link-secondary">All documents</a> ';
+    const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a> <a href="/entry-forms" class="link-secondary">Entry forms</a> <a href="/apis" class="link-secondary">APIs</a>';
   const actionsUser = "";
-  const actionsCommon = '<a href="/account/change-password" class="link-secondary">Change password</a> ' + (isAdmin ? '<a href="/account/users" class="link-secondary">Manage users</a> <a href="/account/users/create" class="link-secondary">Create user</a> ' : '') + '<a href="/logout" class="link-secondary">Log out</a>';
+    const userAdminOptions = '<option value="/account/change-password">Change password</option>' + (isAdmin ? '<option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
+  const specialOptions = '<option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const actionsCommon = '<a href="/logout" class="link-secondary">Log out</a>';
   const theadAdmin = "<tr><th>Name</th><th>Description</th><th>Document ID</th><th>Actions</th></tr>";
   const theadUser = "<tr><th>Name</th><th>Description</th></tr>";
 
@@ -3850,17 +4089,35 @@ function renderStartPage(profiles, role) {
     .edit-link { color: #58a6ff; }
     .delete-link { color: #f85149; margin-left: 0.5rem; }
     .delete-link:hover { color: #ff7b72; }
+    .nav-select { margin-left: 1rem; padding: 0.35rem 0.5rem; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.9rem; cursor: pointer; vertical-align: middle; }
+    .nav-select:hover { border-color: #58a6ff; }
+    .nav-select:focus { outline: none; border-color: #58a6ff; }
   </style>
 </head>
 <body>
   <h1>Elenko</h1>
-  <p class="sub">Profiles for Elenko databases (CouchDB documents)</p>
-  <p>${isAdmin ? actionsAdmin : actionsUser}${actionsCommon}</p>
+  <p>
+    ${isAdmin ? actionsAdmin : actionsUser}
+    <select id="nav-user-admin" class="nav-select" aria-label="Administration">${userAdminOptions}</select>
+    ${isAdmin ? `<select id="nav-special" class="nav-select" aria-label="Special functions">${specialOptions}</select>` : ""}
+    ${actionsCommon}
+  </p>
   <table>
     <thead>${isAdmin ? theadAdmin : theadUser}</thead>
     <tbody>${rows}
     </tbody>
   </table>
+  <script>
+    document.getElementById('nav-user-admin').addEventListener('change', function() {
+      var v = this.value;
+      if (v) { window.location.href = v; }
+    });
+    var navSpecial = document.getElementById('nav-special');
+    if (navSpecial) navSpecial.addEventListener('change', function() {
+      var v = this.value;
+      if (v) { window.location.href = v; }
+    });
+  </script>
 </body>
 </html>`;
 }
@@ -3878,6 +4135,8 @@ function renderEditProfilePage(doc, forms = []) {
   const name = escapeHtml(doc.name || "");
   const description = escapeHtml(doc.description || "");
   const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+  const fieldDefaultSources = Array.isArray(doc.fieldDefaultSources) ? doc.fieldDefaultSources : [];
+  const initialDefaultSources = fieldNames.map((_, i) => (fieldDefaultSources[i] !== undefined && DEFAULT_VALUE_SOURCES.includes(fieldDefaultSources[i]) ? fieldDefaultSources[i] : ""));
   const rev = escapeHtml(doc._rev || "");
   const customCss = doc.customCss || "";
   const entryFormIds = Array.isArray(doc.entryFormIds)
@@ -3929,7 +4188,12 @@ function renderEditProfilePage(doc, forms = []) {
     select { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
     select:focus { outline: none; border-color: #58a6ff; }
     .field-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center; }
-    .field-row input { flex: 1; }
+    .field-row input[name="fieldNames"] { flex: 1; min-width: 10rem; }
+    .field-row select[name="fieldDefaultSources"] { flex: 0 0 auto; width: auto; min-width: 10rem; max-width: 14rem; }
+    .field-list-header { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.25rem; font-size: 0.875rem; color: #8b949e; }
+    .field-list-header .col-name { flex: 1; min-width: 10rem; }
+    .field-list-header .col-prefill { flex: 0 0 auto; width: auto; min-width: 10rem; max-width: 14rem; }
+    .field-list-header .col-action { flex: 0 0 auto; min-width: 5rem; }
     .field-list { margin: 1rem 0; }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
     .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
@@ -3938,6 +4202,12 @@ function renderEditProfilePage(doc, forms = []) {
     .btn-secondary:hover { background: #30363d; }
     .btn-remove { background: transparent; color: #f85149; padding: 0.25rem 0.5rem; }
     .btn-remove:hover { color: #ff7b72; }
+    .flow-config-table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
+    .flow-config-table th, .flow-config-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #21262d; }
+    .flow-config-table th { color: #8b949e; font-weight: 600; font-size: 0.875rem; }
+    .flow-config-table tbody tr:last-child td { border-bottom: none; }
+    .flow-config-table input[type="text"] { margin: 0; }
+    .flow-config-table select { margin: 0; min-width: 10rem; }
     .theme-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
     .theme-row label { margin: 0; flex: 0 0 8rem; }
     .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid #30363d; border-radius: 4px; background: #161b22; }
@@ -3966,7 +4236,10 @@ function renderEditProfilePage(doc, forms = []) {
     <label for="description">Description</label>
     <textarea id="description" name="description" placeholder="Optional description">${description}</textarea>
     <label class="field-list-label">Field names</label>
-    <div class="field-list" id="field-list"></div>
+    <p class="sub" style="margin-top:0.25rem;">Optional default value is used when creating a new entry (form is prefilled; you can change it before saving).</p>
+    <div class="field-list" id="field-list">
+      <div class="field-list-header"><span class="col-name">Field name</span><span class="col-prefill">Prefill value</span><span class="col-action"></span></div>
+    </div>
     <button type="button" class="btn btn-secondary" id="add-field">+ Add field</button>
     <label>Theme (colours)</label>
     <p class="sub" style="margin-top:0.25rem;">Colours for the full database (list) view: background, table, links, etc. Click the swatch to open the colour picker.</p>
@@ -4019,18 +4292,29 @@ function renderEditProfilePage(doc, forms = []) {
     const msgEl = document.getElementById('msg');
     const profileId = ${JSON.stringify(doc._id)};
     const initialFields = ${JSON.stringify(fieldNames)};
+    const initialDefaultSources = ${JSON.stringify(initialDefaultSources)};
 
-    function addFieldRow(value) {
+    const defaultSourceOptions = [
+      { value: '', label: 'None' },
+      { value: 'createdAt', label: 'Creation date' },
+      { value: 'updatedAt', label: 'Update date' },
+      { value: 'currentUser', label: 'Current user' }
+    ];
+
+    function addFieldRow(value, defaultSource) {
       const row = document.createElement('div');
       row.className = 'field-row';
       const esc = (v) => (v || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + esc(value) + '"><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button>';
+      const selectOpts = defaultSourceOptions.map(function(opt) {
+        return '<option value="' + esc(opt.value) + '"' + (defaultSource === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
+      }).join('');
+      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + esc(value) + '"><select name="fieldDefaultSources" title="Default for new entries">' + selectOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button>';
       row.querySelector('.btn-remove').onclick = () => row.remove();
       fieldList.appendChild(row);
     }
 
-    addBtn.onclick = () => addFieldRow();
-    (initialFields.length ? initialFields : ['', '']).forEach(v => addFieldRow(v));
+    addBtn.onclick = () => addFieldRow('', '');
+    (initialFields.length ? initialFields : ['', '']).forEach((v, i) => addFieldRow(v, initialDefaultSources[i] || ''));
 
     const cssFileInput = document.getElementById('customCssFile');
     const cssTextarea = document.getElementById('customCss');
@@ -4188,7 +4472,18 @@ function renderEditProfilePage(doc, forms = []) {
       const description = document.getElementById('description').value.trim();
       const customCss = document.getElementById('customCss').value;
       const _rev = document.getElementById('rev').value;
-      const fieldNames = Array.from(document.querySelectorAll('input[name="fieldNames"]')).map(i => i.value.trim()).filter(Boolean);
+      const fieldRows = Array.from(document.getElementById('field-list').querySelectorAll('.field-row'));
+      const fieldNames = [];
+      const fieldDefaultSources = [];
+      fieldRows.forEach((row) => {
+        const input = row.querySelector('input[name="fieldNames"]');
+        const select = row.querySelector('select[name="fieldDefaultSources"]');
+        const name = input ? input.value.trim() : '';
+        if (name) {
+          fieldNames.push(name);
+          fieldDefaultSources.push(select ? select.value : '');
+        }
+      });
       const entryFormIds = Array.from(document.querySelectorAll('select[name="entryFormIds"]'))
         .map((s) => s.value.trim())
         .filter(Boolean);
@@ -4212,6 +4507,7 @@ function renderEditProfilePage(doc, forms = []) {
             description,
             customCss,
             fieldNames,
+            fieldDefaultSources,
             entryFormId: entryFormIds[0] || '',
             entryFormIds,
             theme,
@@ -4273,7 +4569,7 @@ function renderCreateProfilePage() {
 </head>
 <body>
   <h1>Elenko</h1>
-  <p class="sub">Create Elenko profile</p>
+  <p class="sub">Create Elenko database</p>
   <form id="create-form">
     <label for="name">Name</label>
     <input type="text" id="name" name="name" required placeholder="Profile name">
@@ -4766,14 +5062,31 @@ async function main() {
   await initCouch();
   startApiWorker();
   startFlowWorker();
-  // Log a startup event so we always get at least one line in the flow log.
-  sendFlowMessage("system.start", { pid: process.pid, port: PORT });
   console.log(
     "Flow logging configured for",
     process.env.FLOW_LOG_FILE || path.join(__dirname, "logs", "flow.log")
   );
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    const browserUrl = `http://127.0.0.1:${PORT}`;
+    const altUrl = `http://localhost:${PORT}`;
+    const openInBrowserMsg = `Open in browser: ${browserUrl} or ${altUrl}`;
     console.log(`Elenko server listening on http://0.0.0.0:${PORT}`);
+    console.log(openInBrowserMsg);
+    sendFlowMessage("system.start", {
+      pid: process.pid,
+      port: PORT,
+      message: openInBrowserMsg,
+      browserUrl,
+      altUrl,
+    });
+  });
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`Port ${PORT} is already in use. Stop the other process or set PORT to a different number.`);
+    } else {
+      console.error("Server listen error:", err);
+    }
+    process.exit(1);
   });
 }
 
