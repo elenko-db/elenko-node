@@ -32,8 +32,8 @@ function buildUrlWithQuery(baseUrl, dataset) {
 
 parentPort.on("message", (msg) => {
   if (msg.kind !== "apiRequest") return;
-  const { apiDoc, apiKey, dataset, entryId, profileId } = msg;
-  const responseTarget = (apiDoc && (apiDoc.responseTarget === "create" ? "create" : "update")) || "update";
+  const { apiDoc, apiKey, dataset, entryId, profileId, requestId } = msg;
+  const responseTarget = (apiDoc && (apiDoc.responseTarget === "create" ? "create" : apiDoc.responseTarget === "forward" ? "forward" : "update")) || "update";
   const url = apiDoc && apiDoc.url ? String(apiDoc.url).trim() : "";
   const method = (apiDoc && apiDoc.method) ? String(apiDoc.method).toUpperCase() : "GET";
   const template = apiDoc && typeof apiDoc.template === "string" ? apiDoc.template.trim() : "";
@@ -45,6 +45,7 @@ parentPort.on("message", (msg) => {
       kind: "apiResponse",
       entryId,
       profileId,
+      requestId,
       success: false,
       statusCode: null,
       body: null,
@@ -77,6 +78,7 @@ parentPort.on("message", (msg) => {
       kind: "apiResponse",
       entryId,
       profileId,
+      requestId,
       success: false,
       statusCode: null,
       body: null,
@@ -109,6 +111,7 @@ parentPort.on("message", (msg) => {
         kind: "apiResponse",
         entryId,
         profileId,
+        requestId,
         success: res.ok,
         statusCode: res.status,
         body,
@@ -127,6 +130,7 @@ parentPort.on("message", (msg) => {
         kind: "apiResponse",
         entryId,
         profileId,
+        requestId,
         success: false,
         statusCode: null,
         body: null,
