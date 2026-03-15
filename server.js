@@ -15,7 +15,13 @@ const PORT = process.env.PORT || 3000;
 const COUCHDB_URL = process.env.COUCHDB_URL || "http://admin:admin@localhost:5984";
 const COUCHDB_DB = process.env.COUCHDB_DB || "elenko";
 const ELENKO_CONFIG_DB = process.env.ELENKO_CONFIG_DB || "elenko_config";
+const COUCHDB_USER = "admin";
+const COUCHDB_BOOTSTRAP_FILE = process.env.COUCHDB_BOOTSTRAP_FILE || path.join(__dirname, "couchdb.bootstrap.json");
+const COUCHDB_ENC_KEY = Buffer.from("ElenkoCouchBootstrapKey32Bytes!!", "utf8").slice(0, 32);
+const COUCHDB_ENC_IV = Buffer.from("ElenkoCouchBootstrapIV16", "utf8").slice(0, 16);
 const IO_DIR = process.env.IO_DIR || path.join(__dirname, "io");
+const PUBLIC_DIR = path.join(__dirname, "public");
+const CONFIG_BACKUPS_DIR = path.join(PUBLIC_DIR, "backups");
 const MAX_ENTRIES_PER_PROFILE = 500000;
 const ENTRIES_PAGE_SIZE = 25;
 const SORT_KEY_SPECIAL = ["createdAt", "updatedAt"];
@@ -75,6 +81,50 @@ const DEFAULT_PROFILE_THEME = {
   tableHeaderText: "#8b949e",
   tableBorder: "#21262d",
 };
+
+const DEFAULT_APP_THEME = {
+  background: "#0f1419",
+  text: "#e6edf3",
+  label: "#8b949e",
+  link: "#58a6ff",
+  tableBg: "#161b22",
+  tableHeaderBg: "#21262d",
+  tableHeaderText: "#8b949e",
+  tableBorder: "#21262d",
+};
+
+function normalizeAppTheme(theme) {
+  if (!theme || typeof theme !== "object") return { ...DEFAULT_APP_THEME };
+  const get = (key) => {
+    const v = theme[key];
+    return typeof v === "string" && v.trim() ? v.trim() : DEFAULT_APP_THEME[key];
+  };
+  return {
+    background: get("background"),
+    text: get("text"),
+    label: get("label"),
+    link: get("link"),
+    tableBg: get("tableBg"),
+    tableHeaderBg: get("tableHeaderBg"),
+    tableHeaderText: get("tableHeaderText"),
+    tableBorder: get("tableBorder"),
+  };
+}
+
+function getAppThemeVars(theme) {
+  const t = theme && typeof theme === "object" ? theme : { ...DEFAULT_APP_THEME };
+  return `
+    :root {
+      --app-bg: ${escapeHtml(t.background)};
+      --app-text: ${escapeHtml(t.text)};
+      --app-label: ${escapeHtml(t.label)};
+      --app-link: ${escapeHtml(t.link)};
+      --app-table-bg: ${escapeHtml(t.tableBg)};
+      --app-table-header-bg: ${escapeHtml(t.tableHeaderBg)};
+      --app-table-header-text: ${escapeHtml(t.tableHeaderText)};
+      --app-table-border: ${escapeHtml(t.tableBorder)};
+    }`;
+}
 
 function normalizeProfileTheme(theme) {
   if (!theme || typeof theme !== "object") return { ...DEFAULT_PROFILE_THEME };
@@ -521,6 +571,309 @@ let apiWorker;
 
 const pendingApiRequests = new Map();
 
+let cachedAppConfig = null;
+let cachedAppConfigLoadedAt = 0;
+
+async function getAppUiConfig() {
+  const now = Date.now();
+  if (cachedAppConfig && now - cachedAppConfigLoadedAt < 30000) return cachedAppConfig;
+  if (!configDb) {
+    cachedAppConfig = { theme: { ...DEFAULT_APP_THEME }, logoUrl: "", logoWidth: 0, logoHeight: 0, loginTextAbove: "", loginTextBelow: "", couchdbPassword: "" };
+    cachedAppConfigLoadedAt = now;
+    return cachedAppConfig;
+  }
+  try {
+    const result = await configDb.find({
+      selector: { type: "elenko_app_config" },
+      limit: 1,
+    });
+    const doc = (result.docs && result.docs[0]) || null;
+    if (!doc) {
+      cachedAppConfig = { theme: { ...DEFAULT_APP_THEME }, logoUrl: "", logoWidth: 0, logoHeight: 0, loginTextAbove: "", loginTextBelow: "", couchdbPassword: "" };
+    } else {
+      const theme = normalizeAppTheme(doc.theme);
+      cachedAppConfig = {
+        _id: doc._id,
+        _rev: doc._rev,
+        theme,
+        logoUrl: typeof doc.logoUrl === "string" ? doc.logoUrl.trim() : "",
+        logoWidth: Number.isFinite(doc.logoWidth) ? doc.logoWidth : 0,
+        logoHeight: Number.isFinite(doc.logoHeight) ? doc.logoHeight : 0,
+        loginTextAbove: typeof doc.loginTextAbove === "string" ? doc.loginTextAbove.trim() : "",
+        loginTextBelow: typeof doc.loginTextBelow === "string" ? doc.loginTextBelow.trim() : "",
+        couchdbPassword: typeof doc.couchdbPassword === "string" ? doc.couchdbPassword : "",
+      };
+    }
+  } catch {
+    cachedAppConfig = { theme: { ...DEFAULT_APP_THEME }, logoUrl: "", logoWidth: 0, logoHeight: 0, loginTextAbove: "", loginTextBelow: "", couchdbPassword: "" };
+  }
+  cachedAppConfigLoadedAt = now;
+  // Ensure new fields always present for older config docs or cache
+  if (cachedAppConfig && typeof cachedAppConfig.loginTextAbove !== "string") cachedAppConfig.loginTextAbove = "";
+  if (cachedAppConfig && typeof cachedAppConfig.loginTextBelow !== "string") cachedAppConfig.loginTextBelow = "";
+  if (cachedAppConfig && typeof cachedAppConfig.couchdbPassword !== "string") cachedAppConfig.couchdbPassword = "";
+  return cachedAppConfig;
+}
+
+const CONFIG_EXPORT_VERSION = 1;
+const EXPORTABLE_DB_TYPES = new Set(["elenko_profile", "elenko_entry_form"]);
+const EXPORTABLE_CONFIG_TYPES = new Set(["elenko_app_config", "elenko_flow", "elenko_api", "elenko_js_processing"]);
+
+function stripForExport(doc, type) {
+  if (!doc || typeof doc !== "object") return null;
+  const out = { ...doc };
+  delete out._rev;
+  if (type === "elenko_api") {
+    out.apiKeyRef = "";
+  }
+  if (type === "elenko_app_config") {
+    delete out.couchdbPassword;
+  }
+  return out;
+}
+
+async function getFlowIdsFromFormDocs(dbInstance, formDocs) {
+  const flowIds = new Set();
+  for (const form of formDocs) {
+    const configs = Array.isArray(form.flowConfigs) ? form.flowConfigs : [];
+    for (const c of configs) {
+      const id = (c && typeof c.flowId === "string") ? c.flowId.trim() : "";
+      if (id) flowIds.add(id);
+    }
+  }
+  const result = [];
+  if (!configDb) return result;
+  for (const fid of flowIds) {
+    let doc = null;
+    try {
+      doc = await configDb.get(fid);
+    } catch (e) {
+      if (e.statusCode !== 404) throw e;
+    }
+    if (!doc && fid) {
+      const byName = await configDb.find({ selector: { type: "elenko_flow", name: fid }, limit: 1 });
+      doc = byName.docs && byName.docs[0];
+    }
+    if (doc && doc.type === "elenko_flow" && doc._id) result.push(doc._id);
+  }
+  return [...new Set(result)];
+}
+
+function getApiAndJsIdsFromFlowDocs(flowDocs) {
+  const apiIds = new Set();
+  const jsIds = new Set();
+  for (const flow of flowDocs) {
+    const steps = Array.isArray(flow.steps) ? flow.steps : [];
+    for (const step of steps) {
+      const target = step && step.target;
+      const param = (step && typeof step.param === "string") ? step.param.trim() : "";
+      if (target === "api" && param) apiIds.add(param);
+      if (target === "script" && param) jsIds.add(param);
+    }
+  }
+  return { apiIds: [...apiIds], jsIds: [...jsIds] };
+}
+
+async function resolveConfigDocIds(configDbInstance, ids, type, nameField) {
+  const result = [];
+  for (const id of ids) {
+    let doc = null;
+    try {
+      doc = await configDbInstance.get(id);
+    } catch (e) {
+      if (e.statusCode !== 404) throw e;
+    }
+    if (!doc && nameField) {
+      const byName = await configDbInstance.find({
+        selector: { type, [nameField]: id },
+        limit: 1,
+      });
+      doc = byName.docs && byName.docs[0];
+    }
+    if (doc && doc._id) result.push(doc._id);
+  }
+  return [...new Set(result)];
+}
+
+async function buildConfigExport(scope, profileId) {
+  const docsDb = [];
+  const docsConfig = [];
+  const seenConfig = new Set();
+  const seenDb = new Set();
+
+  const addDb = (doc) => {
+    if (!doc || !EXPORTABLE_DB_TYPES.has(doc.type)) return;
+    const id = doc._id;
+    if (seenDb.has(id)) return;
+    seenDb.add(id);
+    docsDb.push(stripForExport(doc, doc.type));
+  };
+  const addConfig = (doc) => {
+    if (!doc || !EXPORTABLE_CONFIG_TYPES.has(doc.type)) return;
+    const id = doc._id;
+    if (seenConfig.has(id)) return;
+    seenConfig.add(id);
+    docsConfig.push(stripForExport(doc, doc.type));
+  };
+
+  if (scope === "all" && configDb) {
+    const appResult = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+    const appDoc = appResult.docs && appResult.docs[0];
+    if (appDoc) addConfig(appDoc);
+  }
+
+  const profileIds = scope === "all"
+    ? (await db.find({ selector: { type: "elenko_profile" }, fields: ["_id"], limit: 1000 })).docs.map((p) => p._id)
+    : (profileId ? [profileId] : []);
+
+  for (const pid of profileIds) {
+    let profile;
+    try {
+      profile = await db.get(pid);
+    } catch (e) {
+      if (e.statusCode === 404) continue;
+      throw e;
+    }
+    if (!profile || profile.type !== "elenko_profile") continue;
+    addDb(profile);
+
+    const formIds = getProfileEntryFormIds(profile);
+    for (const fid of formIds) {
+      try {
+        const formDoc = await db.get(fid);
+        if (formDoc && formDoc.type === "elenko_entry_form") addDb(formDoc);
+      } catch (_) {}
+    }
+
+    const formDocs = [];
+    for (const fid of formIds) {
+      try {
+        const formDoc = await db.get(fid);
+        if (formDoc && formDoc.type === "elenko_entry_form") formDocs.push(formDoc);
+      } catch (_) {}
+    }
+    const flowIds = await getFlowIdsFromFormDocs(db, formDocs);
+    const flowDocs = [];
+    for (const flid of flowIds) {
+      try {
+        const flowDoc = await configDb.get(flid);
+        if (flowDoc && flowDoc.type === "elenko_flow") flowDocs.push(flowDoc);
+      } catch (_) {}
+    }
+    for (const f of flowDocs) addConfig(f);
+
+    const { apiIds, jsIds } = getApiAndJsIdsFromFlowDocs(flowDocs);
+    const resolvedApiIds = await resolveConfigDocIds(configDb, apiIds, "elenko_api", "name");
+    const resolvedJsIds = await resolveConfigDocIds(configDb, jsIds, "elenko_js_processing", "name");
+    for (const aid of resolvedApiIds) {
+      try {
+        const apiDoc = await configDb.get(aid);
+        if (apiDoc && apiDoc.type === "elenko_api") addConfig(apiDoc);
+      } catch (_) {}
+    }
+    for (const jid of resolvedJsIds) {
+      try {
+        const jsDoc = await configDb.get(jid);
+        if (jsDoc && jsDoc.type === "elenko_js_processing") addConfig(jsDoc);
+      } catch (_) {}
+    }
+  }
+
+  return {
+    version: CONFIG_EXPORT_VERSION,
+    scope,
+    profileId: scope === "profile" ? profileId || null : null,
+    exportedAt: new Date().toISOString(),
+    documents: { db: docsDb, configDb: docsConfig },
+  };
+}
+
+async function applyConfigImport(data, overwrite) {
+  const errors = [];
+  let importedDb = 0;
+  let importedConfig = 0;
+  const payload = data && data.documents;
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, error: "Invalid export format: missing documents" };
+  }
+  const docsDb = Array.isArray(payload.db) ? payload.db : [];
+  const docsConfig = Array.isArray(payload.configDb) ? payload.configDb : [];
+
+  for (const doc of docsDb) {
+    if (!doc || typeof doc !== "object" || !EXPORTABLE_DB_TYPES.has(doc.type)) continue;
+    const id = doc._id;
+    const toInsert = { ...doc };
+    delete toInsert._rev;
+    try {
+      if (id) {
+        try {
+          const existing = await db.get(id);
+          if (existing && overwrite) {
+            toInsert._rev = existing._rev;
+            await db.insert(toInsert);
+            importedDb++;
+          }
+        } catch (e) {
+          if (e.statusCode === 404) {
+            await db.insert(toInsert);
+            importedDb++;
+          } else throw e;
+        }
+      } else {
+        await db.insert(toInsert);
+        importedDb++;
+      }
+    } catch (err) {
+      errors.push({ id: id || "(new)", type: doc.type, message: err.message || String(err) });
+    }
+  }
+
+  for (const doc of docsConfig) {
+    if (!doc || typeof doc !== "object" || !EXPORTABLE_CONFIG_TYPES.has(doc.type)) continue;
+    const id = doc._id;
+    const toInsert = { ...doc };
+    delete toInsert._rev;
+    if (toInsert.type === "elenko_api") toInsert.apiKeyRef = toInsert.apiKeyRef || "";
+    try {
+      if (!configDb) {
+        errors.push({ id: id || "(new)", type: doc.type, message: "Config store not available" });
+        continue;
+      }
+      if (id) {
+        try {
+          const existing = await configDb.get(id);
+          if (existing && overwrite) {
+            toInsert._rev = existing._rev;
+            await configDb.insert(toInsert);
+            importedConfig++;
+          }
+        } catch (e) {
+          if (e.statusCode === 404) {
+            await configDb.insert(toInsert);
+            importedConfig++;
+          } else throw e;
+        }
+      } else {
+        await configDb.insert(toInsert);
+        importedConfig++;
+      }
+    } catch (err) {
+      errors.push({ id: id || "(new)", type: doc.type, message: err.message || String(err) });
+    }
+  }
+
+  if (importedConfig > 0 || docsConfig.some((d) => d && d.type === "elenko_app_config")) {
+    cachedAppConfig = null;
+    cachedAppConfigLoadedAt = 0;
+  }
+  return {
+    ok: errors.length === 0,
+    importedDb,
+    importedConfig,
+    errors: errors.length > 0 ? errors : undefined,
+  };
+}
+
 function startApiWorker() {
   const workerPath = path.join(__dirname, "apiWorker.js");
   apiWorker = new Worker(workerPath);
@@ -773,14 +1126,170 @@ function clearSearchListCache(profileId) {
   }
 }
 
-async function initCouch() {
-  const client = nano(COUCHDB_URL);
+function buildCouchUrlFromBase(password) {
+  try {
+    const u = new URL(COUCHDB_URL);
+    const host = u.host || "localhost:5984";
+    const protocol = u.protocol || "http:";
+    const encoded = encodeURIComponent(password || "");
+    return `${protocol}//${COUCHDB_USER}:${encoded}@${host}`;
+  } catch {
+    return `http://${COUCHDB_USER}:${encodeURIComponent(password || "")}@localhost:5984`;
+  }
+}
+
+function buildCouchOrigin() {
+  try {
+    const u = new URL(COUCHDB_URL);
+    return `${u.protocol}//${u.host || "localhost:5984"}`;
+  } catch {
+    return "http://localhost:5984";
+  }
+}
+
+function encryptCouchPassword(plain) {
+  if (plain == null || plain === "") return "";
+  const cipher = crypto.createCipheriv("aes-256-cbc", COUCHDB_ENC_KEY, COUCHDB_ENC_IV);
+  const enc = Buffer.concat([cipher.update(Buffer.from(plain, "utf8")), cipher.final()]);
+  return enc.toString("hex");
+}
+
+function decryptCouchPassword(encryptedHex) {
+  if (!encryptedHex || typeof encryptedHex !== "string") return null;
+  try {
+    const buf = Buffer.from(encryptedHex, "hex");
+    const decipher = crypto.createDecipheriv("aes-256-cbc", COUCHDB_ENC_KEY, COUCHDB_ENC_IV);
+    return Buffer.concat([decipher.update(buf), decipher.final()]).toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+function readBootstrapPassword() {
+  try {
+    const raw = fs.readFileSync(COUCHDB_BOOTSTRAP_FILE, "utf8");
+    const data = JSON.parse(raw);
+    const enc = data && (data.passwordEncrypted || data.encrypted);
+    if (!enc) return null;
+    return decryptCouchPassword(enc);
+  } catch {
+    return null;
+  }
+}
+
+function isBootstrapFileMissing() {
+  try {
+    if (!fs.existsSync(COUCHDB_BOOTSTRAP_FILE)) return true;
+    const raw = fs.readFileSync(COUCHDB_BOOTSTRAP_FILE, "utf8");
+    const data = JSON.parse(raw);
+    const enc = data && (data.passwordEncrypted || data.encrypted);
+    return !enc;
+  } catch {
+    return true;
+  }
+}
+
+function writeBootstrapFile(password) {
+  if (password == null) password = "";
+  const encrypted = encryptCouchPassword(password);
+  fs.writeFileSync(
+    COUCHDB_BOOTSTRAP_FILE,
+    JSON.stringify({ passwordEncrypted: encrypted }, null, 2),
+    "utf8"
+  );
+}
+
+async function setCouchDbAdminPassword(currentPassword, newPassword) {
+  const origin = buildCouchOrigin();
+  const pathSegment = "_node/_local/_config/admins/" + encodeURIComponent(COUCHDB_USER);
+  const url = origin.replace(/\/?$/, "") + "/" + pathSegment;
+  const auth = Buffer.from(COUCHDB_USER + ":" + (currentPassword || ""), "utf8").toString("base64");
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Basic " + auth,
+    },
+    body: JSON.stringify(newPassword),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(res.status === 401 || res.status === 403
+      ? "Current CouchDB password is incorrect or access denied."
+      : (text || res.statusText || "Failed to update CouchDB admin password."));
+  }
+}
+
+async function tryRestoreBootstrapFromStoredPassword() {
+  if (!db || !configDb || !isBootstrapFileMissing()) return false;
+  try {
+    const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+    const doc = result.docs && result.docs[0];
+    const stored = typeof (doc && doc.couchdbPassword) === "string" ? doc.couchdbPassword.trim() : "";
+    if (stored === "" || stored === "admin") return false;
+    const testUrl = buildCouchUrlFromBase(stored);
+    let storedIsCurrentPassword = false;
+    try {
+      const testClient = nano(testUrl);
+      await testClient.db.get(COUCHDB_DB);
+      storedIsCurrentPassword = true;
+    } catch (e) {
+      if (!isCouchAuthError(e)) throw e;
+    }
+    if (storedIsCurrentPassword) {
+      writeBootstrapFile(stored);
+      return true;
+    }
+    await setCouchDbAdminPassword("admin", stored);
+    writeBootstrapFile(stored);
+    await initCouch({ password: stored });
+    cachedAppConfig = null;
+    cachedAppConfigLoadedAt = 0;
+    return true;
+  } catch (e) {
+    console.error("Restore bootstrap from stored password failed:", e);
+    return false;
+  }
+}
+
+function isCouchAuthError(err) {
+  if (!err) return false;
+  if (err.statusCode === 401 || err.statusCode === 403) return true;
+  const msg = String(err.message || err.reason || "");
+  return /name or password|unauthorized|authentication|incorrect/i.test(msg);
+}
+
+async function initCouch(options) {
+  let password = options && options.password;
+  if (password === undefined || password === null) {
+    password = readBootstrapPassword();
+    if (password === null) {
+      db = null;
+      configDb = null;
+      return;
+    }
+  }
+  const url = buildCouchUrlFromBase(password);
+  let client;
+  try {
+    client = nano(url);
+  } catch (err) {
+    console.warn("CouchDB connection failed (will show setup page):", err.message || err);
+    db = null;
+    configDb = null;
+    return;
+  }
   const dbName = COUCHDB_DB;
   try {
     await client.db.get(dbName);
   } catch (err) {
     if (err?.statusCode === 404) {
       await client.db.create(dbName);
+    } else if (isCouchAuthError(err)) {
+      console.warn("CouchDB authentication failed (will show setup page):", err.message || err.reason || err);
+      db = null;
+      configDb = null;
+      return;
     } else {
       throw err;
     }
@@ -793,6 +1302,11 @@ async function initCouch() {
   } catch (err) {
     if (err?.statusCode === 404) {
       await client.db.create(configDbName);
+    } else if (isCouchAuthError(err)) {
+      console.warn("CouchDB authentication failed (will show setup page):", err.message || err.reason || err);
+      db = null;
+      configDb = null;
+      return;
     } else {
       throw err;
     }
@@ -940,16 +1454,178 @@ app.use(
   })
 );
 
-app.get("/login", (req, res) => {
+app.use(async (req, res, next) => {
+  const isSetupPath = req.path === "/setup" || req.path === "/setup/change-couchdb-password";
+  if (!db) {
+    if (isSetupPath) return next();
+    if (isBootstrapFileMissing()) {
+      try {
+        await initCouch({ password: "admin" });
+        if (db) return next();
+      } catch (_) {}
+    }
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderSetupRequiredPage());
+  }
+  if (db && isBootstrapFileMissing()) {
+    const restored = await tryRestoreBootstrapFromStoredPassword();
+    if (restored) return next();
+    if (!isSetupPath) return res.redirect("/setup");
+  }
+  next();
+});
+
+app.get("/setup", async (req, res) => {
+  if (db && isBootstrapFileMissing()) {
+    const restored = await tryRestoreBootstrapFromStoredPassword();
+    if (restored) return res.redirect("/login");
+    const appUi = await getAppUiConfig();
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, null, null, "/setup/change-couchdb-password", true));
+  }
+  if (!db) {
+    if (isBootstrapFileMissing()) {
+      try {
+        await initCouch({ password: "admin" });
+        if (db) {
+          const appUi = await getAppUiConfig();
+          return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, null, null, "/setup/change-couchdb-password", true));
+        }
+      } catch (_) {}
+    }
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderSetupRequiredPage());
+  }
+  return res.redirect("/login");
+});
+
+app.post("/setup", async (req, res) => {
+  const password = typeof (req.body && req.body.couchdbPassword) === "string" ? req.body.couchdbPassword : "";
+  if (!password.trim()) {
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderSetupRequiredPage("Password is required."));
+  }
+  try {
+    writeBootstrapFile(password.trim());
+    await initCouch({ password: password.trim() });
+    if (!db || !configDb) {
+      return res.set("Content-Type", "text/html; charset=utf-8").send(renderSetupRequiredPage("Connection failed. Check the password and that CouchDB is reachable."));
+    }
+    const existing = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+    const doc = existing.docs && existing.docs[0];
+    if (!doc) {
+      await configDb.insert({
+        type: "elenko_app_config",
+        theme: { ...DEFAULT_APP_THEME },
+        logoUrl: "",
+        logoWidth: 0,
+        logoHeight: 0,
+        loginTextAbove: "",
+        loginTextBelow: "",
+        couchdbPassword: password.trim(),
+      });
+    } else {
+      // Do not overwrite couchdbPassword on existing doc: after a rebuild the user may
+      // re-enter only to create the bootstrap file; the stored password should stay.
+      if (typeof doc.couchdbPassword !== "string" || doc.couchdbPassword === "") {
+        doc.couchdbPassword = password.trim();
+      }
+      await configDb.insert(doc);
+    }
+    cachedAppConfig = null;
+    cachedAppConfigLoadedAt = 0;
+    return res.redirect("/login");
+  } catch (err) {
+    console.error("Setup error:", err);
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderSetupRequiredPage(err.message || "Setup failed."));
+  }
+});
+
+app.post("/setup/change-couchdb-password", async (req, res) => {
+  const currentPassword = typeof (req.body && req.body.currentPassword) === "string" ? req.body.currentPassword.trim() : "";
+  const newPassword = typeof (req.body && req.body.newPassword) === "string" ? req.body.newPassword.trim() : "";
+  const confirmPassword = typeof (req.body && req.body.confirmPassword) === "string" ? req.body.confirmPassword.trim() : "";
+  if (!db || !configDb) {
+    return res.redirect("/setup");
+  }
+  if (!isBootstrapFileMissing()) {
+    return res.redirect("/login");
+  }
+  if (currentPassword !== "admin") {
+    const appUi = await getAppUiConfig();
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, "Current password must be the default (admin).", null, "/setup/change-couchdb-password", true));
+  }
+  if (!newPassword || !confirmPassword) {
+    const appUi = await getAppUiConfig();
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, "All fields are required.", null, "/setup/change-couchdb-password", true));
+  }
+  if (newPassword !== confirmPassword) {
+    const appUi = await getAppUiConfig();
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, "New password and confirmation do not match.", null, "/setup/change-couchdb-password", true));
+  }
+  if (newPassword === "admin") {
+    const appUi = await getAppUiConfig();
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, "New password must be different from the default.", null, "/setup/change-couchdb-password", true));
+  }
+  try {
+    await setCouchDbAdminPassword("admin", newPassword);
+  } catch (e) {
+    console.error("CouchDB admin password update failed:", e);
+    const appUi = await getAppUiConfig();
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, e.message || "Failed to update CouchDB password.", null, "/setup/change-couchdb-password", true));
+  }
+  try {
+    writeBootstrapFile(newPassword);
+  } catch (e) {
+    console.error("Failed to write bootstrap file:", e);
+    const appUi = await getAppUiConfig();
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, "Password updated in CouchDB but failed to write bootstrap file.", null, "/setup/change-couchdb-password", true));
+  }
+  try {
+    await initCouch({ password: newPassword });
+  } catch (e) {
+    console.error("Failed to reconnect with new password:", e);
+    const appUi = await getAppUiConfig();
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, "Bootstrap file saved but reconnection failed: " + (e.message || "connection error"), null, "/setup/change-couchdb-password", true));
+  }
+  try {
+    if (configDb) {
+      const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+      const doc = result.docs && result.docs[0];
+      if (doc) {
+        doc.couchdbPassword = newPassword;
+        await configDb.insert(doc);
+      } else {
+        await configDb.insert({
+          type: "elenko_app_config",
+          theme: { ...DEFAULT_APP_THEME },
+          logoUrl: "",
+          logoWidth: 0,
+          logoHeight: 0,
+          loginTextAbove: "",
+          loginTextBelow: "",
+          couchdbPassword: newPassword,
+        });
+      }
+    }
+    cachedAppConfig = null;
+    cachedAppConfigLoadedAt = 0;
+  } catch (e) {
+    console.error("Failed to update app config with new password:", e);
+  }
+  return res.redirect("/login");
+});
+
+app.get("/login", async (req, res) => {
   if (req.session && req.session.user) return res.redirect("/");
-  res.set("Content-Type", "text/html; charset=utf-8").send(renderLoginPage(null));
+  const appUi = await getAppUiConfig();
+  res.set("Content-Type", "text/html; charset=utf-8").send(renderLoginPage(null, appUi));
 });
 
 app.post("/login", async (req, res) => {
+  const appUi = await getAppUiConfig();
   const username = String((req.body && req.body.username) || "").trim();
   const password = (req.body && req.body.password) || "";
   if (!username) {
-    return res.set("Content-Type", "text/html; charset=utf-8").send(renderLoginPage("Invalid username or password."));
+    return res
+      .set("Content-Type", "text/html; charset=utf-8")
+      .send(renderLoginPage("Invalid username or password.", appUi));
   }
   try {
     const result = await db.find({
@@ -958,7 +1634,9 @@ app.post("/login", async (req, res) => {
     });
     const user = result.docs && result.docs[0];
     if (!user || !verifyPassword(password, user.passwordHash, user.salt)) {
-      return res.set("Content-Type", "text/html; charset=utf-8").send(renderLoginPage("Invalid username or password."));
+      return res
+        .set("Content-Type", "text/html; charset=utf-8")
+        .send(renderLoginPage("Invalid username or password.", appUi));
     }
     req.session.user = user.username;
     req.session.role = (user.role === "user" ? "editor" : user.role) || "editor";
@@ -966,7 +1644,9 @@ app.post("/login", async (req, res) => {
     return res.redirect("/");
   } catch (err) {
     console.error("Login error:", err);
-    return res.set("Content-Type", "text/html; charset=utf-8").send(renderLoginPage("Invalid username or password."));
+    return res
+      .set("Content-Type", "text/html; charset=utf-8")
+      .send(renderLoginPage("Invalid username or password.", appUi));
   }
 });
 
@@ -986,36 +1666,45 @@ app.get("/", async (req, res) => {
       sort: [{ name: "asc" }],
     });
     const profiles = result.docs || [];
+    const appUi = await getAppUiConfig();
     const role = (req.session && req.session.role) || "editor";
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderStartPage(profiles, role));
+    res.send(renderStartPage(profiles, role, appUi));
   } catch (err) {
     console.error("Error loading profiles:", err);
     res.status(500).send(renderErrorPage(err.message));
   }
 });
 
-app.get("/account/change-password", (req, res) => {
-  res.set("Content-Type", "text/html; charset=utf-8").send(renderChangePasswordPage(null));
+app.get("/account/change-password", async (req, res) => {
+  const appUi = await getAppUiConfig();
+  res.set("Content-Type", "text/html; charset=utf-8").send(renderChangePasswordPage(null, appUi));
 });
 
 app.post("/account/change-password", async (req, res) => {
+  const appUi = await getAppUiConfig();
   const current = (req.body && req.body.currentPassword) || "";
   const newPass = (req.body && req.body.newPassword) || "";
   const confirm = (req.body && req.body.confirmPassword) || "";
   const username = req.session && req.session.user;
   if (!username) return res.redirect("/login");
   if (!newPass || newPass.length < 1) {
-    return res.set("Content-Type", "text/html; charset=utf-8").send(renderChangePasswordPage("New password is required."));
+    return res
+      .set("Content-Type", "text/html; charset=utf-8")
+      .send(renderChangePasswordPage("New password is required.", appUi));
   }
   if (newPass !== confirm) {
-    return res.set("Content-Type", "text/html; charset=utf-8").send(renderChangePasswordPage("New password and confirmation do not match."));
+    return res
+      .set("Content-Type", "text/html; charset=utf-8")
+      .send(renderChangePasswordPage("New password and confirmation do not match.", appUi));
   }
   try {
     const result = await db.find({ selector: { type: "elenko_user", username }, limit: 1 });
     const user = result.docs && result.docs[0];
     if (!user || !verifyPassword(current, user.passwordHash, user.salt)) {
-      return res.set("Content-Type", "text/html; charset=utf-8").send(renderChangePasswordPage("Current password is incorrect."));
+      return res
+        .set("Content-Type", "text/html; charset=utf-8")
+        .send(renderChangePasswordPage("Current password is incorrect.", appUi));
     }
     const { hash, salt } = hashPassword(newPass);
     user.passwordHash = hash;
@@ -1024,13 +1713,219 @@ app.post("/account/change-password", async (req, res) => {
     res.redirect("/?password=changed");
   } catch (err) {
     console.error("Change password error:", err);
-    res.set("Content-Type", "text/html; charset=utf-8").send(renderChangePasswordPage("An error occurred. Please try again."));
+    res
+      .set("Content-Type", "text/html; charset=utf-8")
+      .send(renderChangePasswordPage("An error occurred. Please try again.", appUi));
   }
 });
 
-app.get("/account/users/create", requireAdmin, (req, res) => {
+app.get("/account/couchdb-password", requireAdmin, async (req, res) => {
+  const appUi = await getAppUiConfig();
+  const err = typeof req.query.err === "string" ? req.query.err : null;
+  const ok = typeof req.query.ok === "string" ? req.query.ok : null;
+  res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, err, ok));
+});
+
+app.post("/account/couchdb-password", requireAdmin, async (req, res) => {
+  const currentPassword = typeof (req.body && req.body.currentPassword) === "string" ? req.body.currentPassword.trim() : "";
+  const newPassword = typeof (req.body && req.body.newPassword) === "string" ? req.body.newPassword.trim() : "";
+  const confirmPassword = typeof (req.body && req.body.confirmPassword) === "string" ? req.body.confirmPassword.trim() : "";
+  if (!currentPassword || !newPassword || !confirmPassword) {
+    return res.redirect("/account/couchdb-password?err=" + encodeURIComponent("All fields are required."));
+  }
+  if (newPassword !== confirmPassword) {
+    return res.redirect("/account/couchdb-password?err=" + encodeURIComponent("New password and confirmation do not match."));
+  }
+  if (newPassword === currentPassword) {
+    return res.redirect("/account/couchdb-password?err=" + encodeURIComponent("New password must be different from current."));
+  }
+  try {
+    await setCouchDbAdminPassword(currentPassword, newPassword);
+  } catch (e) {
+    console.error("CouchDB admin password update failed:", e);
+    return res.redirect("/account/couchdb-password?err=" + encodeURIComponent(e.message || "Failed to update CouchDB password."));
+  }
+  try {
+    const testClient = nano(buildCouchUrlFromBase(newPassword));
+    await testClient.db.get(COUCHDB_DB);
+  } catch (e) {
+    console.error("CouchDB reconnect test failed:", e);
+    return res.redirect("/account/couchdb-password?err=" + encodeURIComponent("Password was set but reconnection test failed: " + (e.message || "connection error")));
+  }
+  try {
+    writeBootstrapFile(newPassword);
+  } catch (e) {
+    console.error("Failed to write bootstrap file:", e);
+    return res.redirect("/account/couchdb-password?err=" + encodeURIComponent("Password updated in CouchDB but failed to write bootstrap file."));
+  }
+  try {
+    await initCouch({ password: newPassword });
+  } catch (e) {
+    console.error("Failed to reconnect to CouchDB with new password:", e);
+    return res.redirect("/account/couchdb-password?err=" + encodeURIComponent("Password and bootstrap file saved but reconnection failed: " + (e.message || "connection error")));
+  }
+  try {
+    if (configDb) {
+      const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+      const doc = result.docs && result.docs[0];
+      if (doc) {
+        doc.couchdbPassword = newPassword;
+        await configDb.insert(doc);
+      }
+    }
+    cachedAppConfig = null;
+    cachedAppConfigLoadedAt = 0;
+  } catch (e) {
+    console.error("Failed to update app config with new password:", e);
+  }
+  return res.redirect("/account/couchdb-password?ok=" + encodeURIComponent("CouchDB password updated. Bootstrap file and app config saved. You can continue using the app."));
+});
+
+app.get("/app-config", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderEditAppConfigPage(appUi, null));
+  } catch (err) {
+    console.error("Error loading app config:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/config-export-import", requireAdmin, async (req, res) => {
+  try {
+    const result = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "name"],
+      sort: [{ name: "asc" }],
+    });
+    const profiles = result.docs || [];
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderConfigExportImportPage(profiles, appUi));
+  } catch (err) {
+    console.error("Error loading config export/import page:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/config-export", requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const scope = body.scope === "all" ? "all" : "profile";
+    const profileId = scope === "profile" && typeof body.profileId === "string" ? body.profileId.trim() : null;
+    if (scope === "profile" && !profileId) {
+      return res.status(400).json({ error: "Select an Elenko database for export." });
+    }
+    const data = await buildConfigExport(scope, profileId);
+    res.json({ ok: true, data });
+  } catch (err) {
+    console.error("Config export error:", err);
+    res.status(500).json({ error: err.message || "Export failed" });
+  }
+});
+
+app.post("/api/config-import", requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const data = body.data;
+    if (!data || typeof data !== "object") {
+      return res.status(400).json({ error: "Invalid import: missing data. Upload an export JSON file." });
+    }
+    if (data.version !== CONFIG_EXPORT_VERSION || !data.documents) {
+      return res.status(400).json({ error: "Invalid export format. Use a file exported from this Export / Import configuration page." });
+    }
+    const result = await applyConfigImport(data, true);
+    res.json(result);
+  } catch (err) {
+    console.error("Config import error:", err);
+    res.status(500).json({ ok: false, error: err.message || "Import failed" });
+  }
+});
+
+app.post("/api/config-backup", requireAdmin, async (req, res) => {
+  try {
+    const data = await buildConfigExport("all", null);
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, "0");
+    const d = String(now.getDate()).padStart(2, "0");
+    const h = String(now.getHours()).padStart(2, "0");
+    const min = String(now.getMinutes()).padStart(2, "0");
+    const s = String(now.getSeconds()).padStart(2, "0");
+    const timestamp = `${y}${m}${d}-${h}${min}${s}`;
+    const filename = `elenko-config-backup-${timestamp}.json`;
+    await fs.promises.mkdir(CONFIG_BACKUPS_DIR, { recursive: true });
+    const filePath = path.join(CONFIG_BACKUPS_DIR, filename);
+    await fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
+    res.json({ ok: true, filename, url: "/backups/" + filename });
+  } catch (err) {
+    console.error("Config backup error:", err);
+    res.status(500).json({ error: err.message || "Backup failed" });
+  }
+});
+
+app.get("/api/config-backups", requireAdmin, async (req, res) => {
+  try {
+    await fs.promises.mkdir(CONFIG_BACKUPS_DIR, { recursive: true });
+    const entries = await fs.promises.readdir(CONFIG_BACKUPS_DIR, { withFileTypes: true });
+    const backups = entries
+      .filter((e) => e.isFile() && e.name.startsWith("elenko-config-backup-") && e.name.endsWith(".json"))
+      .map((e) => ({ name: e.name, url: "/backups/" + e.name }))
+      .sort((a, b) => b.name.localeCompare(a.name));
+    res.json({ backups });
+  } catch (err) {
+    console.error("Config backups list error:", err);
+    res.status(500).json({ error: err.message || "Failed to list backups" });
+  }
+});
+
+app.post("/api/app-config", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const body = req.body || {};
+    const theme = normalizeAppTheme(body.theme || {});
+    const logoUrl = typeof body.logoUrl === "string" ? body.logoUrl.trim() : "";
+    const logoWidth = Number(body.logoWidth) || 0;
+    const logoHeight = Number(body.logoHeight) || 0;
+    const loginTextAbove = typeof body.loginTextAbove === "string" ? body.loginTextAbove.trim() : "";
+    const loginTextBelow = typeof body.loginTextBelow === "string" ? body.loginTextBelow.trim() : "";
+    let doc = null;
+    const id = typeof body._id === "string" && body._id.trim() ? body._id.trim() : "";
+    if (id) {
+      try {
+        const existing = await configDb.get(id);
+        if (existing && existing.type === "elenko_app_config") doc = existing;
+      } catch (_) {}
+    }
+    if (!doc) {
+      const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+      doc = result.docs && result.docs[0];
+    }
+    if (!doc || doc.type !== "elenko_app_config") {
+      doc = { type: "elenko_app_config" };
+    }
+    doc.theme = theme;
+    doc.logoUrl = logoUrl;
+    doc.logoWidth = logoWidth;
+    doc.logoHeight = logoHeight;
+    doc.loginTextAbove = loginTextAbove;
+    doc.loginTextBelow = loginTextBelow;
+    const result = await configDb.insert(doc);
+    cachedAppConfig = null;
+    cachedAppConfigLoadedAt = 0;
+    res.json({ ok: true, id: result.id, rev: result.rev });
+  } catch (err) {
+    console.error("Error saving app config:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/account/users/create", requireAdmin, async (req, res) => {
+  const appUi = await getAppUiConfig();
   const created = req.query.created === "1";
-  res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage(null, created));
+  res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage(null, created, appUi));
 });
 
 app.post("/account/users/create", requireAdmin, async (req, res) => {
@@ -1038,16 +1933,17 @@ app.post("/account/users/create", requireAdmin, async (req, res) => {
   const password = (req.body && req.body.password) || "";
   const roleRaw = (req.body && req.body.role) || "editor";
     const role = roleRaw === "admin" || roleRaw === "reader" ? roleRaw : "editor";
+  const appUi = await getAppUiConfig();
   if (!username) {
-    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username is required."));
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username is required.", false, appUi));
   }
   if (password.length < 1) {
-    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Password is required."));
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Password is required.", false, appUi));
   }
   try {
     const existing = await db.find({ selector: { type: "elenko_user", username }, limit: 1 });
     if (existing.docs && existing.docs.length > 0) {
-      return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username already exists."));
+      return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username already exists.", false, appUi));
     }
     const { hash, salt } = hashPassword(password);
     await db.insert({
@@ -1060,19 +1956,20 @@ app.post("/account/users/create", requireAdmin, async (req, res) => {
     res.redirect("/account/users/create?created=1");
   } catch (err) {
     console.error("Create user error:", err);
-    res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("An error occurred. Please try again."));
+    res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("An error occurred. Please try again.", false, appUi));
   }
 });
 
 app.get("/account/users", requireAdmin, async (req, res) => {
   try {
+    const appUi = await getAppUiConfig();
     const result = await db.find({
       selector: { type: "elenko_user" },
       fields: ["_id", "_rev", "username", "role"],
       sort: [{ username: "asc" }],
     });
     const users = result.docs || [];
-    res.set("Content-Type", "text/html; charset=utf-8").send(renderManageUsersPage(users, req.session && req.session.user));
+    res.set("Content-Type", "text/html; charset=utf-8").send(renderManageUsersPage(users, req.session && req.session.user, appUi));
   } catch (err) {
     console.error("Error loading users:", err);
     res.status(500).send(renderErrorPage(err.message));
@@ -1145,8 +2042,9 @@ app.get("/documents", requireAdmin, async (req, res) => {
       limit: MAX_ENTRIES_PER_PROFILE * 2,
     });
     const docs = result.docs || [];
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderAllDocumentsPage(docs));
+    res.send(renderAllDocumentsPage(docs, appUi));
   } catch (err) {
     console.error("Error loading documents:", err);
     res.status(500).send(renderErrorPage(err.message));
@@ -1202,8 +2100,9 @@ app.get("/entry-forms", requireAdmin, async (req, res) => {
       limit: 500,
     });
     const forms = result.docs || [];
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEntryFormsListPage(forms));
+    res.send(renderEntryFormsListPage(forms, appUi));
   } catch (err) {
     console.error("Error loading entry forms:", err);
     res.status(500).send(renderErrorPage(err.message));
@@ -1212,6 +2111,7 @@ app.get("/entry-forms", requireAdmin, async (req, res) => {
 
 app.get("/entry-forms/create", requireAdmin, async (req, res) => {
   try {
+    const appUi = await getAppUiConfig();
     let flows = [];
     if (configDb) {
       try {
@@ -1220,16 +2120,17 @@ app.get("/entry-forms/create", requireAdmin, async (req, res) => {
       } catch (_) {}
     }
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderCreateEntryFormPage(null, flows));
+    res.send(renderCreateEntryFormPage(null, flows, appUi));
   } catch (err) {
     console.error("Error loading create form page:", err);
     res.status(500).send(renderErrorPage(err.message));
   }
 });
 
-app.get("/entry-forms/css-help", requireAdmin, (req, res) => {
+app.get("/entry-forms/css-help", requireAdmin, async (req, res) => {
+  const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
-  res.send(renderEntryFormCssHelpPage());
+  res.send(renderEntryFormCssHelpPage(appUi));
 });
 
 app.post("/api/entry-forms", requireAdmin, async (req, res) => {
@@ -1282,8 +2183,9 @@ app.get("/entry-forms/:id/edit", requireAdmin, async (req, res) => {
         flows = result.docs || [];
       } catch (_) {}
     }
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditEntryFormPage(doc, null, flows));
+    res.send(renderEditEntryFormPage(doc, null, flows, appUi));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Entry form not found"));
     console.error("Error loading entry form:", err);
@@ -1337,8 +2239,9 @@ app.get("/entry-forms/:id/delete", requireAdmin, async (req, res) => {
     if (!doc || doc.type !== "elenko_entry_form") {
       return res.status(404).send(renderErrorPage("Entry form not found"));
     }
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderDeleteEntryFormPage(doc));
+    res.send(renderDeleteEntryFormPage(doc, appUi));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Entry form not found"));
     console.error("Error loading entry form for delete:", err);
@@ -1394,17 +2297,19 @@ app.get("/apis", requireAdmin, async (req, res) => {
       limit: 500,
     });
     const apis = result.docs || [];
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderApisListPage(apis));
+    res.send(renderApisListPage(apis, appUi));
   } catch (err) {
     console.error("Error loading APIs:", err);
     res.status(500).send(renderErrorPage(err.message));
   }
 });
 
-app.get("/apis/create", requireAdmin, (req, res) => {
+app.get("/apis/create", requireAdmin, async (req, res) => {
+  const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
-  res.send(renderEditApiPage(null, null, req.originalUrl || "/apis/create"));
+  res.send(renderEditApiPage(null, null, req.originalUrl || "/apis/create", appUi));
 });
 
 app.get("/apis/:id/edit", requireAdmin, async (req, res) => {
@@ -1414,8 +2319,9 @@ app.get("/apis/:id/edit", requireAdmin, async (req, res) => {
     if (!doc || doc.type !== "elenko_api") {
       return res.status(404).send(renderErrorPage("API not found"));
     }
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditApiPage(doc, null, req.originalUrl || "/apis/" + encodeURIComponent(req.params.id) + "/edit"));
+    res.send(renderEditApiPage(doc, null, req.originalUrl || "/apis/" + encodeURIComponent(req.params.id) + "/edit", appUi));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("API not found"));
     console.error("Error loading API:", err);
@@ -1501,10 +2407,11 @@ app.post("/api/apis/:id/copy", requireAdmin, async (req, res) => {
   }
 });
 
-app.get("/apis/keys/create", requireAdmin, (req, res) => {
+app.get("/apis/keys/create", requireAdmin, async (req, res) => {
+  const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
   const defaultName = typeof req.query.defaultName === "string" ? req.query.defaultName.trim() : "";
-  res.send(renderEditApiKeyPage(null, null, req.query.returnTo, defaultName));
+  res.send(renderEditApiKeyPage(null, null, req.query.returnTo, defaultName, appUi));
 });
 
 app.post("/api/apis/keys", requireAdmin, async (req, res) => {
@@ -1538,8 +2445,9 @@ app.get("/apis/keys/:id/edit", requireAdmin, async (req, res) => {
     if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
     const doc = await configDb.get(req.params.id);
     const hasKey = doc && (doc.key != null || doc.value != null);
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditApiKeyPage(doc, null, req.query.returnTo, ""));
+    res.send(renderEditApiKeyPage(doc, null, req.query.returnTo, "", appUi));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("API key not found"));
     console.error("Error loading API key:", err);
@@ -1594,17 +2502,19 @@ app.get("/flows", requireAdmin, async (req, res) => {
       limit: 500,
     });
     const flows = result.docs || [];
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderFlowsListPage(flows));
+    res.send(renderFlowsListPage(flows, appUi));
   } catch (err) {
     console.error("Error loading flows:", err);
     res.status(500).send(renderErrorPage(err.message));
   }
 });
 
-app.get("/flows/create", requireAdmin, (req, res) => {
+app.get("/flows/create", requireAdmin, async (req, res) => {
+  const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
-  res.send(renderEditFlowPage(null, null));
+  res.send(renderEditFlowPage(null, null, appUi));
 });
 
 app.get("/flows/:id/edit", requireAdmin, async (req, res) => {
@@ -1614,8 +2524,9 @@ app.get("/flows/:id/edit", requireAdmin, async (req, res) => {
     if (!doc || doc.type !== "elenko_flow") {
       return res.status(404).send(renderErrorPage("Flow not found"));
     }
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditFlowPage(doc, null));
+    res.send(renderEditFlowPage(doc, null, appUi));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Flow not found"));
     console.error("Error loading flow:", err);
@@ -1694,17 +2605,19 @@ app.get("/js-processing", requireAdmin, async (req, res) => {
       limit: 500,
     });
     const list = result.docs || [];
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderJsProcessingListPage(list));
+    res.send(renderJsProcessingListPage(list, appUi));
   } catch (err) {
     console.error("Error loading JS Processing:", err);
     res.status(500).send(renderErrorPage(err.message));
   }
 });
 
-app.get("/js-processing/create", requireAdmin, (req, res) => {
+app.get("/js-processing/create", requireAdmin, async (req, res) => {
+  const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
-  res.send(renderEditJsProcessingPage(null, null));
+  res.send(renderEditJsProcessingPage(null, null, appUi));
 });
 
 app.get("/js-processing/:id/edit", requireAdmin, async (req, res) => {
@@ -1714,8 +2627,9 @@ app.get("/js-processing/:id/edit", requireAdmin, async (req, res) => {
     if (!doc || doc.type !== "elenko_js_processing") {
       return res.status(404).send(renderErrorPage("JS Processing document not found"));
     }
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditJsProcessingPage(doc, null));
+    res.send(renderEditJsProcessingPage(doc, null, appUi));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("JS Processing document not found"));
     console.error("Error loading JS Processing:", err);
@@ -1773,9 +2687,10 @@ app.put("/api/js-processing/:id", requireAdmin, async (req, res) => {
   }
 });
 
-app.get("/profile/create", requireAdmin, (req, res) => {
+app.get("/profile/create", requireAdmin, async (req, res) => {
+  const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
-  res.send(renderCreateProfilePage());
+  res.send(renderCreateProfilePage(appUi));
 });
 
 app.post("/api/profiles", requireAdmin, async (req, res) => {
@@ -1960,8 +2875,9 @@ app.get("/profile/:id/edit", requireAdmin, async (req, res) => {
       });
       forms = result.docs || [];
     } catch (e) {}
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditProfilePage(doc, forms));
+    res.send(renderEditProfilePage(doc, forms, appUi));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Profile not found"));
     console.error("Error loading profile:", err);
@@ -2514,8 +3430,9 @@ app.get("/deletions", requireAdmin, async (req, res) => {
       selector: { type: "elenko_pending_deletions" },
     });
     const batches = result.docs || [];
+    const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderDeletionsPage(batches));
+    res.send(renderDeletionsPage(batches, appUi));
   } catch (err) {
     console.error("Error loading deletions:", err);
     res.status(500).send(renderErrorPage(err.message));
@@ -3539,7 +4456,9 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
 </html>`;
 }
 
-function renderDeletionsPage(batches) {
+function renderDeletionsPage(batches, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const batchRows =
     batches.length > 0
       ? batches
@@ -3567,21 +4486,22 @@ function renderDeletionsPage(batches) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Marked for deletion</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 42rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 42rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     .actions { margin-bottom: 1.5rem; }
-    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
-    .batch { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    .batch { background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #21262d); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
     .batch-title { margin: 0 0 0.5rem 0; }
-    .batch-ids { font-size: 0.875rem; color: #8b949e; word-break: break-all; margin: 0 0 0.75rem 0; }
+    .batch-ids { font-size: 0.875rem; color: var(--app-label, #8b949e); word-break: break-all; margin: 0 0 0.75rem 0; }
     .btn { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }
     .btn-danger { background: #da3633; color: #fff; }
     .btn-danger:hover { background: #f85149; }
     .btn-danger:disabled { opacity: 0.6; cursor: not-allowed; }
-    .empty { color: #8b949e; font-style: italic; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
@@ -3620,7 +4540,9 @@ function renderDeletionsPage(batches) {
 </html>`;
 }
 
-function renderEntryFormsListPage(forms) {
+function renderEntryFormsListPage(forms, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const rows =
     forms.length > 0
       ? forms
@@ -3645,23 +4567,26 @@ function renderEntryFormsListPage(forms) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Entry forms</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 42rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 42rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     .actions { margin-bottom: 1.5rem; }
-    .actions a { color: #58a6ff; text-decoration: none; margin-right: 1rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #21262d; }
-    th { background: #21262d; color: #8b949e; font-weight: 600; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .edit-link { color: #58a6ff; }
+    .edit-link { color: var(--app-link, #58a6ff); }
     .delete-link { color: #f85149; margin-left: 0.5rem; }
     .delete-link:hover { color: #ff7b72; }
-    .empty { color: #8b949e; font-style: italic; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
   </style>
 </head>
 <body>
@@ -3677,7 +4602,9 @@ function renderEntryFormsListPage(forms) {
 </html>`;
 }
 
-function renderDeleteEntryFormPage(doc) {
+function renderDeleteEntryFormPage(doc, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const name = escapeHtml(doc.name || doc._id);
   const rev = escapeHtml(doc._rev || "");
   const id = doc._id;
@@ -3691,12 +4618,13 @@ function renderDeleteEntryFormPage(doc) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Delete entry form</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 32rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 32rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     .actions { margin-bottom: 1.5rem; }
-    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
     .warning { background: #3d1f1f; color: #f85149; padding: 1rem; border-radius: 8px; margin: 1rem 0; }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; margin-right: 0.5rem; margin-top: 0.5rem; }
@@ -3747,7 +4675,9 @@ function renderDeleteEntryFormPage(doc) {
 </html>`;
 }
 
-function renderFlowsListPage(flows) {
+function renderFlowsListPage(flows, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
   const stepSummary = (steps) => {
     if (!Array.isArray(steps) || steps.length === 0) return "—";
@@ -3780,22 +4710,25 @@ function renderFlowsListPage(flows) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Flows</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 56rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 56rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     .actions { margin-bottom: 1.5rem; }
-    .actions a { color: #58a6ff; text-decoration: none; margin-right: 1rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #21262d; }
-    th { background: #21262d; color: #8b949e; font-weight: 600; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .edit-link { color: #58a6ff; margin-right: 0.5rem; }
-    .empty { color: #8b949e; font-style: italic; }
-    .id-cell { font-size: 0.85em; color: #8b949e; word-break: break-all; }
+    .edit-link { color: var(--app-link, #58a6ff); margin-right: 0.5rem; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
   </style>
 </head>
 <body>
@@ -3811,7 +4744,9 @@ function renderFlowsListPage(flows) {
 </html>`;
 }
 
-function renderEditFlowPage(doc, err) {
+function renderEditFlowPage(doc, err, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const isEdit = !!(doc && doc._id);
   const nameVal = doc && typeof doc.name === "string" ? escapeHtml(doc.name) : "";
   const descVal = doc && typeof doc.description === "string" ? escapeHtml(doc.description) : "";
@@ -3830,20 +4765,21 @@ function renderEditFlowPage(doc, err) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – ${title}</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 48rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 48rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
-    input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    select { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    select { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
     .btn { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }
     .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
-    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; }
     .btn-remove { background: transparent; color: #f85149; padding: 0.25rem 0.5rem; }
-    .flow-steps-table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    .flow-steps-table th, .flow-steps-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #21262d; }
-    .flow-steps-table th { color: #8b949e; font-weight: 600; font-size: 0.875rem; }
+    .flow-steps-table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    .flow-steps-table th, .flow-steps-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    .flow-steps-table th { color: var(--app-table-header-text, #8b949e); font-weight: 600; font-size: 0.875rem; }
     .flow-steps-table select { min-width: 10rem; margin: 0; }
     .flow-steps-table input { margin: 0; }
     .msg.err { background: #3d1f1f; color: #f85149; padding: 0.5rem; border-radius: 6px; margin: 1rem 0; }
@@ -3851,13 +4787,13 @@ function renderEditFlowPage(doc, err) {
 </head>
 <body>
   <div class="actions">
-    <a href="/flows" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem;">← Flows</a>
+    <a href="/flows">← Flows</a>
     <button type="submit" form="flow-form" class="btn btn-primary" style="margin-left:1rem;">${submitLabel}</button>
     <a href="/flows" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
   </div>
   <h1>${title}</h1>
   <p class="sub">Steps run in order. Log = passthrough (data unchanged, written to flow log). API and Local DB use the Param column (API doc ID or profile ID).</p>
-  <p class="sub" style="margin-top:0.5rem; padding:0.5rem; background:#161b22; border-radius:6px; border-left:3px solid #58a6ff;"><strong>Persistence:</strong> The flow writes to the database only when it includes one of: <em>Send to Local DB</em>, <em>Update current document</em>, or <em>Create new document in this profile</em>. If none of these steps are present, the result is not saved (&quot;fire and forget&quot;). Adding or removing a Log step does not change this — logging is neutral.</p>
+  <p class="sub" style="margin-top:0.5rem; padding:0.5rem; background:var(--app-table-bg, #161b22); border-radius:6px; border-left:3px solid var(--app-link, #58a6ff);"><strong>Persistence:</strong> The flow writes to the database only when it includes one of: <em>Send to Local DB</em>, <em>Update current document</em>, or <em>Create new document in this profile</em>. If none of these steps are present, the result is not saved (&quot;fire and forget&quot;). Adding or removing a Log step does not change this — logging is neutral.</p>
   ${errHtml}
   <form id="flow-form">
     ${revInput}
@@ -3988,7 +4924,9 @@ function renderEditFlowPage(doc, err) {
 </html>`;
 }
 
-function renderJsProcessingListPage(list) {
+function renderJsProcessingListPage(list, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
   const rows =
     list.length > 0
@@ -4017,22 +4955,25 @@ function renderJsProcessingListPage(list) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – JS Processing</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 56rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 56rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     .actions { margin-bottom: 1.5rem; }
-    .actions a { color: #58a6ff; text-decoration: none; margin-right: 1rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #21262d; }
-    th { background: #21262d; color: #8b949e; font-weight: 600; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .edit-link { color: #58a6ff; margin-right: 0.5rem; }
-    .empty { color: #8b949e; font-style: italic; }
-    .id-cell { font-size: 0.85em; color: #8b949e; word-break: break-all; }
+    .edit-link { color: var(--app-link, #58a6ff); margin-right: 0.5rem; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
   </style>
 </head>
 <body>
@@ -4048,7 +4989,9 @@ function renderJsProcessingListPage(list) {
 </html>`;
 }
 
-function renderEditJsProcessingPage(doc, err) {
+function renderEditJsProcessingPage(doc, err, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const isEdit = !!(doc && doc._id);
   const nameVal = doc && typeof doc.name === "string" ? escapeHtml(doc.name) : "";
   const descVal = doc && typeof doc.description === "string" ? escapeHtml(doc.description) : "";
@@ -4067,22 +5010,23 @@ function renderEditJsProcessingPage(doc, err) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – ${title}</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 48rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 48rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
-    input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    textarea { width: 100%; min-height: 12rem; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: monospace; font-size: 0.9rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    textarea { width: 100%; min-height: 12rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-family: monospace; font-size: 0.9rem; }
     .btn { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }
     .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
-    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; }
     .msg.err { background: #3d1f1f; color: #f85149; padding: 0.5rem; border-radius: 6px; margin: 1rem 0; }
   </style>
 </head>
 <body>
   <div class="actions">
-    <a href="/js-processing" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem;">← JS Processing</a>
+    <a href="/js-processing">← JS Processing</a>
     <button type="submit" form="js-form" class="btn btn-primary" style="margin-left:1rem;">${submitLabel}</button>
     <a href="/js-processing" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
   </div>
@@ -4127,7 +5071,9 @@ function renderEditJsProcessingPage(doc, err) {
 </html>`;
 }
 
-function renderApisListPage(apis) {
+function renderApisListPage(apis, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
   const rows =
     apis.length > 0
@@ -4157,22 +5103,25 @@ function renderApisListPage(apis) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – REST APIs</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 56rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 56rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     .actions { margin-bottom: 1.5rem; }
-    .actions a { color: #58a6ff; text-decoration: none; margin-right: 1rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #21262d; }
-    th { background: #21262d; color: #8b949e; font-weight: 600; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .edit-link, .copy-link { color: #58a6ff; margin-right: 0.5rem; }
-    .empty { color: #8b949e; font-style: italic; }
-    .id-cell { font-size: 0.85em; color: #8b949e; word-break: break-all; }
+    .edit-link, .copy-link { color: var(--app-link, #58a6ff); margin-right: 0.5rem; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
   </style>
 </head>
 <body>
@@ -4207,7 +5156,9 @@ function renderApisListPage(apis) {
 </html>`;
 }
 
-function renderEditApiPage(doc, err, returnTo) {
+function renderEditApiPage(doc, err, returnTo, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const isEdit = !!(doc && doc._id);
   const id = doc && doc._id;
   const rev = doc && doc._rev;
@@ -4239,21 +5190,24 @@ function renderEditApiPage(doc, err, returnTo) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – ${title}</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 42rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 42rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
     .actions { margin-bottom: 1rem; }
-    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
-    label { display: block; margin-top: 0.75rem; }
-    input, select, textarea { width: 100%; max-width: 28rem; padding: 0.5rem; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; }
+    label { display: block; margin-top: 0.75rem; color: var(--app-label, #8b949e); }
+    input, select, textarea { width: 100%; max-width: 28rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
     .btn { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; border: none; }
     .btn-primary { background: #238636; color: #fff; }
-    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; display: inline-block; margin-left: 0.5rem; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; display: inline-block; margin-left: 0.5rem; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
     .msg { margin-top: 1rem; }
     .msg.err { color: #f85149; }
     .msg.ok { color: #3fb950; }
-    .sub { color: #8b949e; font-size: 0.9rem; margin-top: 0.25rem; }
+    .sub { color: var(--app-label, #8b949e); font-size: 0.9rem; margin-top: 0.25rem; }
   </style>
 </head>
 <body>
@@ -4366,7 +5320,9 @@ function renderEditApiPage(doc, err, returnTo) {
 </html>`;
 }
 
-function renderEditApiKeyPage(doc, err, returnTo, defaultName) {
+function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const isEdit = !!(doc && doc._id);
   const id = doc && doc._id;
   const rev = doc && doc._rev;
@@ -4387,21 +5343,24 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – ${title}</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 42rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 42rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
     .actions { margin-bottom: 1rem; }
-    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
-    label { display: block; margin-top: 0.75rem; }
-    input { width: 100%; max-width: 28rem; padding: 0.5rem; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; }
+    label { display: block; margin-top: 0.75rem; color: var(--app-label, #8b949e); }
+    input { width: 100%; max-width: 28rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
     .btn { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; border: none; }
     .btn-primary { background: #238636; color: #fff; }
-    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; display: inline-block; margin-left: 0.5rem; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; display: inline-block; margin-left: 0.5rem; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
     .msg { margin-top: 1rem; }
     .msg.err { color: #f85149; }
     .msg.ok { color: #3fb950; }
-    .sub { color: #8b949e; font-size: 0.9rem; margin-top: 0.25rem; }
+    .sub { color: var(--app-label, #8b949e); font-size: 0.9rem; margin-top: 0.25rem; }
   </style>
 </head>
 <body>
@@ -4459,15 +5418,17 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName) {
 </html>`;
 }
 
-function renderCreateEntryFormPage(err, flows) {
-  return renderEntryFormPage(null, null, err, flows);
+function renderCreateEntryFormPage(err, flows, appUi) {
+  return renderEntryFormPage(null, null, err, flows, appUi);
 }
 
-function renderEditEntryFormPage(doc, err, flows) {
-  return renderEntryFormPage(doc, doc._rev, err, flows);
+function renderEditEntryFormPage(doc, err, flows, appUi) {
+  return renderEntryFormPage(doc, doc._rev, err, flows, appUi);
 }
 
-function renderEntryFormCssHelpPage() {
+function renderEntryFormCssHelpPage(appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4476,18 +5437,19 @@ function renderEntryFormCssHelpPage() {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Entry form CSS reference</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 48rem; line-height: 1.5; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 48rem; line-height: 1.5; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
     h2 { font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem; font-size: 1.1rem; }
-    p { margin: 0.5rem 0 1rem 0; color: #8b949e; }
-    code { background: #21262d; padding: 0.15em 0.4em; border-radius: 4px; font-size: 0.9em; }
-    pre { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.875rem; }
+    p { margin: 0.5rem 0 1rem 0; color: var(--app-label, #8b949e); }
+    code { background: var(--app-table-header-bg, #21262d); padding: 0.15em 0.4em; border-radius: 4px; font-size: 0.9em; }
+    pre { background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #21262d); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.875rem; }
     table { width: 100%; border-collapse: collapse; margin: 0.5rem 0 1rem 0; }
-    th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #21262d; }
-    th { color: #8b949e; font-weight: 600; }
+    th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     .back { margin-bottom: 1rem; }
-    .back a { color: #58a6ff; text-decoration: none; }
+    .back a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .back a:hover { text-decoration: underline; }
   </style>
 </head>
@@ -4549,7 +5511,9 @@ function renderEntryFormCssHelpPage() {
 </html>`;
 }
 
-function renderEntryFormPage(doc, rev, err, flows) {
+function renderEntryFormPage(doc, rev, err, flows, appUi) {
+  const appTheme = normalizeAppTheme(appUi && appUi.theme);
+  const appThemeVars = getAppThemeVars(appTheme);
   const flowsList = Array.isArray(flows) ? flows : [];
   const isEdit = !!doc;
   const name = doc ? escapeHtml(doc.name || "") : "";
@@ -4633,19 +5597,20 @@ function renderEntryFormPage(doc, rev, err, flows) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – ${title}</title>
   <style>
+    ${appThemeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 48rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 48rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
-    input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    input:focus { outline: none; border-color: #58a6ff; }
-    select { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    textarea { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; font-family: inherit; min-height: 4rem; resize: vertical; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    input:focus { outline: none; border-color: var(--app-link, #58a6ff); }
+    select { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    textarea { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; font-family: inherit; min-height: 4rem; resize: vertical; }
     .btn { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }
     .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
     .btn-primary:hover { background: #2ea043; }
-    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; }
     .btn-secondary:hover { background: #30363d; }
     .btn-remove { background: transparent; color: #f85149; padding: 0.25rem 0.5rem; }
     .btn-remove:hover { color: #ff7b72; }
@@ -4655,11 +5620,11 @@ function renderEntryFormPage(doc, rev, err, flows) {
     .field-layout-table input { width: 100%; }
     .theme-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
     .theme-row label { margin: 0; flex: 0 0 10rem; }
-    .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid #30363d; border-radius: 4px; background: #161b22; }
-    .theme-row input[type="text"] { flex: 1; min-width: 8.5rem; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.875rem; }
-    .flow-config-table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    .flow-config-table th, .flow-config-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #21262d; }
-    .flow-config-table th { color: #8b949e; font-weight: 600; font-size: 0.875rem; }
+    .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; background: var(--app-table-bg, #161b22); }
+    .theme-row input[type="text"] { flex: 1; min-width: 8.5rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 0.875rem; }
+    .flow-config-table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    .flow-config-table th, .flow-config-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    .flow-config-table th { color: var(--app-table-header-text, #8b949e); font-weight: 600; font-size: 0.875rem; }
     .flow-config-table tbody tr:last-child td { border-bottom: none; }
     .flow-config-table input[type="text"] { margin: 0; }
     .flow-config-table select { margin: 0; min-width: 10rem; }
@@ -4667,7 +5632,7 @@ function renderEntryFormPage(doc, rev, err, flows) {
 </head>
 <body>
   <div class="actions">
-    <a href="/entry-forms" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem;">← Entry forms</a>
+    <a href="/entry-forms">← Entry forms</a>
     <button type="submit" form="entry-form-form" class="btn btn-primary" style="margin-left:1rem;">${submitLabel}</button>
     <a href="/entry-forms" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
   </div>
@@ -4985,7 +5950,9 @@ function renderDeleteProfilePage(doc) {
 </html>`;
 }
 
-function renderAllDocumentsPage(docs) {
+function renderAllDocumentsPage(docs, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const profileMap = {};
   for (const d of docs) {
     if (d.type === "elenko_profile") {
@@ -5034,33 +6001,34 @@ function renderAllDocumentsPage(docs) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – All documents</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; min-height: 100vh; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); min-height: 100vh; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     .actions { margin-bottom: 1.5rem; }
-    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #21262d; }
-    th { background: #21262d; color: #8b949e; font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .empty { color: #8b949e; font-style: italic; }
-    code { font-size: 0.9em; background: #21262d; padding: 0.2em 0.4em; border-radius: 4px; word-break: break-all; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    code { font-size: 0.9em; background: var(--app-table-bg, #21262d); color: var(--app-label, #8b949e); padding: 0.2em 0.4em; border-radius: 4px; word-break: break-all; }
     .btn { display: inline-block; background: #da3633; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; margin-bottom: 1rem; }
     .btn:hover { background: #f85149; }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
-    .profile-id-hint { font-size: 0.85em; color: #8b949e; font-weight: normal; }
+    .profile-id-hint { font-size: 0.85em; color: var(--app-label, #8b949e); font-weight: normal; }
   </style>
 </head>
 <body>
   <div class="actions"><a href="/">← Profiles</a></div>
   <h1>All documents</h1>
   <p class="sub">CouchDB documents created by the application (profiles, entries, pending-deletion batches).</p>
-  <p><label for="doc-summary-search" style="margin-right:0.5rem;">Search Summary:</label><input type="search" id="doc-summary-search" placeholder="Filter by summary…" style="padding:0.5rem 0.75rem;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:1rem;min-width:16rem;"></p>
+  <p><label for="doc-summary-search" style="margin-right:0.5rem;">Search Summary:</label><input type="search" id="doc-summary-search" placeholder="Filter by summary…" style="padding:0.5rem 0.75rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);font-size:1rem;min-width:16rem;"></p>
   <p><button type="button" class="btn" id="delete-marked-btn">Delete marked entries</button></p>
   <table>
     <thead>
@@ -5122,8 +6090,27 @@ function renderAllDocumentsPage(docs) {
 </html>`;
 }
 
-function renderStartPage(profiles, role) {
+function renderStartPage(profiles, role, appUi) {
   const isAdmin = role === "admin";
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const logoUrl = appUi && appUi.logoUrl ? appUi.logoUrl : "";
+  const logoWidth = appUi && appUi.logoWidth ? appUi.logoWidth : 0;
+  const logoHeight = appUi && appUi.logoHeight ? appUi.logoHeight : 0;
+  const logoHtml = logoUrl
+    ? `<div class="logo-wrap" style="margin-bottom:1rem;"><img src="${escapeHtml(logoUrl)}" style="max-width:100%;${logoWidth ? `width:${logoWidth}px;` : ""}${logoHeight ? `height:${logoHeight}px;` : ""}" alt="Elenko logo"></div>`
+    : "";
+  const titleHtml = logoUrl ? "" : "<h1>Elenko</h1>";
+  const themeVars = `
+    :root {
+      --app-bg: ${escapeHtml(theme.background)};
+      --app-text: ${escapeHtml(theme.text)};
+      --app-label: ${escapeHtml(theme.label)};
+      --app-link: ${escapeHtml(theme.link)};
+      --app-table-bg: ${escapeHtml(theme.tableBg)};
+      --app-table-header-bg: ${escapeHtml(theme.tableHeaderBg)};
+      --app-table-header-text: ${escapeHtml(theme.tableHeaderText)};
+      --app-table-border: ${escapeHtml(theme.tableBorder)};
+    }`;
   const rows = profiles.length
     ? profiles
         .map((p) => {
@@ -5150,9 +6137,9 @@ function renderStartPage(profiles, role) {
 
     const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
-  const userAdminOptions = '<option value="" disabled selected>Administration</option><option value="/account/change-password">Change password</option>' + (isAdmin ? '<option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special functions</option><option value="/entry-forms">Entry forms</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
-  const actionsCommon = '<a href="/logout" class="link-secondary">Log out</a>';
+  const userAdminOptions = '<option value="" disabled selected>Administration</option><option value="/account/change-password">Change password</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
+  const specialOptions = '<option value="" disabled selected>Special functions</option><option value="/app-config">Application design / theme</option><option value="/config-export-import">Export / Import configuration</option><option value="/entry-forms">Entry forms</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
   const theadAdmin = "<tr><th>Name</th><th>Description</th><th>Document ID</th><th>Actions</th></tr>";
   const theadUser = "<tr><th>Name</th><th>Description</th></tr>";
 
@@ -5164,24 +6151,27 @@ function renderStartPage(profiles, role) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Database profiles</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; min-height: 100vh; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); min-height: 100vh; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #21262d; }
-    th { background: #21262d; color: #8b949e; font-weight: 600; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    a { color: #58a6ff; text-decoration: none; }
+    a { color: var(--app-link, #58a6ff); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    code { font-size: 0.9em; background: #21262d; padding: 0.2em 0.4em; border-radius: 4px; }
-    .empty { color: #8b949e; font-style: italic; }
+    code { font-size: 0.9em; background: var(--app-table-bg, #21262d); color: var(--app-label, #8b949e); padding: 0.2em 0.4em; border-radius: 4px; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 0; }
     .btn:hover { background: #2ea043; text-decoration: none; }
-    .link-secondary { color: #8b949e; margin-left: 1rem; }
-    .link-secondary:hover { color: #e6edf3; }
+    a.btn:not(.btn-secondary), .nav-bar a.btn:not(.btn-secondary) { color: #fff; }
+    a.btn:hover:not(.btn-secondary), .nav-bar a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    .btn-logout { display: inline-block; margin-left: 0.5rem; padding: 0.35rem 0.75rem; background: #0d1117; color: #fff; border: 1px solid #30363d; border-radius: 6px; font-size: 0.9rem; text-decoration: none; vertical-align: middle; }
+    .btn-logout:hover { background: #21262d; color: #fff; text-decoration: none; }
     .nav-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; margin-bottom: 1rem; }
-    .edit-link { color: #58a6ff; }
+    .edit-link { color: var(--app-link, #58a6ff); }
     .delete-link { color: #f85149; margin-left: 0.5rem; }
     .delete-link:hover { color: #ff7b72; }
     .nav-select { margin-left: 0; padding: 0.35rem 0.5rem; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.9rem; cursor: pointer; vertical-align: middle; }
@@ -5190,7 +6180,8 @@ function renderStartPage(profiles, role) {
   </style>
 </head>
 <body>
-  <h1>Elenko</h1>
+  ${logoHtml}
+  ${titleHtml}
   <p class="nav-bar">
     ${isAdmin ? actionsAdmin : actionsUser}
     ${isAdmin ? '<select id="nav-flow-processing" class="nav-select" aria-label="Flow processing"><option value="" disabled selected>Flow processing</option><option value="/flows">Flows</option><option value="/apis">REST APIs</option><option value="/js-processing">JS Processing</option></select>' : ''}
@@ -5232,7 +6223,9 @@ function toHex6(hex) {
   return "#" + s;
 }
 
-function renderEditProfilePage(doc, forms = []) {
+function renderEditProfilePage(doc, forms = [], appUi) {
+  const appTheme = normalizeAppTheme(appUi && appUi.theme);
+  const appThemeVars = getAppThemeVars(appTheme);
   const name = escapeHtml(doc.name || "");
   const description = escapeHtml(doc.description || "");
   const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
@@ -5278,17 +6271,18 @@ function renderEditProfilePage(doc, forms = []) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Edit profile</title>
   <style>
+    ${appThemeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 48rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 48rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
-    input[type="text"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    input[type="text"]:focus { outline: none; border-color: #58a6ff; }
-    textarea { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; font-family: inherit; min-height: 4rem; resize: vertical; }
-    textarea:focus { outline: none; border-color: #58a6ff; }
-    select { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    select:focus { outline: none; border-color: #58a6ff; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    input[type="text"]:focus { outline: none; border-color: var(--app-link, #58a6ff); }
+    textarea { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; font-family: inherit; min-height: 4rem; resize: vertical; }
+    textarea:focus { outline: none; border-color: var(--app-link, #58a6ff); }
+    select { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    select:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .field-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center; }
     .field-row input[name="fieldNames"] { flex: 1; min-width: 10rem; }
     .field-row select[name="fieldDefaultSources"] { flex: 0 0 auto; width: auto; min-width: 10rem; max-width: 14rem; }
@@ -5304,16 +6298,16 @@ function renderEditProfilePage(doc, forms = []) {
     .btn-secondary:hover { background: #30363d; }
     .btn-remove { background: transparent; color: #f85149; padding: 0.25rem 0.5rem; }
     .btn-remove:hover { color: #ff7b72; }
-    .flow-config-table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    .flow-config-table th, .flow-config-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #21262d; }
-    .flow-config-table th { color: #8b949e; font-weight: 600; font-size: 0.875rem; }
+    .flow-config-table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    .flow-config-table th, .flow-config-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    .flow-config-table th { color: var(--app-table-header-text, #8b949e); font-weight: 600; font-size: 0.875rem; }
     .flow-config-table tbody tr:last-child td { border-bottom: none; }
     .flow-config-table input[type="text"] { margin: 0; }
     .flow-config-table select { margin: 0; min-width: 10rem; }
     .theme-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
     .theme-row label { margin: 0; flex: 0 0 8rem; }
-    .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid #30363d; border-radius: 4px; background: #161b22; }
-    .theme-row input[type="text"] { flex: 1; min-width: 8.5rem; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.875rem; }
+    .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; background: var(--app-table-bg, #161b22); }
+    .theme-row input[type="text"] { flex: 1; min-width: 8.5rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 0.875rem; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
@@ -5381,7 +6375,7 @@ function renderEditProfilePage(doc, forms = []) {
     <label style="margin-top:1.5rem;">Recover entries</label>
     <p class="sub" style="margin-top:0.25rem;">If entries show in All documents but not on this profile, they may have a different profile ID (e.g. after a restore). In <a href="/documents">All documents</a>, open an entry row and copy the ID in parentheses from the Summary column. Paste it below and click Reassign to attach those entries to this profile.</p>
     <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;flex-wrap:wrap;">
-      <input type="text" id="previous-profile-id" placeholder="Paste previous profile ID" style="max-width:20rem;padding:0.5rem;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;">
+      <input type="text" id="previous-profile-id" placeholder="Paste previous profile ID" style="max-width:20rem;padding:0.5rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);">
       <button type="button" class="btn btn-secondary" id="reassign-entries-btn">Reassign entries to this profile</button>
       <span id="reassign-msg"></span>
     </div>
@@ -5637,7 +6631,9 @@ function renderEditProfilePage(doc, forms = []) {
 </html>`;
 }
 
-function renderCreateProfilePage() {
+function renderCreateProfilePage(appUi) {
+  const appTheme = normalizeAppTheme(appUi && appUi.theme);
+  const appThemeVars = getAppThemeVars(appTheme);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5646,15 +6642,16 @@ function renderCreateProfilePage() {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Create profile</title>
   <style>
+    ${appThemeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 32rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 32rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
-    input[type="text"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    input[type="text"]:focus { outline: none; border-color: #58a6ff; }
-    textarea { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; font-family: inherit; min-height: 4rem; resize: vertical; }
-    textarea:focus { outline: none; border-color: #58a6ff; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    input[type="text"]:focus { outline: none; border-color: var(--app-link, #58a6ff); }
+    textarea { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; font-family: inherit; min-height: 4rem; resize: vertical; }
+    textarea:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .field-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center; }
     .field-row input { flex: 1; }
     .field-list { margin: 1rem 0; }
@@ -5692,7 +6689,7 @@ function renderCreateProfilePage() {
     <div style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;margin-bottom:0.5rem;">
       <input type="text" id="importConfigFile" placeholder="e.g. compositions.eld" style="flex:1;min-width:12rem;">
       <label for="importFileSelect" style="margin:0;color:#8b949e;">Select file:</label>
-      <select id="importFileSelect" class="import-select" style="background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:0.5rem;font-size:1rem;min-width:10rem;">
+      <select id="importFileSelect" class="import-select" style="background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);padding:0.5rem;font-size:1rem;min-width:10rem;">
         <option value="">— Select file —</option>
       </select>
     </div>
@@ -5818,8 +6815,32 @@ function renderCreateProfilePage() {
 </html>`;
 }
 
-function renderLoginPage(errorMessage) {
+function renderLoginPage(errorMessage, appUi) {
   const err = errorMessage ? `<p class="login-err">${escapeHtml(errorMessage)}</p>` : "";
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const logoUrl = appUi && appUi.logoUrl ? appUi.logoUrl : "";
+  const logoWidth = appUi && appUi.logoWidth ? appUi.logoWidth : 0;
+  const logoHeight = appUi && appUi.logoHeight ? appUi.logoHeight : 0;
+  const loginTextAboveRaw = appUi && typeof appUi.loginTextAbove === "string" ? appUi.loginTextAbove.trim() : "";
+  const loginTextBelowRaw = appUi && typeof appUi.loginTextBelow === "string" ? appUi.loginTextBelow.trim() : "";
+  const loginTextAboveHtml = loginTextAboveRaw ? marked.parse(loginTextAboveRaw) : "";
+  const loginTextBelowHtml = loginTextBelowRaw ? marked.parse(loginTextBelowRaw) : "";
+  const themeVars = `
+    :root {
+      --app-bg: ${escapeHtml(theme.background)};
+      --app-text: ${escapeHtml(theme.text)};
+      --app-label: ${escapeHtml(theme.label)};
+      --app-link: ${escapeHtml(theme.link)};
+      --app-table-bg: ${escapeHtml(theme.tableBg)};
+      --app-table-border: ${escapeHtml(theme.tableBorder)};
+    }`;
+  const logoHtml = logoUrl
+    ? `<div class="logo-wrap" style="margin-bottom:1rem;">
+         <img src="${escapeHtml(logoUrl)}"
+              style="max-width:100%;${logoWidth ? `width:${logoWidth}px;` : ""}${logoHeight ? `height:${logoHeight}px;` : ""}"
+              alt="Elenko logo">
+       </div>`
+    : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5828,23 +6849,31 @@ function renderLoginPage(errorMessage) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Login</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
     .login-box { max-width: 20rem; width: 100%; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
-    input[type="text"], input[type="password"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    input:focus { outline: none; border-color: #58a6ff; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"], input[type="password"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    input:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
     .btn:hover { background: #2ea043; }
     .login-err { color: #f85149; margin-top: 1rem; }
+    .login-markdown { line-height: 1.5; margin: 1rem 0; }
+    .login-markdown p { margin: 0 0 0.5rem 0; }
+    .login-markdown p:last-child { margin-bottom: 0; }
+    .login-markdown ul, .login-markdown ol { margin: 0 0 0.5rem 0; padding-left: 1.5rem; }
+    .login-markdown a { color: var(--app-link, #58a6ff); }
   </style>
 </head>
 <body>
   <div class="login-box">
-    <h1>Elenko</h1>
+    ${logoHtml}
+    ${logoUrl ? "" : "<h1>Elenko</h1>"}
     <p class="sub">Log in to continue</p>
+    ${loginTextAboveHtml ? `<div class="login-markdown">${loginTextAboveHtml}</div>` : ""}
     ${err}
     <form method="post" action="/login">
       <label for="username">Username</label>
@@ -5853,12 +6882,15 @@ function renderLoginPage(errorMessage) {
       <input type="password" id="password" name="password" required>
       <button type="submit" class="btn">Log in</button>
     </form>
+    ${loginTextBelowHtml ? `<div class="login-markdown">${loginTextBelowHtml}</div>` : ""}
   </div>
 </body>
 </html>`;
 }
 
-function renderChangePasswordPage(errorMessage) {
+function renderChangePasswordPage(errorMessage, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const err = errorMessage ? `<p class="login-err">${escapeHtml(errorMessage)}</p>` : "";
   return `<!DOCTYPE html>
 <html lang="en">
@@ -5868,13 +6900,14 @@ function renderChangePasswordPage(errorMessage) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Change password</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 24rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 24rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
-    input[type="password"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    input:focus { outline: none; border-color: #58a6ff; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="password"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    input:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
     .btn:hover { background: #2ea043; }
     .btn-secondary { display: inline-block; margin-top: 0.5rem; background: #21262d; color: #e6edf3; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; }
@@ -5900,7 +6933,593 @@ function renderChangePasswordPage(errorMessage) {
 </html>`;
 }
 
-function renderManageUsersPage(users, currentUsername) {
+function renderCouchDbPasswordPage(appUi, errorMessage, successMessage, formAction, isSetupFlow) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const err = errorMessage ? `<p class="msg err">${escapeHtml(errorMessage)}</p>` : "";
+  const ok = successMessage ? `<p class="msg ok">${escapeHtml(successMessage)}</p>` : "";
+  const action = formAction || "/account/couchdb-password";
+  const sub = isSetupFlow
+    ? "You are connected with the default password. Set a new password below; it will be saved to CouchDB and to the bootstrap file so the app can connect after restart."
+    : "Change the password for the CouchDB <code>admin</code> user. The new password is written to CouchDB, then verified by reconnecting. The encrypted bootstrap file and Application config are updated so the app can connect after restart.";
+  const cancelHref = isSetupFlow ? "/setup" : "/";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – CouchDB password</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 28rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="password"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    input:focus { outline: none; border-color: var(--app-link, #58a6ff); }
+    .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
+    .btn:hover { background: #2ea043; }
+    .btn-secondary { display: inline-block; margin-top: 0.5rem; background: #21262d; color: #e6edf3; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; }
+    .btn-secondary:hover { background: #30363d; }
+    .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
+    .msg.err { background: #3d1f1f; color: #f85149; }
+    .msg.ok { background: #1a2e1a; color: #7ee787; }
+  </style>
+</head>
+<body>
+  <div class="actions" style="margin-bottom:1rem;"><a href="${escapeHtml(cancelHref)}" class="btn-secondary">← ${isSetupFlow ? "Setup" : "Profiles"}</a></div>
+  <h1>CouchDB password</h1>
+  <p class="sub">${sub}</p>
+  ${err}
+  ${ok}
+  <form method="post" action="${escapeHtml(action)}">
+    <label for="currentPassword">Current CouchDB password</label>
+    <input type="password" id="currentPassword" name="currentPassword" required autofocus autocomplete="current-password"${isSetupFlow ? ' placeholder="admin"' : ""}>
+    <label for="newPassword">New password</label>
+    <input type="password" id="newPassword" name="newPassword" required autocomplete="new-password">
+    <label for="confirmPassword">Confirm new password</label>
+    <input type="password" id="confirmPassword" name="confirmPassword" required autocomplete="new-password">
+    <button type="submit" class="btn">Change CouchDB password</button>
+  </form>
+  <a href="${escapeHtml(cancelHref)}" class="btn-secondary">Cancel</a>
+</body>
+</html>`;
+}
+
+function renderEditAppConfigPage(appUi, err) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const bg = toHex6(theme.background);
+  const text = toHex6(theme.text);
+  const label = toHex6(theme.label);
+  const link = toHex6(theme.link);
+  const tableBg = toHex6(theme.tableBg);
+  const tableHeaderBg = toHex6(theme.tableHeaderBg);
+  const tableHeaderText = toHex6(theme.tableHeaderText);
+  const tableBorder = toHex6(theme.tableBorder);
+  const logoUrl = appUi && typeof appUi.logoUrl === "string" ? appUi.logoUrl : "";
+  const logoWidth = appUi && appUi.logoWidth ? String(appUi.logoWidth) : "";
+  const logoHeight = appUi && appUi.logoHeight ? String(appUi.logoHeight) : "";
+  const loginTextAbove = (appUi && typeof appUi.loginTextAbove === "string") ? appUi.loginTextAbove : "";
+  const loginTextBelow = (appUi && typeof appUi.loginTextBelow === "string") ? appUi.loginTextBelow : "";
+  const id = appUi && appUi._id ? String(appUi._id) : "";
+  const rev = appUi && appUi._rev ? String(appUi._rev) : "";
+  const msgErr = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Application design</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 40rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: #8b949e; margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
+    input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
+    input[type="text"]:focus, input[type="number"]:focus { outline: none; border-color: #58a6ff; }
+    .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
+    .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
+    .btn-primary:hover { background: #2ea043; }
+    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; margin-left: 0.5rem; }
+    .btn-secondary:hover { background: #30363d; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a:hover { text-decoration: underline; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    .theme-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 1rem; margin-top: 0.5rem; }
+    .theme-row { display: flex; align-items: center; gap: 0.5rem; }
+    .theme-row label { margin: 0; flex: 0 0 6rem; }
+    .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid #30363d; border-radius: 4px; background: #161b22; }
+    .theme-row input[type="text"] { flex: 1; min-width: 8.5rem; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.875rem; }
+    .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
+    .msg.err { background: #3d1f1f; color: #f85149; }
+    .logo-preview { margin-top: 0.75rem; }
+    .logo-preview img { max-width: 100%; border-radius: 4px; border: 1px solid #30363d; background: #161b22; padding: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="actions">
+    <a href="/" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem 0.5rem 1rem;">← Profiles</a>
+    <button type="submit" form="app-config-form" class="btn btn-primary" style="margin-left:1rem;">Save</button>
+    <button type="button" id="set-default-theme-btn" class="btn btn-secondary" style="margin-left:0.5rem;">Set to default</button>
+    <a href="/" class="btn btn-secondary">Cancel</a>
+  </div>
+  <h1>Application design</h1>
+  <p class="sub">Global colours and logo/header image used on the login page, start page, and configuration pages. Defaults match the current dark theme.</p>
+  ${msgErr}
+  <form id="app-config-form">
+    ${id ? `<input type="hidden" id="appConfigId" name="_id" value="${escapeHtml(id)}">` : ""}
+    ${rev ? `<input type="hidden" id="appConfigRev" name="_rev" value="${escapeHtml(rev)}">` : ""}
+    <label>Theme (colours)</label>
+    <p class="sub" style="margin-top:0.25rem;">Click the swatch to pick a colour, or edit the hex value.</p>
+    <div class="theme-grid">
+      <div class="theme-row"><label for="theme-background">Background</label><input type="color" id="theme-background" value="${escapeHtml(bg)}"><input type="text" id="theme-background-hex" value="${escapeHtml(bg)}" placeholder="#0f1419"></div>
+      <div class="theme-row"><label for="theme-text">Text</label><input type="color" id="theme-text" value="${escapeHtml(text)}"><input type="text" id="theme-text-hex" value="${escapeHtml(text)}" placeholder="#e6edf3"></div>
+      <div class="theme-row"><label for="theme-label">Label</label><input type="color" id="theme-label" value="${escapeHtml(label)}"><input type="text" id="theme-label-hex" value="${escapeHtml(label)}" placeholder="#8b949e"></div>
+      <div class="theme-row"><label for="theme-link">Link</label><input type="color" id="theme-link" value="${escapeHtml(link)}"><input type="text" id="theme-link-hex" value="${escapeHtml(link)}" placeholder="#58a6ff"></div>
+      <div class="theme-row"><label for="theme-tableBg">Table background</label><input type="color" id="theme-tableBg" value="${escapeHtml(tableBg)}"><input type="text" id="theme-tableBg-hex" value="${escapeHtml(tableBg)}" placeholder="#161b22"></div>
+      <div class="theme-row"><label for="theme-tableHeaderBg">Table header bg</label><input type="color" id="theme-tableHeaderBg" value="${escapeHtml(tableHeaderBg)}"><input type="text" id="theme-tableHeaderBg-hex" value="${escapeHtml(tableHeaderBg)}" placeholder="#21262d"></div>
+      <div class="theme-row"><label for="theme-tableHeaderText">Table header text</label><input type="color" id="theme-tableHeaderText" value="${escapeHtml(tableHeaderText)}"><input type="text" id="theme-tableHeaderText-hex" value="${escapeHtml(tableHeaderText)}" placeholder="#8b949e"></div>
+      <div class="theme-row"><label for="theme-tableBorder">Table border</label><input type="color" id="theme-tableBorder" value="${escapeHtml(tableBorder)}"><input type="text" id="theme-tableBorder-hex" value="${escapeHtml(tableBorder)}" placeholder="#21262d"></div>
+    </div>
+    <label for="logoUrl">Logo / header image URL</label>
+    <input type="text" id="logoUrl" name="logoUrl" placeholder="/logo.png or https://…" value="${escapeHtml(logoUrl)}">
+    <p class="sub" style="margin-top:0.25rem;">Optional. URL or path. For a file in the <code>public/</code> directory (e.g. in Docker), omit <code>/public/</code> and use the path from the site root, e.g. <code>/logo.png</code>.</p>
+    <div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-top:0.5rem;">
+      <div style="flex:0 0 8rem;">
+        <label for="logoWidth">Logo width (px)</label>
+        <input type="number" id="logoWidth" name="logoWidth" min="0" step="1" placeholder="0 = auto" value="${escapeHtml(logoWidth)}">
+      </div>
+      <div style="flex:0 0 8rem;">
+        <label for="logoHeight">Logo height (px)</label>
+        <input type="number" id="logoHeight" name="logoHeight" min="0" step="1" placeholder="0 = auto" value="${escapeHtml(logoHeight)}">
+      </div>
+    </div>
+    ${
+      logoUrl
+        ? `<div class="logo-preview">
+      <p class="sub" style="margin-top:0.5rem;">Preview:</p>
+      <img src="${escapeHtml(logoUrl)}" alt="Application logo preview"
+           style="${logoWidth ? `width:${escapeHtml(logoWidth)}px;` : ""}${logoHeight ? `height:${escapeHtml(logoHeight)}px;` : ""}">
+    </div>`
+        : ""
+    }
+    <label for="loginTextAbove">Login page text (above form)</label>
+    <textarea id="loginTextAbove" name="loginTextAbove" rows="3" placeholder="Optional. Shown below the logo, above the login fields. Markdown supported." style="width:100%;padding:0.5rem;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:1rem;font-family:inherit;resize:vertical;">${escapeHtml(loginTextAbove)}</textarea>
+    <p class="sub" style="margin-top:0.25rem;">Rendered as Markdown on the login page.</p>
+    <label for="loginTextBelow" style="margin-top:1rem;">Login page text (below form)</label>
+    <textarea id="loginTextBelow" name="loginTextBelow" rows="3" placeholder="Optional. Shown below the login button. Markdown supported." style="width:100%;padding:0.5rem;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:1rem;font-family:inherit;resize:vertical;">${escapeHtml(loginTextBelow)}</textarea>
+    <p class="sub" style="margin-top:0.25rem;">Rendered as Markdown on the login page.</p>
+  </form>
+  <div id="msg" class="msg" style="display:none;"></div>
+  <script>
+    (function() {
+      function bindColorPair(colorId, textId) {
+        var c = document.getElementById(colorId);
+        var t = document.getElementById(textId);
+        if (!c || !t) return;
+        c.addEventListener('input', function() {
+          t.value = c.value;
+        });
+        t.addEventListener('input', function() {
+          var v = t.value.trim();
+          if (!v) return;
+          if (!v.startsWith('#')) v = '#' + v;
+          t.value = v;
+          c.value = v;
+        });
+      }
+      bindColorPair('theme-background', 'theme-background-hex');
+      bindColorPair('theme-text', 'theme-text-hex');
+      bindColorPair('theme-label', 'theme-label-hex');
+      bindColorPair('theme-link', 'theme-link-hex');
+      bindColorPair('theme-tableBg', 'theme-tableBg-hex');
+      bindColorPair('theme-tableHeaderBg', 'theme-tableHeaderBg-hex');
+      bindColorPair('theme-tableHeaderText', 'theme-tableHeaderText-hex');
+      bindColorPair('theme-tableBorder', 'theme-tableBorder-hex');
+
+      var defaultTheme = {
+        background: '#0f1419',
+        text: '#e6edf3',
+        label: '#8b949e',
+        link: '#58a6ff',
+        tableBg: '#161b22',
+        tableHeaderBg: '#21262d',
+        tableHeaderText: '#8b949e',
+        tableBorder: '#21262d'
+      };
+      var setDefaultBtn = document.getElementById('set-default-theme-btn');
+      if (setDefaultBtn) {
+        setDefaultBtn.onclick = function() {
+          ['background', 'text', 'label', 'link', 'tableBg', 'tableHeaderBg', 'tableHeaderText', 'tableBorder'].forEach(function(key) {
+            var colorEl = document.getElementById('theme-' + key);
+            var hexEl = document.getElementById('theme-' + key + '-hex');
+            var val = defaultTheme[key];
+            if (colorEl) colorEl.value = val;
+            if (hexEl) hexEl.value = val;
+          });
+          var logoUrlEl = document.getElementById('logoUrl');
+          var logoWidthEl = document.getElementById('logoWidth');
+          var logoHeightEl = document.getElementById('logoHeight');
+          if (logoUrlEl) logoUrlEl.value = '';
+          if (logoWidthEl) logoWidthEl.value = '0';
+          if (logoHeightEl) logoHeightEl.value = '0';
+          var loginTextAboveEl = document.getElementById('loginTextAbove');
+          var loginTextBelowEl = document.getElementById('loginTextBelow');
+          if (loginTextAboveEl) loginTextAboveEl.value = '';
+          if (loginTextBelowEl) loginTextBelowEl.value = '';
+        };
+      }
+
+      var form = document.getElementById('app-config-form');
+      var msgEl = document.getElementById('msg');
+      if (!form || !msgEl) return;
+      form.onsubmit = async function(e) {
+        e.preventDefault();
+        msgEl.style.display = 'none';
+        msgEl.textContent = '';
+        msgEl.className = 'msg';
+        var theme = {
+          background: document.getElementById('theme-background-hex').value.trim() || '${escapeHtml(bg)}',
+          text: document.getElementById('theme-text-hex').value.trim() || '${escapeHtml(text)}',
+          label: document.getElementById('theme-label-hex').value.trim() || '${escapeHtml(label)}',
+          link: document.getElementById('theme-link-hex').value.trim() || '${escapeHtml(link)}',
+          tableBg: document.getElementById('theme-tableBg-hex').value.trim() || '${escapeHtml(tableBg)}',
+          tableHeaderBg: document.getElementById('theme-tableHeaderBg-hex').value.trim() || '${escapeHtml(tableHeaderBg)}',
+          tableHeaderText: document.getElementById('theme-tableHeaderText-hex').value.trim() || '${escapeHtml(tableHeaderText)}',
+          tableBorder: document.getElementById('theme-tableBorder-hex').value.trim() || '${escapeHtml(tableBorder)}'
+        };
+        var loginTextAboveEl = document.getElementById('loginTextAbove');
+        var loginTextBelowEl = document.getElementById('loginTextBelow');
+        var payload = {
+          theme,
+          logoUrl: document.getElementById('logoUrl').value.trim(),
+          logoWidth: document.getElementById('logoWidth').value,
+          logoHeight: document.getElementById('logoHeight').value,
+          loginTextAbove: loginTextAboveEl ? loginTextAboveEl.value.trim() : '',
+          loginTextBelow: loginTextBelowEl ? loginTextBelowEl.value.trim() : ''
+        };
+        var idEl = document.getElementById('appConfigId');
+        var revEl = document.getElementById('appConfigRev');
+        if (idEl && idEl.value) payload._id = idEl.value;
+        if (revEl && revEl.value) payload._rev = revEl.value;
+        try {
+          var r = await fetch('/api/app-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          var data = await r.json();
+          if (!r.ok) {
+            msgEl.textContent = data.error || 'Save failed';
+            msgEl.className = 'msg err';
+            msgEl.style.display = 'block';
+            return;
+          }
+          msgEl.textContent = 'Saved. Reload pages to see the new design.';
+          msgEl.className = 'msg';
+          msgEl.style.display = 'block';
+          if (data.id) {
+            if (!idEl) {
+              idEl = document.createElement('input');
+              idEl.type = 'hidden';
+              idEl.id = 'appConfigId';
+              idEl.name = '_id';
+              form.appendChild(idEl);
+            }
+            idEl.value = data.id;
+          }
+          if (data.rev) {
+            if (!revEl) {
+              revEl = document.createElement('input');
+              revEl.type = 'hidden';
+              revEl.id = 'appConfigRev';
+              revEl.name = '_rev';
+              form.appendChild(revEl);
+            }
+            revEl.value = data.rev;
+          }
+        } catch (err) {
+          msgEl.textContent = err.message || 'Request failed';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+        }
+      };
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderConfigExportImportPage(profiles, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const profileOptions = profiles.length
+    ? '<option value="">— Select database —</option>' + profiles.map((p) => `<option value="${escapeHtml(p._id)}">${escapeHtml(p.name || p._id)}</option>`).join("")
+    : '<option value="">No databases</option>';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Export / Import configuration</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 36rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="radio"] { margin-right: 0.5rem; }
+    select { padding: 0.35rem 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; min-width: 12rem; }
+    .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
+    .btn-primary { background: #238636; color: #fff; }
+    .btn-primary:hover { background: #2ea043; }
+    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; margin-left: 0.5rem; }
+    .btn-secondary:hover { background: #30363d; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .section { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--app-table-border, #30363d); }
+    .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
+    .msg.err { background: #3d1f1f; color: #f85149; }
+    .msg.ok { background: #1a2e1a; color: #7ee787; }
+    #import-file { margin-top: 0.5rem; }
+    .radio-group { margin-top: 0.5rem; }
+    .radio-group label { display: inline; margin-top: 0; }
+  </style>
+</head>
+<body>
+  <div class="actions">
+    <a href="/" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem;">← Profiles</a>
+  </div>
+  <h1>Export / Import configuration</h1>
+  <p class="sub">Export configuration to a JSON file or import from a previously exported file. User data, API keys, and passwords are never exported.</p>
+
+  <div class="radio-group">
+    <label><input type="radio" name="mode" value="export" checked> Export</label>
+    <label style="margin-left:1rem;"><input type="radio" name="mode" value="import"> Import</label>
+  </div>
+
+  <div id="export-section">
+    <div class="section">
+      <label for="export-scope">Scope</label>
+      <select id="export-scope">
+        <option value="profile">One Elenko database</option>
+        <option value="all">All configuration documents</option>
+      </select>
+      <p class="sub" style="margin-top:0.25rem;">"One Elenko database" exports the selected profile and its linked entry forms and flows (and APIs / JS Processing used by those flows). "All" also includes the Application design document.</p>
+    </div>
+    <div class="section" id="export-profile-wrap">
+      <label for="export-profile">Elenko database</label>
+      <select id="export-profile">${profileOptions}</select>
+    </div>
+    <div class="section">
+      <button type="button" id="export-btn" class="btn btn-primary">Download export file</button>
+    </div>
+  </div>
+
+  <div id="import-section" style="display:none;">
+    <div class="section">
+      <label for="import-file">Export file (JSON)</label>
+      <input type="file" id="import-file" accept=".json,application/json">
+      <p class="sub" style="margin-top:0.25rem;">Select a file that was exported from this page. Existing configuration will be overwritten.</p>
+    </div>
+    <div class="section">
+      <label><input type="checkbox" id="import-backup" checked> Backup original configuration</label>
+      <p class="sub" style="margin-top:0.25rem;">Before importing, save current configuration to <code>public/backups/</code> with a timestamped filename.</p>
+    </div>
+    <div class="section">
+      <button type="button" id="import-btn" class="btn btn-primary">Import</button>
+    </div>
+  </div>
+
+  <div id="restore-section" class="section" style="margin-top:2rem; padding-top:1.5rem; border-top:1px solid var(--app-table-border, #30363d);">
+    <h2 style="font-size:1.1rem; font-weight:600; margin-bottom:0.5rem;">Restore old configurations</h2>
+    <p class="sub" style="margin-bottom:0.75rem;">Select a backup from <code>public/backups/</code> to restore. Existing configuration will be overwritten.</p>
+    <label for="restore-select">Backup file</label>
+    <select id="restore-select" style="min-width:20rem;">
+      <option value="">— Load list —</option>
+    </select>
+    <button type="button" id="restore-btn" class="btn btn-primary" style="margin-left:0.5rem;">Restore</button>
+  </div>
+
+  <div id="msg" class="msg" style="display:none;"></div>
+
+  <script>
+    (function() {
+      var modeExport = document.querySelector('input[name="mode"][value="export"]');
+      var modeImport = document.querySelector('input[name="mode"][value="import"]');
+      var exportSection = document.getElementById('export-section');
+      var importSection = document.getElementById('import-section');
+      var exportScope = document.getElementById('export-scope');
+      var exportProfileWrap = document.getElementById('export-profile-wrap');
+      var exportProfile = document.getElementById('export-profile');
+      var exportBtn = document.getElementById('export-btn');
+      var importFile = document.getElementById('import-file');
+      var importBackup = document.getElementById('import-backup');
+      var importBtn = document.getElementById('import-btn');
+      var restoreSelect = document.getElementById('restore-select');
+      var restoreBtn = document.getElementById('restore-btn');
+      var msgEl = document.getElementById('msg');
+
+      function setMode() {
+        var isExport = modeExport && modeExport.checked;
+        exportSection.style.display = isExport ? 'block' : 'none';
+        importSection.style.display = isExport ? 'none' : 'block';
+        exportProfileWrap.style.display = (exportScope && exportScope.value === 'profile') ? 'block' : 'none';
+        msgEl.style.display = 'none';
+      }
+      function setProfileVisibility() {
+        exportProfileWrap.style.display = (exportScope && exportScope.value === 'profile') ? 'block' : 'none';
+      }
+      if (modeExport) modeExport.addEventListener('change', setMode);
+      if (modeImport) modeImport.addEventListener('change', setMode);
+      if (exportScope) exportScope.addEventListener('change', setProfileVisibility);
+
+      if (exportBtn) exportBtn.addEventListener('click', async function() {
+        msgEl.style.display = 'none';
+        var scope = exportScope && exportScope.value === 'all' ? 'all' : 'profile';
+        var profileId = scope === 'profile' && exportProfile ? exportProfile.value : null;
+        if (scope === 'profile' && !profileId) {
+          msgEl.textContent = 'Select an Elenko database to export.';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+          return;
+        }
+        try {
+          var r = await fetch('/api/config-export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope: scope, profileId: profileId })
+          });
+          var data = await r.json();
+          if (!r.ok) {
+            msgEl.textContent = data.error || 'Export failed';
+            msgEl.className = 'msg err';
+            msgEl.style.display = 'block';
+            return;
+          }
+          var blob = new Blob([JSON.stringify(data.data, null, 2)], { type: 'application/json' });
+          var a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = 'elenko-config-export-' + (data.data.scope === 'all' ? 'all' : (data.data.profileId || 'profile')) + '-' + (data.data.exportedAt || '').slice(0, 10) + '.json';
+          a.click();
+          URL.revokeObjectURL(a.href);
+          msgEl.textContent = 'Export downloaded.';
+          msgEl.className = 'msg ok';
+          msgEl.style.display = 'block';
+        } catch (err) {
+          msgEl.textContent = err.message || 'Export failed';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+        }
+      });
+
+      if (importBtn) importBtn.addEventListener('click', async function() {
+        msgEl.style.display = 'none';
+        var file = importFile && importFile.files[0];
+        if (!file) {
+          msgEl.textContent = 'Select an export file to import.';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+          return;
+        }
+        try {
+          if (importBackup && importBackup.checked) {
+            var backupR = await fetch('/api/config-backup', { method: 'POST' });
+            var backupData = await backupR.json();
+            if (!backupR.ok) {
+              msgEl.textContent = 'Backup failed: ' + (backupData.error || backupR.statusText);
+              msgEl.className = 'msg err';
+              msgEl.style.display = 'block';
+              return;
+            }
+          }
+          var text = await new Promise(function(resolve, reject) {
+            var reader = new FileReader();
+            reader.onload = function() { resolve(reader.result); };
+            reader.onerror = reject;
+            reader.readAsText(file);
+          });
+          var data = JSON.parse(text);
+          var r = await fetch('/api/config-import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: data })
+          });
+          var result = await r.json();
+          if (!r.ok) {
+            msgEl.textContent = result.error || 'Import failed';
+            msgEl.className = 'msg err';
+            msgEl.style.display = 'block';
+            return;
+          }
+          if (result.errors && result.errors.length) {
+            msgEl.textContent = 'Imported ' + result.importedDb + ' main doc(s), ' + result.importedConfig + ' config doc(s). Some errors: ' + result.errors.slice(0, 3).map(function(e) { return e.id + ': ' + e.message; }).join('; ');
+            msgEl.className = 'msg err';
+          } else {
+            msgEl.textContent = 'Imported ' + result.importedDb + ' main document(s), ' + result.importedConfig + ' config document(s).';
+            msgEl.className = 'msg ok';
+          }
+          msgEl.style.display = 'block';
+          importFile.value = '';
+          if (restoreSelect) loadRestoreList();
+        } catch (err) {
+          msgEl.textContent = (err.message || 'Import failed') + (err.message && err.message.indexOf('JSON') !== -1 ? ' Make sure the file is a valid export JSON.' : '');
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+        }
+      });
+
+      function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
+      function loadRestoreList() {
+        if (!restoreSelect) return;
+        restoreSelect.innerHTML = '<option value="">Loading…</option>';
+        fetch('/api/config-backups')
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            var list = data.backups || [];
+            restoreSelect.innerHTML = list.length ? list.map(function(b) { return '<option value="' + esc(b.url) + '">' + esc(b.name) + '</option>'; }).join('') : '<option value="">No backups</option>';
+          })
+          .catch(function() {
+            restoreSelect.innerHTML = '<option value="">Failed to load</option>';
+          });
+      }
+      if (restoreSelect) restoreSelect.addEventListener('focus', loadRestoreList);
+      if (restoreBtn) restoreBtn.addEventListener('click', async function() {
+        var url = restoreSelect && restoreSelect.value;
+        if (!url) {
+          msgEl.textContent = 'Select a backup to restore.';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+          return;
+        }
+        msgEl.style.display = 'none';
+        try {
+          var r = await fetch(url);
+          if (!r.ok) throw new Error('Failed to load backup');
+          var data = await r.json();
+          var impR = await fetch('/api/config-import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: data })
+          });
+          var result = await impR.json();
+          if (!impR.ok) {
+            msgEl.textContent = result.error || 'Restore failed';
+            msgEl.className = 'msg err';
+            msgEl.style.display = 'block';
+            return;
+          }
+          if (result.errors && result.errors.length) {
+            msgEl.textContent = 'Restored ' + result.importedDb + ' main doc(s), ' + result.importedConfig + ' config doc(s). Some errors: ' + result.errors.slice(0, 3).map(function(e) { return e.id + ': ' + e.message; }).join('; ');
+            msgEl.className = 'msg err';
+          } else {
+            msgEl.textContent = 'Restored ' + result.importedDb + ' main document(s), ' + result.importedConfig + ' config document(s). Reload the page to see changes.';
+            msgEl.className = 'msg ok';
+          }
+          msgEl.style.display = 'block';
+        } catch (err) {
+          msgEl.textContent = err.message || 'Restore failed';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+        }
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderManageUsersPage(users, currentUsername, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const rows =
     users.length > 0
       ? users
@@ -5930,19 +7549,20 @@ function renderManageUsersPage(users, currentUsername) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Manage users</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; min-height: 100vh; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); min-height: 100vh; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; max-width: 56rem; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #21262d; }
-    th { background: #21262d; color: #8b949e; font-weight: 600; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; max-width: 56rem; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .empty { color: #8b949e; font-style: italic; }
-    .empty a { color: #58a6ff; }
-    .muted { color: #8b949e; font-size: 0.9em; }
-    select { padding: 0.35rem 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; }
-    input[type="password"] { padding: 0.35rem 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .empty a { color: var(--app-link, #58a6ff); }
+    .muted { color: var(--app-label, #8b949e); font-size: 0.9em; }
+    select { padding: 0.35rem 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
+    input[type="password"] { padding: 0.35rem 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
     .btn-set-password, .btn-delete-user { padding: 0.35rem 0.75rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }
     .btn-set-password { background: #238636; color: #fff; }
     .btn-set-password:hover { background: #2ea043; }
@@ -5951,12 +7571,16 @@ function renderManageUsersPage(users, currentUsername) {
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
-    a { color: #58a6ff; text-decoration: none; }
+    a { color: var(--app-link, #58a6ff); text-decoration: none; }
     a:hover { text-decoration: underline; }
+    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-left: 0.5rem; }
+    .btn:hover { background: #2ea043; text-decoration: none; }
+    a.btn:not(.btn-secondary) { color: #fff; }
+    a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
   </style>
 </head>
 <body>
-  <div><a href="/">← Profiles</a> | <a href="/account/users/create">Create user</a></div>
+  <div><a href="/">← Profiles</a> <a href="/account/users/create" class="btn">Create user</a></div>
   <h1>Manage users</h1>
   <p class="sub">Change role, set password, or delete users.</p>
   <table>
@@ -6027,7 +7651,9 @@ function renderManageUsersPage(users, currentUsername) {
 </html>`;
 }
 
-function renderCreateUserPage(errorMessage, created) {
+function renderCreateUserPage(errorMessage, created, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const err = errorMessage ? `<p class="login-err">${escapeHtml(errorMessage)}</p>` : "";
   const createdMsg = created ? '<p class="msg ok">User created.</p>' : "";
   return `<!DOCTYPE html>
@@ -6038,14 +7664,15 @@ function renderCreateUserPage(errorMessage, created) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Create user</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 24rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 24rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
-    input[type="text"], input[type="password"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    input:focus { outline: none; border-color: #58a6ff; }
-    select { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"], input[type="password"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    input:focus { outline: none; border-color: var(--app-link, #58a6ff); }
+    select { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
     .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
     .btn:hover { background: #2ea043; }
     .btn-secondary { display: inline-block; margin-top: 0.5rem; background: #21262d; color: #e6edf3; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; }
@@ -6128,6 +7755,46 @@ function renderForbiddenPage() {
     <h1>Elenko</h1>
     <p class="err">You do not have permission to access this page.</p>
     <p><a href="/">Back to start</a></p>
+  </div>
+</body>
+</html>`;
+}
+
+function renderSetupRequiredPage(errMessage) {
+  const err = errMessage ? `<p class="err">${escapeHtml(errMessage)}</p>` : "";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Configuration required</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .box { max-width: 28rem; width: 100%; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: #8b949e; margin: 1rem 0; }
+    .err { color: #f85149; margin: 1rem 0; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
+    input[type="password"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
+    .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
+    .btn:hover { background: #2ea043; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Elenko</h1>
+    <p class="sub">The CouchDB bootstrap file is missing. The application cannot connect to the database until an administrator configures it.</p>
+    <p class="sub">If you are an administrator, use the form below to set the CouchDB password (user <code>admin</code>). This will create the bootstrap file and allow the application to start.</p>
+    ${err}
+    <form method="post" action="/setup">
+      <label for="couchdbPassword">CouchDB password (admin user)</label>
+      <input type="password" id="couchdbPassword" name="couchdbPassword" required autofocus placeholder="Enter CouchDB admin password">
+      <button type="submit" class="btn">Create bootstrap and connect</button>
+    </form>
   </div>
 </body>
 </html>`;
