@@ -54,6 +54,15 @@ function formatDateTimeLocal(d) {
   return `${y}-${m}-${day} ${h}:${min}:${s}`;
 }
 
+function formatDateOnly(d) {
+  const date = d instanceof Date ? d : new Date(d);
+  if (!date || Number.isNaN(date.getTime())) return "—";
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function resolveDefaultValue(source, req) {
   if (source === "createdAt" || source === "updatedAt") return formatDateTimeLocal(new Date());
   if (source === "currentUser") return req && req.session && req.session.user ? String(req.session.user) : "";
@@ -311,6 +320,16 @@ function getProfileEntryFormIds(profileDoc) {
 function getProfileDefaultEntryFormId(profileDoc) {
   const ids = getProfileEntryFormIds(profileDoc);
   return ids.length > 0 ? ids[0] : "";
+}
+
+function isMobileRequest(req) {
+  try {
+    const ua = String(req.get("user-agent") || "");
+    if (!ua) return false;
+    return /Mobile|Android|iPhone|iPad|iPod|Windows Phone|Opera Mini|IEMobile/i.test(ua);
+  } catch {
+    return false;
+  }
 }
 
 /** Create an entry in the target profile from context.dataset. Returns the created document. Used by flow worker and pipeline. */
@@ -2411,7 +2430,11 @@ app.get("/apis/keys/create", requireAdmin, async (req, res) => {
   const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
   const defaultName = typeof req.query.defaultName === "string" ? req.query.defaultName.trim() : "";
-  res.send(renderEditApiKeyPage(null, null, req.query.returnTo, defaultName, appUi));
+  const defaultApiKeyDocId =
+    typeof req.query.apiKeyDocId === "string" && req.query.apiKeyDocId.trim()
+      ? req.query.apiKeyDocId.trim()
+      : "";
+  res.send(renderEditApiKeyPage(null, null, req.query.returnTo, defaultName, appUi, defaultApiKeyDocId));
 });
 
 app.post("/api/apis/keys", requireAdmin, async (req, res) => {
@@ -2419,8 +2442,10 @@ app.post("/api/apis/keys", requireAdmin, async (req, res) => {
     if (!configDb) return res.status(503).json({ error: "Config store not available" });
     const name = typeof (req.body && req.body.name) === "string" ? req.body.name.trim() : "";
     if (!name) return res.status(400).json({ error: "Name is required." });
+    const apiKeyDocIdRaw = typeof (req.body && req.body.apiKeyDocId) === "string" ? req.body.apiKeyDocId : "";
+    const apiKeyDocId = apiKeyDocIdRaw != null ? String(apiKeyDocIdRaw).trim() : "";
     const key = typeof (req.body && req.body.key) === "string" ? req.body.key : "";
-    const id = slugifyForApiKeyId(name);
+    const id = apiKeyDocId || slugifyForApiKeyId(name);
     let doc = { type: "elenko_api_key", name, key };
     try {
       const existing = await configDb.get(id);
@@ -2447,7 +2472,7 @@ app.get("/apis/keys/:id/edit", requireAdmin, async (req, res) => {
     const hasKey = doc && (doc.key != null || doc.value != null);
     const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditApiKeyPage(doc, null, req.query.returnTo, "", appUi));
+    res.send(renderEditApiKeyPage(doc, null, req.query.returnTo, "", appUi, ""));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("API key not found"));
     console.error("Error loading API key:", err);
@@ -2695,13 +2720,21 @@ app.get("/profile/create", requireAdmin, async (req, res) => {
 
 app.post("/api/profiles", requireAdmin, async (req, res) => {
   try {
-    const { name, description, fieldNames, fieldDefaultSources, customCss } = req.body || {};
+    const { name, description, fieldNames, fieldDefaultSources, customCss, listFields: rawListFields } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name is required" });
     }
     const fields = Array.isArray(fieldNames)
       ? fieldNames.filter((f) => typeof f === "string" && f.trim()).map((f) => f.trim())
       : [];
+    const listFields =
+      Array.isArray(rawListFields)
+        ? rawListFields
+            .filter((f) => typeof f === "string" && f.trim())
+            .map((f) => f.trim())
+            .filter((f) => fields.includes(f))
+            .slice(0, 3)
+        : fields.slice(0, 3);
     const doc = {
       type: "elenko_profile",
       name: name.trim(),
@@ -2709,6 +2742,7 @@ app.post("/api/profiles", requireAdmin, async (req, res) => {
       customCss: customCss != null ? String(customCss) : "",
       fieldNames: fields,
       fieldDefaultSources: normalizeFieldDefaultSources(fields, fieldDefaultSources),
+      listFields,
       createdAt: new Date().toISOString(),
     };
     const result = await db.insert(doc);
@@ -2897,6 +2931,8 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       entryFormId,
       entryFormIds,
       theme,
+      listFields: rawListFields,
+      mobileSingleEntryFormId,
       sortKeyFields: rawSortKeyFields,
       sortDirection,
     } = req.body || {};
@@ -2934,6 +2970,23 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       doc.entryFormId = "";
     }
     doc.theme = normalizeProfileTheme(theme);
+    const listFields =
+      Array.isArray(rawListFields)
+        ? rawListFields
+            .filter((f) => typeof f === "string" && f.trim())
+            .map((f) => f.trim())
+            .filter((f) => fields.includes(f))
+            .slice(0, 3)
+        : Array.isArray(doc.listFields)
+          ? doc.listFields
+          : fields.slice(0, 3);
+    doc.listFields = listFields;
+    const mobileSingleId =
+      typeof mobileSingleEntryFormId === "string" && mobileSingleEntryFormId.trim()
+        ? mobileSingleEntryFormId.trim()
+        : "";
+    doc.mobileSingleEntryFormId =
+      mobileSingleId && updatedEntryFormIds.includes(mobileSingleId) ? mobileSingleId : "";
     const sortKeyFields = Array.isArray(rawSortKeyFields)
       ? rawSortKeyFields
           .filter((f) => typeof f === "string" && f.trim())
@@ -3261,7 +3314,14 @@ app.get("/profile/:id/entry/:entryId", async (req, res) => {
     let formDoc = null;
     const profileFormIds = getProfileEntryFormIds(doc);
     let formId = "";
-    if (record.entryFormId && typeof record.entryFormId === "string" && record.entryFormId.trim()) {
+    const mobileFormIdRaw =
+      typeof doc.mobileSingleEntryFormId === "string" && doc.mobileSingleEntryFormId.trim()
+        ? doc.mobileSingleEntryFormId.trim()
+        : "";
+    const useMobileForm = mobileFormIdRaw && isMobileRequest(req);
+    if (useMobileForm) {
+      formId = mobileFormIdRaw;
+    } else if (record.entryFormId && typeof record.entryFormId === "string" && record.entryFormId.trim()) {
       formId = record.entryFormId.trim();
     } else if (profileFormIds.length > 0) {
       formId = profileFormIds[0];
@@ -4338,6 +4398,20 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   const nextUrl = hasNext ? profileBase + "?page=" + (page + 1) + qParam : null;
   const pageOfTotal = totalPages != null ? " of " + totalPages : "";
 
+  const maxMobileListFields = 3;
+  const rawMobileListFields = Array.isArray(doc.listFields) ? doc.listFields : [];
+  const mobileListFields =
+    rawMobileListFields
+      .filter((f) => typeof f === "string" && f.trim())
+      .map((f) => f.trim())
+      .filter((f) => fieldNames.includes(f))
+      .slice(0, maxMobileListFields);
+  const effectiveMobileListFields =
+    mobileListFields.length > 0
+      ? mobileListFields
+      : fieldNames.slice(0, maxMobileListFields);
+  const mobileVisibleSet = new Set(effectiveMobileListFields);
+
   const themeVars = `
     :root {
       --profile-bg: ${escapeHtml(theme.background)};
@@ -4359,7 +4433,12 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
 
   const headerRow =
     fieldNames.length > 0
-      ? `<tr>${fieldNames.map((f) => `<th>${escapeHtml(f)}</th>`).join("")}</tr>`
+      ? `<tr>${fieldNames
+          .map((f) => {
+            const cls = mobileVisibleSet.has(f) ? "col col-mobile-visible" : "col col-mobile-hidden";
+            return `<th class="${cls}">${escapeHtml(f)}</th>`;
+          })
+          .join("")}</tr>`
       : "<tr><th>—</th></tr>";
 
   const returnQuery = [];
@@ -4374,11 +4453,12 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             const val = rec[fn];
             const text = val != null ? String(val) : "";
             const escaped = escapeHtml(text);
+            const mobileCls = mobileVisibleSet.has(fn) ? " col-mobile-visible" : " col-mobile-hidden";
             if (i === 0) {
               const entryUrl = "/profile/" + encodeURIComponent(doc._id) + "/entry/" + encodeURIComponent(rec._id) + returnQueryStr;
-              return `<td class="entry-link-cell"><span class="entry-cell-clamp"><a href="${entryUrl}">${escaped}</a></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}"><span class="entry-cell-clamp"><a href="${entryUrl}">${escaped}</a></span></td>`;
             }
-            return `<td><span class="entry-cell-clamp">${escaped}</span></td>`;
+            return `<td class="${mobileCls}"><span class="entry-cell-clamp">${escaped}</span></td>`;
           });
           return `\n        <tr>${cells.join("")}</tr>`;
         })
@@ -4428,6 +4508,11 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .pagination .btn-pag-prev:hover, .pagination .btn-pag-next:hover { background: #30363d; }
     .pagination .btn-pag.disabled { color: #484f58; pointer-events: none; }
     .pagination .page-num { color: var(--profile-label, #8b949e); font-size: 0.875rem; }
+    @media (max-width: 768px) {
+      table { font-size: 0.9rem; }
+      th.col-mobile-hidden,
+      td.col-mobile-hidden { display: none; }
+    }
   </style>
   ${customCss ? `<style>${customCss}</style>` : ""}
 </head>
@@ -4590,7 +4675,7 @@ function renderEntryFormsListPage(forms, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Profiles</a><a href="/entry-forms/create" class="btn">Create entry form</a></div>
+  <div class="actions"><a href="/">← Profiles</a><a href="/entry-forms/create" class="btn">Create Single Entry form</a></div>
   <h1>Entry forms</h1>
   <p class="sub">Configure how a single database entry is displayed (colours and field layout). Assign a form to a profile on the profile edit page.</p>
   <table>
@@ -5281,10 +5366,18 @@ function renderEditApiPage(doc, err, returnTo, appUi) {
       createEditKeyLink.addEventListener('click', function(e) {
         e.preventDefault();
         var name = (document.getElementById('name').value || '').trim();
+        var apiKeyRef = (document.getElementById('apiKeyRef').value || '').trim();
         var returnTo = window.location.pathname + window.location.search;
         var q = returnTo ? '?returnTo=' + encodeURIComponent(returnTo) : '';
-        if (name) q += (q ? '&' : '?') + 'defaultName=' + encodeURIComponent(name);
-        window.location.href = '/apis/keys/create' + q;
+        if (apiKeyRef && formId) {
+          // Editing an existing REST API: open (or edit) the existing key doc.
+          window.location.href = '/apis/keys/' + encodeURIComponent(apiKeyRef) + '/edit' + q;
+        } else {
+          // Creating a new REST API (or missing apiKeyRef): open create page.
+          if (apiKeyRef) q += (q ? '&' : '?') + 'apiKeyDocId=' + encodeURIComponent(apiKeyRef);
+          if (name) q += (q ? '&' : '?') + 'defaultName=' + encodeURIComponent(name);
+          window.location.href = '/apis/keys/create' + q;
+        }
       });
     }
     form.onsubmit = async function(e) {
@@ -5320,18 +5413,19 @@ function renderEditApiPage(doc, err, returnTo, appUi) {
 </html>`;
 }
 
-function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi) {
+function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApiKeyDocId) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const isEdit = !!(doc && doc._id);
   const id = doc && doc._id;
+  const apiKeyDocIdVal = id ? id : (typeof defaultApiKeyDocId === "string" ? defaultApiKeyDocId.trim() : "");
   const rev = doc && doc._rev;
   const nameVal = doc && typeof doc.name === "string" ? escapeHtml(doc.name) : (typeof defaultName === "string" && defaultName ? escapeHtml(defaultName) : "");
   const keyPlaceholder = isEdit ? "Leave blank to keep current key" : "API key / secret";
   const returnToVal = typeof returnTo === "string" && returnTo.trim() ? escapeHtml(returnTo.trim()) : "";
   const returnToInput = returnToVal ? `<input type="hidden" name="returnTo" id="returnTo" value="${returnToVal}">` : "";
   const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
-  const title = isEdit ? "Edit API key" : "Create API key";
+  const title = isEdit ? "Edit API key" : "Create / Update API key";
   const submitLabel = isEdit ? "Save" : "Create";
   const revInput = rev ? `<input type="hidden" id="rev" value="${escapeHtml(rev)}">` : "";
 
@@ -5372,11 +5466,13 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi) {
   <h1>${title}</h1>
   <p class="sub">Stored in the config store. The document ID is derived from the name (e.g. &quot;My Service&quot; → key_my-service). Use this ID in the API form as &quot;API key document ID&quot;.</p>
   ${errHtml}
-  <form id="api-key-form">
+  <form id="api-key-form" autocomplete="off">
     ${revInput}
     ${returnToInput}
     <input type="hidden" id="keyId" value="${id ? escapeHtml(id) : ""}">
-    <label for="name">Descriptive name</label>
+    <label for="apiKeyDocId">API key document ID</label>
+    <input type="text" id="apiKeyDocId" value="${apiKeyDocIdVal ? escapeHtml(apiKeyDocIdVal) : ""}" readonly>
+    <label for="name">Description</label>
     <input type="text" id="name" name="name" required placeholder="e.g. OpenWeather API key" value="${nameVal}">
     <label for="key">API key / secret</label>
     <input type="password" id="key" name="key" placeholder="${escapeHtml(keyPlaceholder)}" autocomplete="off">
@@ -5385,8 +5481,25 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi) {
   <script>
     var form = document.getElementById('api-key-form');
     var keyId = document.getElementById('keyId').value;
+    var apiKeyDocIdEl = document.getElementById('apiKeyDocId');
     var returnToEl = document.getElementById('returnTo');
     var returnToVal = returnToEl ? returnToEl.value : '';
+
+    function syncApiKeyDocId() {
+      // In edit mode, the document id is fixed; in create mode it is derived from the "Description"/name.
+      // If an apiKeyDocId was provided (from the REST API's apiKeyRef), keep it.
+      if (!apiKeyDocIdEl || keyId) return;
+      if (apiKeyDocIdEl.value && String(apiKeyDocIdEl.value).trim()) return;
+      var n = (document.getElementById('name').value || '').trim();
+      apiKeyDocIdEl.value = n ? slugifyForKeyId(n) : '';
+    }
+    var nameEl = document.getElementById('name');
+    if (nameEl) {
+      nameEl.addEventListener('input', syncApiKeyDocId);
+      nameEl.addEventListener('blur', syncApiKeyDocId);
+    }
+    syncApiKeyDocId();
+
     form.onsubmit = async function(e) {
       e.preventDefault();
       var msgEl = document.getElementById('msg');
@@ -5395,6 +5508,8 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi) {
       var urlApi = keyId ? '/api/apis/keys/' + encodeURIComponent(keyId) : '/api/apis/keys';
       var methodHttp = keyId ? 'PUT' : 'POST';
       var body = { name: name };
+      var apiKeyDocId = apiKeyDocIdEl ? String(apiKeyDocIdEl.value || '').trim() : '';
+      if (apiKeyDocId) body.apiKeyDocId = apiKeyDocId;
       if (key) body.key = key;
       try {
         var r = await fetch(urlApi, { method: methodHttp, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -5544,7 +5659,7 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
   const fieldLayout = (doc && Array.isArray(doc.fieldLayout) ? doc.fieldLayout : []);
   const revInput = rev ? `<input type="hidden" id="rev" value="${escapeHtml(rev)}">` : "";
   const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
-  const title = isEdit ? "Edit entry form" : "Create entry form";
+  const title = isEdit ? "Single Entry form configuration" : "Create Single Entry form configuration";
   const submitLabel = isEdit ? "Save" : "Create";
 
   const labelsRows =
@@ -5656,6 +5771,7 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
       <div class="theme-row"><label for="theme-textEdit" style="margin-top:0;">Text (edit)</label><input type="color" id="theme-textEdit-color" value="${textEdit}" aria-label="Text edit"><input type="text" id="theme-textEdit" placeholder="#e6edf3" value="${textEdit}"></div>
     </div>
     <label for="layout">Layout</label>
+    <p class="sub" style="margin-top:0.25rem;">Table layout is the default and generates a two-column table. The first column contains the field names, the second the values. Grid layout places all fields in one row. Stack layout allows positioning the fields directly.</p>
     <select id="layout" name="layout">
       <option value="table" ${layout === "table" ? "selected" : ""}>Table</option>
       <option value="grid" ${layout === "grid" ? "selected" : ""}>Grid</option>
@@ -5771,9 +5887,19 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
       tr.querySelector('.fl-x').value = xv;
       tr.querySelector('.fl-y').value = yv;
       tr.querySelector('.fl-height').value = hv;
-      tr.querySelector('.btn-remove').onclick = () => tr.remove();
+      const removeBtn = tr.querySelector('.btn-remove');
+      if (removeBtn) {
+        removeBtn.onclick = () => tr.remove();
+      }
       tbody.appendChild(tr);
     }
+    // Wire remove handlers for any initial field layout rows rendered from the server
+    Array.from(tbody.querySelectorAll('.field-layout-row .btn-remove')).forEach((btn) => {
+      btn.onclick = () => {
+        const row = btn.closest('.field-layout-row');
+        if (row) row.remove();
+      };
+    });
     addBtn.onclick = () => addRow('', tbody.querySelectorAll('.field-layout-row').length, '100%', '', '', '', 'text');
 
     function toHex6Sync(val) {
@@ -6114,34 +6240,26 @@ function renderStartPage(profiles, role, appUi) {
   const rows = profiles.length
     ? profiles
         .map((p) => {
-          if (isAdmin) {
-            return `
-        <tr>
-          <td><a href="/profile/${encodeURIComponent(p._id)}">${escapeHtml(p.name || p._id)}</a></td>
-          <td>${escapeHtml(p.description || "—")}</td>
-          <td><code>${escapeHtml(p._id)}</code></td>
-          <td><a href="/profile/${encodeURIComponent(p._id)}/edit" class="edit-link">Edit</a> <a href="/profile/${encodeURIComponent(p._id)}/delete" class="delete-link">Delete</a></td>
-        </tr>`;
-          }
+          const createdDate = p.createdAt ? formatDateOnly(p.createdAt) : "—";
           return `
         <tr>
           <td><a href="/profile/${encodeURIComponent(p._id)}">${escapeHtml(p.name || p._id)}</a></td>
           <td>${escapeHtml(p.description || "—")}</td>
+          <td class="col-mobile-hidden">${escapeHtml(createdDate)}</td>
         </tr>`;
         })
         .join("")
     : `
         <tr>
-          <td colspan="${isAdmin ? 4 : 2}" class="empty">No Elenko database profiles yet.${isAdmin ? ' Add documents with <code>type: "elenko_profile"</code> in CouchDB.' : ""}</td>
+          <td colspan="3" class="empty">No Elenko database profiles yet.${isAdmin ? ' Add documents with <code>type: "elenko_profile"</code> in CouchDB.' : ""}</td>
         </tr>`;
 
     const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
-  const userAdminOptions = '<option value="" disabled selected>Administration</option><option value="/account/change-password">Change password</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special functions</option><option value="/app-config">Application design / theme</option><option value="/config-export-import">Export / Import configuration</option><option value="/entry-forms">Entry forms</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
+  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/config-export-import">Export / Import configuration</option><option value="/entry-forms">Single Entry forms</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
-  const theadAdmin = "<tr><th>Name</th><th>Description</th><th>Document ID</th><th>Actions</th></tr>";
-  const theadUser = "<tr><th>Name</th><th>Description</th></tr>";
+  const thead = '<tr><th>Name</th><th>Description</th><th class="col-mobile-hidden">Creation date</th></tr>';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -6177,6 +6295,17 @@ function renderStartPage(profiles, role, appUi) {
     .nav-select { margin-left: 0; padding: 0.35rem 0.5rem; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.9rem; cursor: pointer; vertical-align: middle; }
     .nav-select:hover { border-color: #58a6ff; }
     .nav-select:focus { outline: none; border-color: #58a6ff; }
+    .col-mobile-hidden { display: table-cell; }
+    @media (max-width: 768px) {
+      .col-mobile-hidden { display: none; }
+      .nav-bar { gap: 0.25rem; margin-bottom: 0.75rem; }
+      .btn { padding: 0.35rem 0.75rem; font-size: 0.875rem; }
+      .btn-logout { padding: 0.25rem 0.55rem; font-size: 0.82rem; }
+      .nav-select { padding: 0.15rem 0.22rem; font-size: 0.7rem; width: 4.7rem; max-width: 4.7rem; min-width: 4.7rem; }
+      .nav-select-admin { width: 4.8rem; max-width: 4.8rem; min-width: 4.8rem; }
+      .nav-select-flow { width: 4.4rem; max-width: 4.4rem; min-width: 4.4rem; }
+      .nav-select-special { width: 4.4rem; max-width: 4.4rem; min-width: 4.4rem; }
+    }
   </style>
 </head>
 <body>
@@ -6184,13 +6313,13 @@ function renderStartPage(profiles, role, appUi) {
   ${titleHtml}
   <p class="nav-bar">
     ${isAdmin ? actionsAdmin : actionsUser}
-    ${isAdmin ? '<select id="nav-flow-processing" class="nav-select" aria-label="Flow processing"><option value="" disabled selected>Flow processing</option><option value="/flows">Flows</option><option value="/apis">REST APIs</option><option value="/js-processing">JS Processing</option></select>' : ''}
-    <select id="nav-user-admin" class="nav-select" aria-label="Administration">${userAdminOptions}</select>
-    ${isAdmin ? `<select id="nav-special" class="nav-select" aria-label="Special functions">${specialOptions}</select>` : ""}
     ${actionsCommon}
+    <select id="nav-user-admin" class="nav-select nav-select-admin" aria-label="Administration">${userAdminOptions}</select>
+    ${isAdmin ? '<select id="nav-flow-processing" class="nav-select nav-select-flow" aria-label="Flow"><option value="" disabled selected>Flow</option><option value="/flows">Flows</option><option value="/apis">REST APIs</option><option value="/js-processing">JS Processing</option></select>' : ''}
+    ${isAdmin ? `<select id="nav-special" class="nav-select nav-select-special" aria-label="Special functions">${specialOptions}</select>` : ""}
   </p>
   <table>
-    <thead>${isAdmin ? theadAdmin : theadUser}</thead>
+    <thead>${thead}</thead>
     <tbody>${rows}
     </tbody>
   </table>
@@ -6233,6 +6362,9 @@ function renderEditProfilePage(doc, forms = [], appUi) {
   const initialDefaultSources = fieldNames.map((_, i) => (fieldDefaultSources[i] !== undefined && DEFAULT_VALUE_SOURCES.includes(fieldDefaultSources[i]) ? fieldDefaultSources[i] : ""));
   const rev = escapeHtml(doc._rev || "");
   const customCss = doc.customCss || "";
+  const listFields = Array.isArray(doc.listFields)
+    ? doc.listFields.filter((f) => typeof f === "string" && f.trim()).map((f) => f.trim())
+    : [];
   const entryFormIds = Array.isArray(doc.entryFormIds)
     ? doc.entryFormIds.filter((id) => typeof id === "string" && id.trim()).map((id) => id.trim())
     : [];
@@ -6256,13 +6388,26 @@ function renderEditProfilePage(doc, forms = [], appUi) {
           : []);
   const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
   const sortDirectionValue = doc.sortDirection === "desc" ? "desc" : "asc";
+  const mobileSingleEntryFormId =
+    typeof doc.mobileSingleEntryFormId === "string" && doc.mobileSingleEntryFormId.trim()
+      ? doc.mobileSingleEntryFormId.trim()
+      : "";
   function sortKeySelect(name, id, selected) {
     const fieldOpts = fieldNames.map((fn) => `<option value="${escapeHtml(fn)}"${selected === fn ? " selected" : ""}>${escapeHtml(fn)}</option>`).join("");
     return `<select id="${id}" name="${name}"><option value="">— None —</option>${fieldOpts}<option value="createdAt"${selected === "createdAt" ? " selected" : ""}>Creation date</option><option value="updatedAt"${selected === "updatedAt" ? " selected" : ""}>Update date</option></select>`;
   }
+  function listFieldSelect(name, id, selected) {
+    const fieldOpts = fieldNames
+      .map((fn) => `<option value="${escapeHtml(fn)}"${selected === fn ? " selected" : ""}>${escapeHtml(fn)}</option>`)
+      .join("");
+    return `<select id="${id}" name="${name}"><option value="">— None —</option>${fieldOpts}</select>`;
+  }
   const sortKeySelect1 = sortKeySelect("sortKeyField1", "sortKeyField1", sortKeyFields[0]);
   const sortKeySelect2 = sortKeySelect("sortKeyField2", "sortKeyField2", sortKeyFields[1]);
   const sortKeySelect3 = sortKeySelect("sortKeyField3", "sortKeyField3", sortKeyFields[2]);
+  const listFieldSelect1 = listFieldSelect("listField1", "listField1", listFields[0]);
+  const listFieldSelect2 = listFieldSelect("listField2", "listField2", listFields[1]);
+  const listFieldSelect3 = listFieldSelect("listField3", "listField3", listFields[2]);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6296,6 +6441,9 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     .btn-primary:hover { background: #2ea043; }
     .btn-secondary { background: #21262d; color: #e6edf3; }
     .btn-secondary:hover { background: #30363d; }
+    .btn-danger { background: #da3633; color: #fff; }
+    .btn-danger:hover { background: #f85149; }
+    .btn-danger:disabled { opacity: 0.6; cursor: not-allowed; }
     .btn-remove { background: transparent; color: #f85149; padding: 0.25rem 0.5rem; }
     .btn-remove:hover { color: #ff7b72; }
     .flow-config-table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
@@ -6320,6 +6468,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
   <div class="actions">
     <a href="/">← Profiles</a>
     <button type="submit" form="edit-form" class="btn btn-primary" style="margin-left:1rem;">Save</button>
+    <button type="button" class="btn btn-danger" id="delete-profile-btn" style="margin-left:0.5rem;">Delete profile</button>
     <a href="/" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
   </div>
   <h1>Elenko</h1>
@@ -6358,7 +6507,24 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     <div class="field-list" id="entry-forms-list"></div>
     <button type="button" class="btn btn-secondary" id="add-entry-form">+ Add existing form</button>
     <button type="button" class="btn btn-secondary" id="clone-entry-form" style="margin-left:0.5rem;">+ New form from default</button>
-    <p class="sub" style="margin-top:0.25rem;">Use the <a href="/entry-forms">Entry forms</a> page or the link opened after cloning to adjust layout and colours.</p>
+    <p class="sub" style="margin-top:0.25rem;">Use the <a href="/entry-forms">Single Entry forms</a> page or the link opened after cloning to adjust layout and colours.</p>
+    <label for="mobileSingleEntryFormId" style="margin-top:1.5rem;">Mobile Single Entry Form</label>
+    <p class="sub" style="margin-top:0.25rem;">Optional. When set and the app is opened from a mobile device, the single-entry view will use this form instead of the normal default. On desktop, the normal form selection applies.</p>
+    <select id="mobileSingleEntryFormId" name="mobileSingleEntryFormId">
+      <option value="">— None —</option>
+      ${allEntryForms
+        .map((f) => `<option value="${escapeHtml(f.id)}"${
+          mobileSingleEntryFormId === f.id ? " selected" : ""
+        }>${escapeHtml(f.name)}</option>`)
+        .join("")}
+    </select>
+    <label style="margin-top:1.5rem;">Visible fields in entry list (up to 3)</label>
+    <p class="sub" style="margin-top:0.25rem;">On narrow screens (mobile), only these columns stay visible in the entries table. If empty, the first fields are used.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:center;margin-top:0.5rem;">
+      <div><label for="listField1" style="margin:0;font-size:0.875rem;">1</label><br>${listFieldSelect1}</div>
+      <div><label for="listField2" style="margin:0;font-size:0.875rem;">2</label><br>${listFieldSelect2}</div>
+      <div><label for="listField3" style="margin:0;font-size:0.875rem;">3</label><br>${listFieldSelect3}</div>
+    </div>
     <label style="margin-top:1.5rem;">Sort key fields (up to 3)</label>
     <p class="sub" style="margin-top:0.25rem;">Entry list is sorted by these fields in order (CouchDB index). Use profile fields or Creation/Update date.</p>
     <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:center;margin-top:0.5rem;">
@@ -6387,6 +6553,35 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     const form = document.getElementById('edit-form');
     const msgEl = document.getElementById('msg');
     const profileId = ${JSON.stringify(doc._id)};
+    const deleteBtn = document.getElementById('delete-profile-btn');
+    if (deleteBtn) {
+      deleteBtn.onclick = async () => {
+        if (!confirm('Really delete this profile? This cannot be undone.')) return;
+        deleteBtn.disabled = true;
+        msgEl.textContent = '';
+        msgEl.className = 'msg err';
+        try {
+          const _rev = document.getElementById('rev').value;
+          const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ _rev })
+          });
+          const result = await r.json();
+          if (!r.ok) {
+            msgEl.textContent = result.error || 'Delete failed';
+            msgEl.className = 'msg err';
+            deleteBtn.disabled = false;
+            return;
+          }
+          window.location.href = result.redirect || '/';
+        } catch (err) {
+          msgEl.textContent = err.message || 'Request failed';
+          msgEl.className = 'msg err';
+          deleteBtn.disabled = false;
+        }
+      };
+    }
     const initialFields = ${JSON.stringify(fieldNames)};
     const initialDefaultSources = ${JSON.stringify(initialDefaultSources)};
 
@@ -6607,6 +6802,12 @@ function renderEditProfilePage(doc, forms = [], appUi) {
             entryFormId: entryFormIds[0] || '',
             entryFormIds,
             theme,
+            listFields: [
+              document.getElementById('listField1') ? document.getElementById('listField1').value : '',
+              document.getElementById('listField2') ? document.getElementById('listField2').value : '',
+              document.getElementById('listField3') ? document.getElementById('listField3').value : ''
+            ].filter(Boolean),
+            mobileSingleEntryFormId: (document.getElementById('mobileSingleEntryFormId') && document.getElementById('mobileSingleEntryFormId').value) || '',
             sortKeyFields: [
               document.getElementById('sortKeyField1').value,
               document.getElementById('sortKeyField2').value,
