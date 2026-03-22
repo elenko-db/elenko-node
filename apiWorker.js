@@ -92,7 +92,11 @@ parentPort.on("message", (msg) => {
   }
   const headers = { "Content-Type": "application/json" };
   if (apiKey && String(apiKey).trim()) {
-    headers["Authorization"] = "Bearer " + String(apiKey).trim();
+    const key = String(apiKey).trim();
+    // Guardian Content API uses the `api-key` header (or query param). Keep `Authorization` too
+    // for APIs that support bearer tokens.
+    headers["api-key"] = key;
+    headers["Authorization"] = "Bearer " + key;
   }
   const options = {
     method,

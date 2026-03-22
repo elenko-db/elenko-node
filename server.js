@@ -187,7 +187,7 @@ function normalizeEntryFormDoc(body) {
         ...(height != null && { height }),
       };
       if (typeof item.fieldName === "string" && item.fieldName.trim()) {
-        const fieldType = item.fieldType === "markdown" ? "markdown" : "text";
+        const fieldType = item.fieldType === "markdown" ? "markdown" : item.fieldType === "url" ? "url" : "text";
         return { ...base, fieldName: item.fieldName.trim(), fieldType };
       }
       return { ...base, labelId: item.labelId.trim() };
@@ -276,9 +276,26 @@ function computeScriptHash(script) {
 /** Run user script in a minimal VM sandbox. No require, process, or file access. input/output are the only data. */
 function runScriptInSandbox(script, input, timeoutMs) {
   const timeout = Math.min(Math.max(Number(timeoutMs) || 5000, 100), 60000);
+  const scriptLogs = [];
+  const output = {};
+  Object.defineProperty(output, "_writeLog", {
+    enumerable: false,
+    configurable: false,
+    writable: false,
+    value: function writeScriptLog(obj) {
+      try {
+        const raw = obj == null ? null : obj;
+        const safe = JSON.parse(JSON.stringify(raw));
+        scriptLogs.push(safe);
+      } catch (_) {
+        scriptLogs.push({ value: String(obj) });
+      }
+      return null;
+    },
+  });
   const sandbox = {
     input: input && typeof input === "object" ? input : {},
-    output: {},
+    output,
     __returnValue: undefined,
   };
   const wrapped = "__returnValue = (function() {\n" + (typeof script === "string" ? script : "") + "\n})();";
@@ -286,10 +303,26 @@ function runScriptInSandbox(script, input, timeoutMs) {
     const context = vm.createContext(sandbox);
     vm.runInContext(wrapped, context, { timeout });
     const output = sandbox.output && typeof sandbox.output === "object" ? sandbox.output : {};
-    return { returnValue: sandbox.__returnValue, output, error: null };
+    return { returnValue: sandbox.__returnValue, output, scriptLogs, error: null };
   } catch (err) {
-    return { returnValue: undefined, output: {}, error: err && err.message ? err.message : String(err) };
+    return { returnValue: undefined, output: {}, scriptLogs, error: err && err.message ? err.message : String(err) };
   }
+}
+
+function previewApiKey(apiKey) {
+  const s = apiKey == null ? "" : String(apiKey);
+  if (!s) return "";
+  if (s.length <= 4) return s;
+  return s.slice(0, 2) + "…" + s.slice(-2);
+}
+
+function apiKeyLookupErrorInfo(err) {
+  if (!err) return { message: "unknown error", code: "" };
+  const message = err && err.message ? String(err.message) : String(err);
+  const code = err && (err.statusCode != null || err.code != null)
+    ? String(err.statusCode != null ? err.statusCode : err.code)
+    : "";
+  return { message, code };
 }
 
 function buildSortKey(record, sortKeyFields) {
@@ -411,7 +444,7 @@ function runApiCallAndWait(apiDocId, context) {
         p.reject(new Error("API call timeout"));
       }
     }, 60000);
-    pendingApiRequests.set(requestId, { resolve, reject, timeoutId: timeout });
+    pendingApiRequests.set(requestId, { resolve, reject, timeoutId: timeout, apiKeyPreview: "" });
     (async () => {
       try {
         if (!configDb || !apiWorker) {
@@ -441,11 +474,38 @@ function runApiCallAndWait(apiDocId, context) {
           return;
         }
         let apiKey = null;
+        let apiKeyRef = "";
+        let apiKeyLookupError = null;
         if (apiDoc.apiKeyRef && typeof apiDoc.apiKeyRef === "string" && apiDoc.apiKeyRef.trim()) {
+          apiKeyRef = apiDoc.apiKeyRef.trim();
           try {
-            const keyDoc = await configDb.get(apiDoc.apiKeyRef.trim());
+            const keyDoc = await configDb.get(apiKeyRef);
             if (keyDoc && (keyDoc.key != null || keyDoc.value != null)) apiKey = keyDoc.key != null ? String(keyDoc.key) : String(keyDoc.value);
-          } catch (_) {}
+          } catch (e) {
+            apiKeyLookupError = e;
+          }
+        }
+        const p = pendingApiRequests.get(requestId);
+        if (p) p.apiKeyPreview = previewApiKey(apiKey);
+        if (flowWorker) {
+          if (apiKeyLookupError) {
+            const info = apiKeyLookupErrorInfo(apiKeyLookupError);
+            sendFlowMessage("api.keyLookupError", {
+              entryId: context.entryId,
+              profileId: context.profileId,
+              apiKeyRef: apiKeyRef || "",
+              code: info.code,
+              reason: info.message,
+            });
+          } else if (apiKeyRef && !apiKey) {
+            sendFlowMessage("api.keyLookupError", {
+              entryId: context.entryId,
+              profileId: context.profileId,
+              apiKeyRef,
+              code: "",
+              reason: "API key document has no key/value field",
+            });
+          }
         }
         apiWorker.postMessage({
           kind: "apiRequest",
@@ -468,6 +528,7 @@ function runApiCallAndWait(apiDocId, context) {
 async function runPipeline(context, flowDoc) {
   const steps = Array.isArray(flowDoc && flowDoc.steps) ? flowDoc.steps : [];
   let hasExplicitPersistStep = false;
+  const suppressSinglePersist = !!(context && context.suppressSinglePersist);
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const rawTarget = step && step.target;
@@ -495,11 +556,13 @@ async function runPipeline(context, flowDoc) {
       continue;
     }
     if (target === "update") {
+      if (suppressSinglePersist) continue;
       hasExplicitPersistStep = true;
       await updateCurrentEntryFromDataset(db, context);
       continue;
     }
     if (target === "create") {
+      if (suppressSinglePersist) continue;
       hasExplicitPersistStep = true;
       if (context.profileId && db) {
         const created = await createEntryInProfileFromContext(db, context, context.profileId);
@@ -556,8 +619,32 @@ async function runPipeline(context, flowDoc) {
         profileId: context.profileId,
         entryId: context.entryId,
       });
+      if (Array.isArray(result.scriptLogs) && result.scriptLogs.length > 0) {
+        for (const item of result.scriptLogs) {
+          sendFlowMessage("flow.scriptLog", {
+            stepIndex: i,
+            param,
+            profileId: context.profileId,
+            entryId: context.entryId,
+            item,
+          });
+        }
+      }
       if (result.output && typeof result.output === "object") {
-        context.dataset = { ...(context.dataset || {}), ...result.output };
+        const scriptOutput = { ...result.output };
+        const createManyRaw = Array.isArray(scriptOutput._createMany) ? scriptOutput._createMany : null;
+        delete scriptOutput._createMany;
+        context.dataset = { ...(context.dataset || {}), ...scriptOutput };
+        if (createManyRaw && context.profileId && db) {
+          let createdCount = 0;
+          for (const row of createManyRaw) {
+            if (!row || typeof row !== "object") continue;
+            await createEntryInProfileFromContext(db, { dataset: row }, context.profileId);
+            createdCount++;
+          }
+          context.dataset._lastCreatedCount = createdCount;
+          hasExplicitPersistStep = true;
+        }
       }
       continue;
     }
@@ -771,7 +858,19 @@ async function buildConfigExport(scope, profileId) {
         if (formDoc && formDoc.type === "elenko_entry_form") formDocs.push(formDoc);
       } catch (_) {}
     }
-    const flowIds = await getFlowIdsFromFormDocs(db, formDocs);
+
+    // Flows referenced from entry forms (flow buttons)
+    const flowIdSet = new Set(await getFlowIdsFromFormDocs(db, formDocs));
+    // Also include profile-level Information Import flow linkage (new field, with legacy fallback).
+    const profileInfoFlowId =
+      typeof profile.infoImportFlowId === "string" && profile.infoImportFlowId.trim()
+        ? profile.infoImportFlowId.trim()
+        : (typeof profile.guardianFlowId === "string" && profile.guardianFlowId.trim() ? profile.guardianFlowId.trim() : "");
+    if (profileInfoFlowId) {
+      const resolvedProfileFlowIds = await resolveConfigDocIds(configDb, [profileInfoFlowId], "elenko_flow", "name");
+      for (const rf of resolvedProfileFlowIds) flowIdSet.add(rf);
+    }
+    const flowIds = [...flowIdSet];
     const flowDocs = [];
     for (const flid of flowIds) {
       try {
@@ -780,6 +879,31 @@ async function buildConfigExport(scope, profileId) {
       } catch (_) {}
     }
     for (const f of flowDocs) addConfig(f);
+
+    // APIs referenced directly from entry forms (Single step with target = "api")
+    if (configDb) {
+      const directApiNames = new Set();
+      for (const form of formDocs) {
+        const cfgs = Array.isArray(form.flowConfigs) ? form.flowConfigs : [];
+        for (const c of cfgs) {
+          const flowId = (c && typeof c.flowId === "string") ? c.flowId.trim() : "";
+          const target = c && c.target;
+          const param = (c && typeof c.param === "string") ? c.param.trim() : "";
+          if (!flowId && target === "api" && param) {
+            directApiNames.add(param);
+          }
+        }
+      }
+      if (directApiNames.size > 0) {
+        const resolvedDirectApiIds = await resolveConfigDocIds(configDb, [...directApiNames], "elenko_api", "name");
+        for (const aid of resolvedDirectApiIds) {
+          try {
+            const apiDoc = await configDb.get(aid);
+            if (apiDoc && apiDoc.type === "elenko_api") addConfig(apiDoc);
+          } catch (_) {}
+        }
+      }
+    }
 
     const { apiIds, jsIds } = getApiAndJsIdsFromFlowDocs(flowDocs);
     const resolvedApiIds = await resolveConfigDocIds(configDb, apiIds, "elenko_api", "name");
@@ -911,6 +1035,7 @@ function startApiWorker() {
       const p = pendingApiRequests.get(requestId);
       pendingApiRequests.delete(requestId);
       if (p.timeoutId) clearTimeout(p.timeoutId);
+      const apiKeyPreview = p.apiKeyPreview;
       const responseStart = msg.responseStart;
       const responseEnd = msg.responseEnd;
       let bodyToResolve = msg.body;
@@ -933,6 +1058,14 @@ function startApiWorker() {
         responseStart: msg.responseStart,
         responseEnd: msg.responseEnd,
       });
+      if (flowWorker) {
+        // Don't log the full secret; only a safe preview.
+        sendFlowMessage("api.keyPreview", {
+          entryId: msg.entryId,
+          profileId: msg.profileId,
+          apiKeyPreview: apiKeyPreview || "",
+        });
+      }
       return;
     }
     const { entryId, profileId, success, statusCode, body, error, responseTarget, responseField, responseStart, responseEnd } = msg;
@@ -1040,12 +1173,36 @@ function startFlowWorker() {
             dataset: msg.dataset,
           });
           let apiKey = null;
+          let apiKeyRef = "";
+          let apiKeyLookupError = null;
           if (apiDoc.apiKeyRef && typeof apiDoc.apiKeyRef === "string" && apiDoc.apiKeyRef.trim()) {
+            apiKeyRef = apiDoc.apiKeyRef.trim();
             try {
-              const keyDoc = await configDb.get(apiDoc.apiKeyRef.trim());
+              const keyDoc = await configDb.get(apiKeyRef);
               if (keyDoc && (keyDoc.key != null || keyDoc.value != null)) apiKey = keyDoc.key != null ? String(keyDoc.key) : String(keyDoc.value);
-            } catch (_) {}
+            } catch (e) {
+              apiKeyLookupError = e;
+            }
           }
+          if (apiKeyLookupError) {
+            const info = apiKeyLookupErrorInfo(apiKeyLookupError);
+            sendFlowMessage("api.keyLookupError", {
+              entryId: msg.entryId,
+              profileId: msg.profileId,
+              apiKeyRef: apiKeyRef || "",
+              code: info.code,
+              reason: info.message,
+            });
+          } else if (apiKeyRef && !apiKey) {
+            sendFlowMessage("api.keyLookupError", {
+              entryId: msg.entryId,
+              profileId: msg.profileId,
+              apiKeyRef,
+              code: "",
+              reason: "API key document has no key/value field",
+            });
+          }
+          const apiKeyPreview = previewApiKey(apiKey);
           apiWorker.postMessage({
             kind: "apiRequest",
             apiDoc: { url: apiDoc.url, method: apiDoc.method, responseTarget: apiDoc.responseTarget, template: apiDoc.template, responseField: apiDoc.responseField, responseStart: apiDoc.responseStart, responseEnd: apiDoc.responseEnd },
@@ -1053,6 +1210,11 @@ function startFlowWorker() {
             dataset: msg.dataset,
             entryId: msg.entryId,
             profileId: msg.profileId,
+          });
+          sendFlowMessage("api.keyPreview", {
+            entryId: msg.entryId,
+            profileId: msg.profileId,
+            apiKeyPreview: apiKeyPreview || "",
           });
         } catch (err) {
           console.error("Flow worker: callApi failed:", err);
@@ -2325,10 +2487,18 @@ app.get("/apis", requireAdmin, async (req, res) => {
   }
 });
 
+function getQueryApiKeyRef(req) {
+  const v = req.query && req.query.apiKeyRef;
+  if (typeof v === "string") return v.trim();
+  if (Array.isArray(v) && typeof v[0] === "string") return v[0].trim();
+  return "";
+}
+
 app.get("/apis/create", requireAdmin, async (req, res) => {
   const appUi = await getAppUiConfig();
+  const prefillKeyRef = getQueryApiKeyRef(req);
   res.set("Content-Type", "text/html; charset=utf-8");
-  res.send(renderEditApiPage(null, null, req.originalUrl || "/apis/create", appUi));
+  res.send(renderEditApiPage(null, null, req.originalUrl || "/apis/create", appUi, prefillKeyRef));
 });
 
 app.get("/apis/:id/edit", requireAdmin, async (req, res) => {
@@ -2338,9 +2508,17 @@ app.get("/apis/:id/edit", requireAdmin, async (req, res) => {
     if (!doc || doc.type !== "elenko_api") {
       return res.status(404).send(renderErrorPage("API not found"));
     }
+    const qRef = getQueryApiKeyRef(req);
+    // After Create/Update API key, browser returns here with ?apiKeyRef=key_... — persist to CouchDB
+    // (export strips apiKeyRef; slug sync in the form is UI-only until Save unless we save here).
+    if (qRef) {
+      doc.apiKeyRef = qRef;
+      await configDb.insert(doc);
+      return res.redirect(303, "/apis/" + encodeURIComponent(req.params.id) + "/edit");
+    }
     const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditApiPage(doc, null, req.originalUrl || "/apis/" + encodeURIComponent(req.params.id) + "/edit", appUi));
+    res.send(renderEditApiPage(doc, null, "/apis/" + encodeURIComponent(req.params.id) + "/edit", appUi, ""));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("API not found"));
     console.error("Error loading API:", err);
@@ -2474,7 +2652,13 @@ app.get("/apis/keys/:id/edit", requireAdmin, async (req, res) => {
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(renderEditApiKeyPage(doc, null, req.query.returnTo, "", appUi, ""));
   } catch (err) {
-    if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("API key not found"));
+    if (err?.statusCode === 404) {
+      // If key doc does not exist yet, open the create/upsert page with prefilled id.
+      const qs = new URLSearchParams();
+      if (typeof req.query.returnTo === "string" && req.query.returnTo.trim()) qs.set("returnTo", req.query.returnTo.trim());
+      qs.set("apiKeyDocId", req.params.id);
+      return res.redirect("/apis/keys/create?" + qs.toString());
+    }
     console.error("Error loading API key:", err);
     res.status(500).send(renderErrorPage(err.message));
   }
@@ -2643,6 +2827,12 @@ app.get("/js-processing/create", requireAdmin, async (req, res) => {
   const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
   res.send(renderEditJsProcessingPage(null, null, appUi));
+});
+
+app.get("/js-processing/help", requireAdmin, async (req, res) => {
+  const appUi = await getAppUiConfig();
+  res.set("Content-Type", "text/html; charset=utf-8");
+  res.send(renderJsProcessingHelpPage(appUi));
 });
 
 app.get("/js-processing/:id/edit", requireAdmin, async (req, res) => {
@@ -2933,6 +3123,9 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       theme,
       listFields: rawListFields,
       mobileSingleEntryFormId,
+      infoImportFlowId,
+      infoImportButtonTitle,
+      guardianFlowId,
       sortKeyFields: rawSortKeyFields,
       sortDirection,
     } = req.body || {};
@@ -2987,6 +3180,18 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
         : "";
     doc.mobileSingleEntryFormId =
       mobileSingleId && updatedEntryFormIds.includes(mobileSingleId) ? mobileSingleId : "";
+    const importFlowIdNormalized =
+      typeof infoImportFlowId === "string" && infoImportFlowId.trim()
+        ? infoImportFlowId.trim()
+        : (typeof guardianFlowId === "string" && guardianFlowId.trim() ? guardianFlowId.trim() : "");
+    doc.infoImportFlowId = importFlowIdNormalized;
+    // Keep legacy field for backward compatibility with existing data/routes.
+    doc.guardianFlowId = importFlowIdNormalized;
+    const importButtonTitle =
+      typeof infoImportButtonTitle === "string" && infoImportButtonTitle.trim()
+        ? infoImportButtonTitle.trim()
+        : "Import from Guardian";
+    doc.infoImportButtonTitle = importButtonTitle;
     const sortKeyFields = Array.isArray(rawSortKeyFields)
       ? rawSortKeyFields
           .filter((f) => typeof f === "string" && f.trim())
@@ -3296,6 +3501,62 @@ app.post("/api/profile/:id/entry/:entryId/send-to-flow", requireAuth, async (req
     if (err?.statusCode === 404) return res.status(404).json({ error: "Not found" });
     console.error("Send to flow error:", err);
     res.status(500).json({ error: err.message || "Send failed" });
+  }
+});
+
+app.post("/api/profile/:id/run-flow", requireEditor, async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const profileDoc = await db.get(profileId);
+    if (!profileDoc || profileDoc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    if (!configDb) {
+      return res.status(503).json({ error: "Config store not available" });
+    }
+    const body = req.body || {};
+    const flowRefRaw = typeof body.flowId === "string" ? body.flowId.trim() : "";
+    const profileConfiguredFlowId =
+      typeof profileDoc.infoImportFlowId === "string" && profileDoc.infoImportFlowId.trim()
+        ? profileDoc.infoImportFlowId.trim()
+        : (typeof profileDoc.guardianFlowId === "string" ? profileDoc.guardianFlowId.trim() : "");
+    const flowRef = flowRefRaw || profileConfiguredFlowId;
+    if (!flowRef) {
+      return res.status(400).json({ error: "Flow ID is required." });
+    }
+    let flowDoc = null;
+    try {
+      flowDoc = await configDb.get(flowRef);
+    } catch (e) {
+      if (e.statusCode !== 404) throw e;
+    }
+    if (!flowDoc || flowDoc.type !== "elenko_flow") {
+      const byName = await configDb.find({ selector: { type: "elenko_flow", name: flowRef }, limit: 1 });
+      flowDoc = byName.docs && byName.docs[0];
+    }
+    if (!flowDoc || flowDoc.type !== "elenko_flow") {
+      return res.status(404).json({ error: "Flow not found: " + flowRef });
+    }
+
+    const query = typeof body.query === "string" ? body.query.trim() : "";
+    const dataset = { query, guardianQuery: query };
+    const context = {
+      profileId,
+      entryId: "",
+      profileName: profileDoc.name || profileId,
+      dataset,
+      param: "",
+      // Profile-page imports should only create rows from JS output._createMany.
+      // Prevent accidental single-record create/update steps from persisting a helper document.
+      suppressSinglePersist: true,
+    };
+    await runPipeline(context, flowDoc);
+    const created = Number(context.dataset && context.dataset._lastCreatedCount) || 0;
+    return res.json({ ok: true, created });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Not found" });
+    console.error("Run profile flow error:", err);
+    return res.status(500).json({ error: err.message || "Flow failed" });
   }
 });
 
@@ -3852,7 +4113,7 @@ function buildOrderedItems(profileFieldNames, formDoc) {
         x: item.x,
         y: item.y,
         height: item.height,
-        fieldType: item.fieldType === "markdown" ? "markdown" : "text",
+        fieldType: item.fieldType === "markdown" ? "markdown" : item.fieldType === "url" ? "url" : "text",
       });
     } else if (item.labelId && labelsById[item.labelId] !== undefined && !seenLabels.has(item.labelId)) {
       seenLabels.add(item.labelId);
@@ -3867,20 +4128,7 @@ function buildOrderedItems(profileFieldNames, formDoc) {
       });
     }
   }
-  for (const fn of names) {
-    if (!seenFields.has(fn)) {
-      const item = byFieldName[fn];
-      ordered.push({
-        type: "field",
-        fieldName: fn,
-        width: item ? (item.width || "100%") : "100%",
-        x: item && item.x,
-        y: item && item.y,
-        height: item && item.height,
-        fieldType: item && item.fieldType === "markdown" ? "markdown" : "text",
-      });
-    }
-  }
+  // When field layout is configured, show only fields/labels explicitly listed there.
   return ordered;
 }
 
@@ -3966,6 +4214,14 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   function labelClass(o) {
     return o.type === "label" ? "label static-label" : "label field-label";
   }
+  function editControlHtml(o, value) {
+    const escapedName = escapeHtml(o.fieldName);
+    const escapedValue = escapeHtml(value);
+    if (o.fieldType === "url") {
+      return `<input type="url" class="entry-field" name="${escapedName}" placeholder="${escapedName}" value="${escapedValue}">`;
+    }
+    return `<textarea class="entry-field entry-field-textarea" name="${escapedName}" placeholder="${escapedName}" rows="3">${escapedValue}</textarea>`;
+  }
   function itemValue(o) {
     if (o.type === "label") return "";
     const val = record[o.fieldName];
@@ -3981,6 +4237,13 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       } catch (_) {
         return escapeHtml(value);
       }
+    }
+    if (o.fieldType === "url" && value) {
+      const raw = String(value).trim();
+      const escapedText = escapeHtml(raw);
+      const hrefRaw = /^(https?:\/\/|mailto:|tel:)/i.test(raw) ? raw : "https://" + raw;
+      const escapedHref = escapeHtml(hrefRaw);
+      return `<a href="${escapedHref}" target="_blank" rel="noopener noreferrer">${escapedText}</a>`;
     }
     return escapeHtml(value);
   }
@@ -4006,7 +4269,12 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         </div>`;
           }
           const valueHtml = formatValueHtml(o, value);
-          const valueClass = o.fieldType === "markdown" ? " value entry-value-markdown" : " value";
+          const valueClass =
+            o.fieldType === "markdown"
+              ? " value entry-value-markdown"
+              : o.fieldType === "url"
+              ? " value entry-value-url"
+              : " value";
           return `
         <div class="entry-field-block"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
@@ -4034,7 +4302,12 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         </div>`;
           }
           const valueHtml = formatValueHtml(o, value);
-          const valueClass = o.fieldType === "markdown" ? " value entry-value-markdown" : " value";
+          const valueClass =
+            o.fieldType === "markdown"
+              ? " value entry-value-markdown"
+              : o.fieldType === "url"
+              ? " value entry-value-url"
+              : " value";
           return `
         <div class="entry-grid-cell"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
@@ -4058,7 +4331,12 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         </tr>`;
           }
           const valueHtml = formatValueHtml(o, value);
-          const valueClass = o.fieldType === "markdown" ? " value entry-value-markdown" : " value";
+          const valueClass =
+            o.fieldType === "markdown"
+              ? " value entry-value-markdown"
+              : o.fieldType === "url"
+              ? " value entry-value-url"
+              : " value";
           return `
         <tr>
           <td class="${lc}">${escapeHtml(itemLabel(o))}</td>
@@ -4106,6 +4384,7 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .entry-value-markdown h2 { font-size: 1.1rem; }
     .entry-value-markdown h3 { font-size: 1rem; }
     .entry-value-markdown a { color: var(--entry-link, #58a6ff); }
+    .entry-value-url a { color: var(--entry-link, #58a6ff); word-break: break-all; }
     .entry-grid-cell.entry-label-only .label { white-space: nowrap; }
     .entry-label-row .label { white-space: nowrap; }
   </style>
@@ -4194,7 +4473,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
           return `
         <div class="entry-field-block"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
-          <div class="value"><input type="text" class="entry-field" name="${escapeHtml(o.fieldName)}" placeholder="${escapeHtml(o.fieldName)}" value="${escapeHtml(value)}"></div>
+          <div class="value">${editControlHtml(o, value)}</div>
         </div>`;
         })
         .join("") +
@@ -4220,7 +4499,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
           return `
         <div class="entry-grid-cell"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
-          <div class="value"><input type="text" class="entry-field" name="${escapeHtml(o.fieldName)}" placeholder="${escapeHtml(o.fieldName)}" value="${escapeHtml(value)}"></div>
+          <div class="value">${editControlHtml(o, value)}</div>
         </div>`;
         })
         .join("") +
@@ -4242,7 +4521,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
         return `
         <tr>
           <td class="${lc}">${escapeHtml(itemLabel(o))}</td>
-          <td class="value"${valueCellWidth}><input type="text" class="entry-field" name="${escapeHtml(o.fieldName)}" placeholder="${escapeHtml(o.fieldName)}" value="${escapeHtml(value)}"></td>
+          <td class="value"${valueCellWidth}>${editControlHtml(o, value)}</td>
         </tr>`;
       })
       .join("");
@@ -4296,8 +4575,9 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     .entry-grid-cell.entry-label-only .label { white-space: nowrap; }
     .entry-label-row .label { white-space: nowrap; }
     td.value { min-width: 0; overflow: hidden; }
-    input.entry-field { width: 100%; min-width: 0; max-width: 100%; padding: 0.5rem; background: var(--entry-field-bg-edit, #161b22); color: var(--entry-text-edit, #e6edf3); border: 1px solid transparent; border-radius: 4px; font-size: 1rem; box-sizing: border-box; }
-    input.entry-field:focus { outline: none; border-color: var(--entry-link, #58a6ff); }
+    input.entry-field, textarea.entry-field { width: 100%; min-width: 0; max-width: 100%; padding: 0.5rem; background: var(--entry-field-bg-edit, #161b22); color: var(--entry-text-edit, #e6edf3); border: 1px solid transparent; border-radius: 4px; font-size: 1rem; box-sizing: border-box; }
+    input.entry-field:focus, textarea.entry-field:focus { outline: none; border-color: var(--entry-link, #58a6ff); }
+    textarea.entry-field-textarea { resize: vertical; min-height: 5.5rem; line-height: 1.35; white-space: pre-wrap; overflow-wrap: break-word; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; margin-top: 1rem; }
     .btn:hover { background: #2ea043; }
     .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; }
@@ -4332,6 +4612,15 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     const entryFormSelect = document.getElementById('entryFormSelect');
     const form = document.getElementById('entry-form');
     const msgEl = document.getElementById('msg');
+    function autoResizeTextarea(el) {
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = Math.max(el.scrollHeight, 88) + 'px';
+    }
+    Array.from(form.querySelectorAll('textarea.entry-field-textarea')).forEach((el) => {
+      autoResizeTextarea(el);
+      el.addEventListener('input', function() { autoResizeTextarea(el); });
+    });
 
     form.onsubmit = async (e) => {
       e.preventDefault();
@@ -4397,6 +4686,14 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   const prevUrl = hasPrev ? profileBase + "?page=" + (page - 1) + qParam : null;
   const nextUrl = hasNext ? profileBase + "?page=" + (page + 1) + qParam : null;
   const pageOfTotal = totalPages != null ? " of " + totalPages : "";
+  const infoImportFlowId =
+    typeof doc.infoImportFlowId === "string" && doc.infoImportFlowId.trim()
+      ? doc.infoImportFlowId.trim()
+      : (typeof doc.guardianFlowId === "string" && doc.guardianFlowId.trim() ? doc.guardianFlowId.trim() : "");
+  const infoImportButtonTitle =
+    typeof doc.infoImportButtonTitle === "string" && doc.infoImportButtonTitle.trim()
+      ? doc.infoImportButtonTitle.trim()
+      : "Import from Guardian";
 
   const maxMobileListFields = 3;
   const rawMobileListFields = Array.isArray(doc.listFields) ? doc.listFields : [];
@@ -4424,18 +4721,12 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       --profile-table-border: ${escapeHtml(theme.tableBorder)};
     }`;
 
-  const colCount = fieldNames.length > 0 ? fieldNames.length : 1;
-  const colWidthPct = 100 / colCount;
-  const colgroup =
-    colCount === 1
-      ? "<colgroup><col style=\"width:100%\"></colgroup>"
-      : "<colgroup>" + fieldNames.map(() => `<col style="width:${colWidthPct}%">`).join("") + "</colgroup>";
-
   const headerRow =
     fieldNames.length > 0
       ? `<tr>${fieldNames
           .map((f) => {
-            const cls = mobileVisibleSet.has(f) ? "col col-mobile-visible" : "col col-mobile-hidden";
+            const bodyTextCls = (typeof f === "string" && f.trim().toLowerCase() === "bodytext") ? " col-bodytext" : "";
+            const cls = (mobileVisibleSet.has(f) ? "col col-mobile-visible" : "col col-mobile-hidden") + bodyTextCls;
             return `<th class="${cls}">${escapeHtml(f)}</th>`;
           })
           .join("")}</tr>`
@@ -4453,10 +4744,12 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             const val = rec[fn];
             const text = val != null ? String(val) : "";
             const escaped = escapeHtml(text);
-            const mobileCls = mobileVisibleSet.has(fn) ? " col-mobile-visible" : " col-mobile-hidden";
+          const bodyTextCls = (typeof fn === "string" && fn.trim().toLowerCase() === "bodytext") ? " col-bodytext" : "";
+          const mobileCls = (mobileVisibleSet.has(fn) ? " col-mobile-visible" : " col-mobile-hidden") + bodyTextCls;
             if (i === 0) {
               const entryUrl = "/profile/" + encodeURIComponent(doc._id) + "/entry/" + encodeURIComponent(rec._id) + returnQueryStr;
-              return `<td class="entry-link-cell${mobileCls}"><span class="entry-cell-clamp"><a href="${entryUrl}">${escaped}</a></span></td>`;
+              const linkText = text.trim().length > 0 ? escaped : "empty";
+              return `<td class="entry-link-cell${mobileCls}"><span class="entry-cell-clamp"><a href="${entryUrl}">${linkText}</a></span></td>`;
             }
             return `<td class="${mobileCls}"><span class="entry-cell-clamp">${escaped}</span></td>`;
           });
@@ -4485,9 +4778,9 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--profile-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
-    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; }
+    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.35rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.9rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
-    table { width: 100%; table-layout: fixed; border-collapse: collapse; background: var(--profile-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    table { width: 100%; table-layout: auto; border-collapse: collapse; background: var(--profile-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
     th, td { padding: 0.35rem 1rem; text-align: left; border-bottom: 1px solid var(--profile-table-border, #21262d); line-height: 1.35; }
     th { background: var(--profile-table-header-bg, #21262d); color: var(--profile-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
@@ -4508,6 +4801,14 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .pagination .btn-pag-prev:hover, .pagination .btn-pag-next:hover { background: #30363d; }
     .pagination .btn-pag.disabled { color: #484f58; pointer-events: none; }
     .pagination .page-num { color: var(--profile-label, #8b949e); font-size: 0.875rem; }
+    th.col-bodytext, td.col-bodytext { max-width: 50vw; width: 50%; }
+    .guardian-import { margin: 0 0 1rem 0; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    .guardian-import input[type="text"] { padding: 0.5rem 0.75rem; background: var(--profile-table-bg, #161b22); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; color: var(--profile-text, #e6edf3); font-size: 1rem; min-width: 12rem; }
+    .guardian-import button { padding: 0.4rem 0.75rem; background: var(--profile-table-header-bg, #21262d); color: var(--profile-link, #58a6ff); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
+    .guardian-import button:hover { background: #30363d; }
+    .guardian-import .guardian-msg { font-size: 0.875rem; color: var(--profile-label, #8b949e); }
+    .guardian-import .guardian-msg.err { color: #f85149; }
+    .guardian-import .guardian-msg.ok { color: #3fb950; }
     @media (max-width: 768px) {
       table { font-size: 0.9rem; }
       th.col-mobile-hidden,
@@ -4518,6 +4819,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
 </head>
 <body>
   <div class="actions"><a href="/">← Profiles</a>${canEdit ? (isAdmin ? `<a href="/profile/${encodeURIComponent(doc._id)}/edit">Edit profile</a>` : "") + `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn">Create entry</a>` : ""}</div>
+  ${canEdit && infoImportFlowId ? `<form id="info-import-form" class="guardian-import"><label for="info-import-query" style="margin:0;color:var(--profile-label, #8b949e);">Query:</label><input type="text" id="info-import-query" placeholder="e.g. renewable energy"><button type="submit">${escapeHtml(infoImportButtonTitle)}</button><span id="info-import-msg" class="guardian-msg"></span></form>` : ""}
   <h1>${title}</h1>
   ${description ? `<p class="sub">${description}</p>` : ""}
   <form method="get" action="${profileBase}" class="search-bar">
@@ -4532,11 +4834,48 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     ${hasNext ? `<a href="${nextUrl}" class="btn-pag btn-pag-next">Next →</a>` : `<span class="btn-pag btn-pag-next disabled">Next →</span>`}
   </div>
   <table>
-    ${colgroup}
     <thead>${headerRow}</thead>
     <tbody>${dataRows.join("")}${emptyRow}
     </tbody>
   </table>
+  ${canEdit && infoImportFlowId ? `<script>
+    (function() {
+      var form = document.getElementById('info-import-form');
+      if (!form) return;
+      var input = document.getElementById('info-import-query');
+      var msg = document.getElementById('info-import-msg');
+      var flowId = ${JSON.stringify(infoImportFlowId)};
+      form.addEventListener('submit', async function(ev) {
+        ev.preventDefault();
+        var query = input && input.value ? input.value.trim() : '';
+        if (!query) {
+          if (msg) { msg.textContent = 'Please enter a query.'; msg.className = 'guardian-msg err'; }
+          return;
+        }
+        var btn = form.querySelector('button[type="submit"]');
+        if (btn) btn.disabled = true;
+        if (msg) { msg.textContent = 'Import running...'; msg.className = 'guardian-msg'; }
+        try {
+          var r = await fetch('/api/profile/' + encodeURIComponent(${JSON.stringify(doc._id)}) + '/run-flow', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ flowId: flowId, query: query })
+          });
+          var data = await r.json();
+          if (!r.ok) {
+            if (msg) { msg.textContent = data.error || 'Import failed'; msg.className = 'guardian-msg err'; }
+            if (btn) btn.disabled = false;
+            return;
+          }
+          if (msg) { msg.textContent = (typeof data.created === 'number' ? ('Imported: ' + data.created + ' entries.') : 'Import done.'); msg.className = 'guardian-msg ok'; }
+          setTimeout(function() { window.location.reload(); }, 700);
+        } catch (err) {
+          if (msg) { msg.textContent = (err && err.message) ? err.message : 'Request failed'; msg.className = 'guardian-msg err'; }
+          if (btn) btn.disabled = false;
+        }
+      });
+    })();
+  </script>` : ""}
 </body>
 </html>`;
 }
@@ -5126,7 +5465,7 @@ function renderEditJsProcessingPage(doc, err, appUi) {
     <input type="text" id="description" name="description" placeholder="Optional" value="${descVal}">
     <label for="timeout">Timeout (ms)</label>
     <input type="number" id="timeout" name="timeout" min="100" max="60000" value="${timeoutVal}" placeholder="5000">
-    <label for="script">Script</label>
+    <label for="script">Script <button type="button" class="btn btn-secondary" style="margin-left:0.5rem;padding:0.2rem 0.6rem;font-size:0.75rem;" onclick="window.open('/js-processing/help','js-processing-help','width=820,height=760');return false;">Help</button></label>
     <textarea id="script" name="script" placeholder="// input = pipeline data (read-only)\n// output = object to write results\noutput.result = input.someField;">${scriptVal}</textarea>
   </form>
   <script>
@@ -5152,6 +5491,87 @@ function renderEditJsProcessingPage(doc, err, appUi) {
       }
     };
   </script>
+</body>
+</html>`;
+}
+
+function renderJsProcessingHelpPage(appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – JS Processing Help</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 1.25rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); }
+    h1 { font-size: 1.1rem; margin: 0 0 0.75rem 0; }
+    h2 { font-size: 0.95rem; margin: 1rem 0 0.4rem 0; color: var(--app-label, #8b949e); }
+    p { margin: 0.35rem 0; }
+    ul { margin: 0.35rem 0 0.35rem 1.2rem; padding: 0; }
+    li { margin: 0.2rem 0; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    code { background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; padding: 0.1rem 0.3rem; }
+    pre { background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; padding: 0.6rem; overflow: auto; font-size: 0.85rem; line-height: 1.35; }
+    .sub { color: var(--app-label, #8b949e); }
+  </style>
+</head>
+<body>
+  <h1>JS Processing Help</h1>
+  <p class="sub">Scripts run in a sandbox. Use <code>input</code> to read pipeline data and <code>output</code> to return data.</p>
+
+  <h2>input.fieldName</h2>
+  <p>Read values from the current pipeline dataset:</p>
+  <pre>// Example
+var q = input.query || "";
+var apiJson = input.guardianJson || "";</pre>
+
+  <h2>output.fieldName</h2>
+  <p>Write values back into the pipeline dataset (merged after script execution):</p>
+  <pre>// Example
+output.normalizedQuery = (input.query || "").trim().toLowerCase();
+output.importCount = 0;</pre>
+
+  <h2>output._writeLog(object)</h2>
+  <p>Write structured log entries to the flow log as <code>flow.scriptLog</code> messages.</p>
+  <pre>// Example
+output._writeLog({ stage: "parse", ok: true, count: 12 });
+output._writeLog({ level: "error", message: "Invalid JSON" });</pre>
+  <ul>
+    <li>Accepts JSON-compatible objects (strings/numbers/booleans/arrays/objects).</li>
+    <li>Logs include profile and entry context automatically.</li>
+  </ul>
+
+  <h2>output._createMany</h2>
+  <p>Create multiple new Elenko entries in the current profile.</p>
+  <pre>// Example
+output._createMany = [
+  { title: "A", url: "https://example.org/a" },
+  { title: "B", url: "https://example.org/b" }
+];</pre>
+  <ul>
+    <li>Each object is mapped to profile fields by name.</li>
+    <li>Unknown fields are ignored; missing profile fields become empty.</li>
+  </ul>
+
+  <h2>Combined example</h2>
+  <pre>var rows = [];
+try {
+  var parsed = JSON.parse(input.guardianJson || "{}");
+  var results = (((parsed || {}).response || {}).results || []);
+  rows = results.map(function(r) {
+    return { webTitle: r.webTitle || "", webUrl: r.webUrl || "" };
+  });
+  output._writeLog({ stage: "map", results: rows.length });
+} catch (e) {
+  output._writeLog({ level: "error", stage: "parse", message: String(e.message || e) });
+}
+output._createMany = rows;
+output.importCount = rows.length;</pre>
 </body>
 </html>`;
 }
@@ -5241,7 +5661,7 @@ function renderApisListPage(apis, appUi) {
 </html>`;
 }
 
-function renderEditApiPage(doc, err, returnTo, appUi) {
+function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const isEdit = !!(doc && doc._id);
@@ -5251,7 +5671,11 @@ function renderEditApiPage(doc, err, returnTo, appUi) {
   const descVal = doc && typeof doc.description === "string" ? escapeHtml(doc.description) : "";
   const urlVal = doc && typeof doc.url === "string" ? escapeHtml(doc.url) : "";
   const methodVal = doc && doc.method === "POST" ? "POST" : doc && doc.method === "PUT" ? "PUT" : doc && doc.method === "PATCH" ? "PATCH" : "GET";
-  const apiKeyRefVal = doc && typeof doc.apiKeyRef === "string" ? escapeHtml(doc.apiKeyRef) : "";
+  const apiKeyRefRaw =
+    doc && typeof doc.apiKeyRef === "string" && doc.apiKeyRef.trim()
+      ? doc.apiKeyRef.trim()
+      : (typeof prefillApiKeyRef === "string" && prefillApiKeyRef.trim() ? prefillApiKeyRef.trim() : "");
+  const apiKeyRefVal = apiKeyRefRaw ? escapeHtml(apiKeyRefRaw) : "";
   const responseTargetVal = doc && doc.responseTarget === "create" ? "create" : doc && doc.responseTarget === "forward" ? "forward" : "update";
   const templateVal = doc && typeof doc.template === "string" ? escapeHtml(doc.template) : "";
   const responseFieldVal = doc && typeof doc.responseField === "string" ? escapeHtml(doc.responseField) : "";
@@ -5259,8 +5683,8 @@ function renderEditApiPage(doc, err, returnTo, appUi) {
   const responseEndVal = doc && typeof doc.responseEnd === "string" ? escapeHtml(doc.responseEnd) : "";
   const returnToRaw = (typeof returnTo === "string" && returnTo.trim()) ? returnTo.trim() : "";
   const defaultNameForKey = nameVal ? encodeURIComponent(nameVal) : "";
-  const keyEditHref = apiKeyRefVal
-    ? "/apis/keys/" + encodeURIComponent(doc.apiKeyRef) + "/edit" + (returnToRaw ? "?returnTo=" + encodeURIComponent(returnToRaw) : "")
+  const keyEditHref = apiKeyRefRaw
+    ? "/apis/keys/" + encodeURIComponent(apiKeyRefRaw) + "/edit" + (returnToRaw ? "?returnTo=" + encodeURIComponent(returnToRaw) : "")
     : "/apis/keys/create" + (returnToRaw ? "?returnTo=" + encodeURIComponent(returnToRaw) : "") + (defaultNameForKey ? "&defaultName=" + defaultNameForKey : "");
   const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
   const title = isEdit ? "Edit REST API" : "Create REST API";
@@ -5348,10 +5772,13 @@ function renderEditApiPage(doc, err, returnTo, appUi) {
       var slug = s.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'key';
       return 'key_' + (slug.slice(0, 80) || 'key');
     }
+    var apiKeyRefManuallyEdited = false;
     function syncApiKeyRefFromName() {
       var nameEl = document.getElementById('name');
       var refEl = document.getElementById('apiKeyRef');
       if (nameEl && refEl) {
+        if (apiKeyRefManuallyEdited) return;
+        if ((refEl.value || '').trim()) return;
         var n = (nameEl.value || '').trim();
         refEl.value = n ? slugifyForKeyId(n) : '';
       }
@@ -5359,6 +5786,12 @@ function renderEditApiPage(doc, err, returnTo, appUi) {
     var form = document.getElementById('api-form');
     var formId = document.getElementById('apiId').value;
     syncApiKeyRefFromName();
+    var apiKeyRefEl = document.getElementById('apiKeyRef');
+    if (apiKeyRefEl) {
+      apiKeyRefEl.addEventListener('input', function() {
+        apiKeyRefManuallyEdited = true;
+      });
+    }
     document.getElementById('name').addEventListener('input', syncApiKeyRefFromName);
     document.getElementById('name').addEventListener('blur', syncApiKeyRefFromName);
     var createEditKeyLink = document.getElementById('createEditKeyLink');
@@ -5369,15 +5802,10 @@ function renderEditApiPage(doc, err, returnTo, appUi) {
         var apiKeyRef = (document.getElementById('apiKeyRef').value || '').trim();
         var returnTo = window.location.pathname + window.location.search;
         var q = returnTo ? '?returnTo=' + encodeURIComponent(returnTo) : '';
-        if (apiKeyRef && formId) {
-          // Editing an existing REST API: open (or edit) the existing key doc.
-          window.location.href = '/apis/keys/' + encodeURIComponent(apiKeyRef) + '/edit' + q;
-        } else {
-          // Creating a new REST API (or missing apiKeyRef): open create page.
-          if (apiKeyRef) q += (q ? '&' : '?') + 'apiKeyDocId=' + encodeURIComponent(apiKeyRef);
-          if (name) q += (q ? '&' : '?') + 'defaultName=' + encodeURIComponent(name);
-          window.location.href = '/apis/keys/create' + q;
-        }
+        // Always open create/upsert page; this also handles missing key docs gracefully.
+        if (apiKeyRef) q += (q ? '&' : '?') + 'apiKeyDocId=' + encodeURIComponent(apiKeyRef);
+        if (name) q += (q ? '&' : '?') + 'defaultName=' + encodeURIComponent(name);
+        window.location.href = '/apis/keys/create' + q;
       });
     }
     form.onsubmit = async function(e) {
@@ -5684,9 +6112,9 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
             const xVal = item.x != null ? String(item.x) : "";
             const yVal = item.y != null ? String(item.y) : "";
             const hVal = item.height != null ? String(item.height) : "";
-            const fieldTypeVal = item.fieldType === "markdown" ? "markdown" : "text";
+            const fieldTypeVal = item.fieldType === "markdown" ? "markdown" : item.fieldType === "url" ? "url" : "text";
             const typeSelect = item.fieldName
-              ? `<select class="fl-type"><option value="text"${fieldTypeVal === "text" ? " selected" : ""}>Text</option><option value="markdown"${fieldTypeVal === "markdown" ? " selected" : ""}>Markdown</option></select>`
+              ? `<select class="fl-type"><option value="text"${fieldTypeVal === "text" ? " selected" : ""}>Text</option><option value="markdown"${fieldTypeVal === "markdown" ? " selected" : ""}>Markdown</option><option value="url"${fieldTypeVal === "url" ? " selected" : ""}>URL</option></select>`
               : "<span class=\"sub\">—</span>";
             return `
         <tr class="field-layout-row">
@@ -5786,7 +6214,7 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
     </table>
     <button type="button" class="btn btn-secondary" id="add-label" style="margin-top:0.5rem;">+ Add label</button>
     <label class="field-list-label" style="margin-top:1.5rem;">Field layout (optional: field name or label id, order, type, width, position)</label>
-    <p class="sub" style="margin-top:0;">Use a profile field name or a label id from above. Type: Text (plain) or Markdown (rendered in view mode). Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning; Grid uses width as column size only.</p>
+    <p class="sub" style="margin-top:0;">Use a profile field name or a label id from above. Type: Text (plain), Markdown (rendered in view mode), or URL (clickable link text in view mode). Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning; Grid uses width as column size only.</p>
     <table class="field-layout-table">
       <thead><tr><th>Field name or label id</th><th>Order</th><th>Type</th><th>Width</th><th>X (ch)</th><th>Y (em)</th><th>Height (em)</th><th></th></tr></thead>
       <tbody id="field-layout-tbody">${fieldLayoutRows}
@@ -5802,7 +6230,7 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
           <th style="min-width:10rem;">Flow</th>
           <th style="min-width:10rem;">Target</th>
           <th style="min-width:10rem;">Button title</th>
-          <th>Additional parameter</th>
+          <th style="min-width:10rem;">Additional parameter</th>
           <th style="width:5rem;"></th>
         </tr>
       </thead>
@@ -5882,8 +6310,8 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
       const xv = (x != null && x !== '') ? String(x) : '';
       const yv = (y != null && y !== '') ? String(y) : '';
       const hv = (height != null && height !== '') ? String(height) : '';
-      const typeVal = (fieldType === 'markdown') ? 'markdown' : 'text';
-      tr.innerHTML = '<td><input type="text" class="fl-field" placeholder="Field name or label id" value="' + (fieldName || '').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-order" min="0" value="' + (order != null ? order : n) + '"></td><td><select class="fl-type"><option value="text"' + (typeVal === 'text' ? ' selected' : '') + '>Text</option><option value="markdown"' + (typeVal === 'markdown' ? ' selected' : '') + '>Markdown</option></select></td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' + (width || '100%').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-x" step="any" placeholder="—"></td><td><input type="number" class="fl-y" step="any" placeholder="—"></td><td><input type="number" class="fl-height" step="any" placeholder="—" min="0"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
+      const typeVal = (fieldType === 'markdown') ? 'markdown' : (fieldType === 'url' ? 'url' : 'text');
+      tr.innerHTML = '<td><input type="text" class="fl-field" placeholder="Field name or label id" value="' + (fieldName || '').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-order" min="0" value="' + (order != null ? order : n) + '"></td><td><select class="fl-type"><option value="text"' + (typeVal === 'text' ? ' selected' : '') + '>Text</option><option value="markdown"' + (typeVal === 'markdown' ? ' selected' : '') + '>Markdown</option><option value="url"' + (typeVal === 'url' ? ' selected' : '') + '>URL</option></select></td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' + (width || '100%').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-x" step="any" placeholder="—"></td><td><input type="number" class="fl-y" step="any" placeholder="—"></td><td><input type="number" class="fl-height" step="any" placeholder="—" min="0"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
       tr.querySelector('.fl-x').value = xv;
       tr.querySelector('.fl-y').value = yv;
       tr.querySelector('.fl-height').value = hv;
@@ -5964,7 +6392,7 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
         if (labelIds.has(firstCol)) item.labelId = firstCol; else {
           item.fieldName = firstCol;
           const typeEl = tr.querySelector('.fl-type');
-          item.fieldType = (typeEl && typeEl.value === 'markdown') ? 'markdown' : 'text';
+          item.fieldType = (typeEl && (typeEl.value === 'markdown' || typeEl.value === 'url')) ? typeEl.value : 'text';
         }
         return item;
       }).filter(Boolean);
@@ -6267,7 +6695,8 @@ function renderStartPage(profiles, role, appUi) {
   <meta charset="UTF-8">
   ${FAVICON_LINKS}
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Elenko – Database profiles</title>
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <title>Elenko</title>
   <style>
     ${themeVars}
     * { box-sizing: border-box; }
@@ -6392,6 +6821,14 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     typeof doc.mobileSingleEntryFormId === "string" && doc.mobileSingleEntryFormId.trim()
       ? doc.mobileSingleEntryFormId.trim()
       : "";
+  const infoImportFlowId =
+    typeof doc.infoImportFlowId === "string" && doc.infoImportFlowId.trim()
+      ? doc.infoImportFlowId.trim()
+      : (typeof doc.guardianFlowId === "string" && doc.guardianFlowId.trim() ? doc.guardianFlowId.trim() : "");
+  const infoImportButtonTitle =
+    typeof doc.infoImportButtonTitle === "string" && doc.infoImportButtonTitle.trim()
+      ? doc.infoImportButtonTitle.trim()
+      : "Import from Guardian";
   function sortKeySelect(name, id, selected) {
     const fieldOpts = fieldNames.map((fn) => `<option value="${escapeHtml(fn)}"${selected === fn ? " selected" : ""}>${escapeHtml(fn)}</option>`).join("");
     return `<select id="${id}" name="${name}"><option value="">— None —</option>${fieldOpts}<option value="createdAt"${selected === "createdAt" ? " selected" : ""}>Creation date</option><option value="updatedAt"${selected === "updatedAt" ? " selected" : ""}>Update date</option></select>`;
@@ -6471,8 +6908,8 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     <button type="button" class="btn btn-danger" id="delete-profile-btn" style="margin-left:0.5rem;">Delete profile</button>
     <a href="/" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
   </div>
-  <h1>Elenko</h1>
-  <p class="sub">Edit profile</p>
+  <h1>Elenko database profile</h1>
+  <p class="sub">Edit Elenko database profile</p>
   <p class="sub" style="margin-bottom:0.5rem;"><strong>Profile ID:</strong> <code id="profile-id-value">${escapeHtml(doc._id)}</code> <button type="button" class="btn btn-secondary" id="copy-profile-id" style="padding:0.25rem 0.5rem;font-size:0.8rem;">Copy</button></p>
   <form id="edit-form">
     <input type="hidden" id="rev" name="_rev" value="${rev}">
@@ -6518,6 +6955,12 @@ function renderEditProfilePage(doc, forms = [], appUi) {
         }>${escapeHtml(f.name)}</option>`)
         .join("")}
     </select>
+    <label for="infoImportFlowId" style="margin-top:1.5rem;">Information Import flow ID</label>
+    <p class="sub" style="margin-top:0.25rem;">Optional. When set, the profile page shows an import query field and button that runs this flow. The entered query is sent in the dataset as <code>query</code> (and also <code>guardianQuery</code> for compatibility), so you can reference it in API templates with placeholders like <code>#query#</code>.</p>
+    <input type="text" id="infoImportFlowId" name="infoImportFlowId" placeholder="Flow ID or name" value="${escapeHtml(infoImportFlowId)}">
+    <label for="infoImportButtonTitle" style="margin-top:0.75rem;">Information Import button title</label>
+    <p class="sub" style="margin-top:0.25rem;">Text shown on the import button in the database view.</p>
+    <input type="text" id="infoImportButtonTitle" name="infoImportButtonTitle" placeholder="e.g. Import from Guardian" value="${escapeHtml(infoImportButtonTitle)}">
     <label style="margin-top:1.5rem;">Visible fields in entry list (up to 3)</label>
     <p class="sub" style="margin-top:0.25rem;">On narrow screens (mobile), only these columns stay visible in the entries table. If empty, the first fields are used.</p>
     <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:center;margin-top:0.5rem;">
@@ -6813,7 +7256,9 @@ function renderEditProfilePage(doc, forms = [], appUi) {
               document.getElementById('sortKeyField2').value,
               document.getElementById('sortKeyField3').value
             ].filter(Boolean),
-            sortDirection: document.getElementById('sortDirection').value
+            sortDirection: document.getElementById('sortDirection').value,
+            infoImportFlowId: (document.getElementById('infoImportFlowId') && document.getElementById('infoImportFlowId').value.trim()) || '',
+            infoImportButtonTitle: (document.getElementById('infoImportButtonTitle') && document.getElementById('infoImportButtonTitle').value.trim()) || ''
           })
         });
         const data = await r.json();
@@ -6869,8 +7314,8 @@ function renderCreateProfilePage(appUi) {
   </style>
 </head>
 <body>
-  <h1>Elenko</h1>
-  <p class="sub">Create Elenko database</p>
+  <h1>Elenko database profile</h1>
+  <p class="sub">Create Elenko database profile</p>
   <form id="create-form">
     <label for="name">Name</label>
     <input type="text" id="name" name="name" required placeholder="Profile name">
@@ -7225,8 +7670,8 @@ function renderEditAppConfigPage(appUi, err) {
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
     .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
     .btn-primary:hover { background: #2ea043; }
-    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; margin-left: 0.5rem; }
-    .btn-secondary:hover { background: #30363d; }
+    .btn-secondary { background: var(--app-bg, #0f1419); color: #e6edf3; text-decoration: none; margin-left: 0.5rem; border: 1px solid var(--app-table-border, #30363d); }
+    .btn-secondary:hover { background: #161b22; }
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: #58a6ff; text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
@@ -7549,6 +7994,26 @@ function renderConfigExportImportPage(profiles, appUi) {
       var restoreBtn = document.getElementById('restore-btn');
       var msgEl = document.getElementById('msg');
 
+      function summarizeExportCounts(payload) {
+        var summary = { profiles: 0, entryForms: 0, flows: 0, apis: 0, jsProcessing: 0, appConfig: 0 };
+        var docs = payload && payload.documents ? payload.documents : {};
+        var dbDocs = Array.isArray(docs.db) ? docs.db : [];
+        var cfgDocs = Array.isArray(docs.configDb) ? docs.configDb : [];
+        dbDocs.forEach(function(doc) {
+          if (!doc || typeof doc !== 'object') return;
+          if (doc.type === 'elenko_profile') summary.profiles += 1;
+          if (doc.type === 'elenko_entry_form') summary.entryForms += 1;
+        });
+        cfgDocs.forEach(function(doc) {
+          if (!doc || typeof doc !== 'object') return;
+          if (doc.type === 'elenko_flow') summary.flows += 1;
+          if (doc.type === 'elenko_api') summary.apis += 1;
+          if (doc.type === 'elenko_js_processing') summary.jsProcessing += 1;
+          if (doc.type === 'elenko_app_config') summary.appConfig += 1;
+        });
+        return summary;
+      }
+
       function setMode() {
         var isExport = modeExport && modeExport.checked;
         exportSection.style.display = isExport ? 'block' : 'none';
@@ -7592,7 +8057,16 @@ function renderConfigExportImportPage(profiles, appUi) {
           a.download = 'elenko-config-export-' + (data.data.scope === 'all' ? 'all' : (data.data.profileId || 'profile')) + '-' + (data.data.exportedAt || '').slice(0, 10) + '.json';
           a.click();
           URL.revokeObjectURL(a.href);
-          msgEl.textContent = 'Export downloaded.';
+          var c = summarizeExportCounts(data.data);
+          var parts = [
+            'profiles: ' + c.profiles,
+            'forms: ' + c.entryForms,
+            'flows: ' + c.flows,
+            'APIs: ' + c.apis,
+            'JS Processing: ' + c.jsProcessing
+          ];
+          if (c.appConfig > 0) parts.push('app config: ' + c.appConfig);
+          msgEl.textContent = 'Export downloaded. Included ' + parts.join(', ') + '.';
           msgEl.className = 'msg ok';
           msgEl.style.display = 'block';
         } catch (err) {
