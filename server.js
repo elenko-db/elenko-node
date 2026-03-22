@@ -240,6 +240,79 @@ function normalizeEntryFormDoc(body) {
   };
 }
 
+/** Deep copy of an entry form document for insert (new _id). */
+function buildEntryFormDocFromSource(baseForm, name) {
+  return {
+    type: "elenko_entry_form",
+    name,
+    labels: Array.isArray(baseForm.labels) ? baseForm.labels : [],
+    theme: baseForm.theme && typeof baseForm.theme === "object" ? baseForm.theme : DEFAULT_ENTRY_VIEW_THEME,
+    layout: baseForm.layout === "grid" || baseForm.layout === "stack" ? baseForm.layout : "table",
+    fieldLayout: Array.isArray(baseForm.fieldLayout) ? baseForm.fieldLayout : [],
+    customCss: baseForm.customCss != null ? String(baseForm.customCss) : "",
+    flowButtonEnabled: !!baseForm.flowButtonEnabled,
+    flowTarget: typeof baseForm.flowTarget === "string" ? baseForm.flowTarget : "log",
+    flowButtonLabel:
+      typeof baseForm.flowButtonLabel === "string" && baseForm.flowButtonLabel.trim()
+        ? baseForm.flowButtonLabel.trim()
+        : "Send to Flow",
+    flowButtonParam: typeof baseForm.flowButtonParam === "string" ? baseForm.flowButtonParam : "",
+    flowConfigs:
+      Array.isArray(baseForm.flowConfigs) && baseForm.flowConfigs.length > 0
+        ? baseForm.flowConfigs.map((c) => ({
+            enabled: !!(c && c.enabled),
+            target: c && c.target === "localDb" ? "localDb" : c && c.target === "api" ? "api" : "log",
+            label: c && typeof c.label === "string" && c.label.trim() ? c.label.trim() : "Send to Flow",
+            param: c && typeof c.param === "string" ? c.param.trim() : "",
+            flowId: c && typeof c.flowId === "string" ? c.flowId.trim() : "",
+          }))
+        : [
+            {
+              enabled: !!baseForm.flowButtonEnabled,
+              target: typeof baseForm.flowTarget === "string" ? baseForm.flowTarget : "log",
+              label:
+                typeof baseForm.flowButtonLabel === "string" && baseForm.flowButtonLabel.trim()
+                  ? baseForm.flowButtonLabel.trim()
+                  : "Send to Flow",
+              param: typeof baseForm.flowButtonParam === "string" ? baseForm.flowButtonParam : "",
+              flowId: "",
+            },
+          ],
+  };
+}
+
+/** "Copy of Name", then "Copy of Name (2)", "(3)", … until unique in the given name set. */
+function makeUniqueCopyOfLabel(originalName, existingNames, fallbackLabel) {
+  const label = originalName && String(originalName).trim() ? String(originalName).trim() : fallbackLabel;
+  const prefix = `Copy of ${label}`;
+  if (!existingNames.has(prefix)) return prefix;
+  let n = 2;
+  let candidate;
+  do {
+    candidate = `${prefix} (${n})`;
+    n++;
+  } while (existingNames.has(candidate));
+  return candidate;
+}
+
+function makeUniqueEntryFormCopyName(originalName, existingNames) {
+  return makeUniqueCopyOfLabel(originalName, existingNames, "entry form");
+}
+
+function makeUniqueFlowCopyName(originalName, existingNames) {
+  return makeUniqueCopyOfLabel(originalName, existingNames, "flow");
+}
+
+/** New elenko_flow document from an existing flow (new _id on insert). */
+function buildFlowDocFromSource(baseFlow, name) {
+  return {
+    type: "elenko_flow",
+    name,
+    description: typeof baseFlow.description === "string" ? baseFlow.description.trim() : "",
+    steps: normalizeFlowSteps(baseFlow.steps || []),
+  };
+}
+
 function escapeRegex(s) {
   return String(s).replace(/[\\^$.*+?()|[\]{}]/g, "\\$&");
 }
@@ -843,7 +916,13 @@ async function buildConfigExport(scope, profileId) {
     if (!profile || profile.type !== "elenko_profile") continue;
     addDb(profile);
 
-    const formIds = getProfileEntryFormIds(profile);
+    const mobileSingleFormId =
+      typeof profile.mobileSingleEntryFormId === "string" && profile.mobileSingleEntryFormId.trim()
+        ? profile.mobileSingleEntryFormId.trim()
+        : "";
+    const formIdSet = new Set(getProfileEntryFormIds(profile));
+    if (mobileSingleFormId) formIdSet.add(mobileSingleFormId);
+    const formIds = [...formIdSet];
     for (const fid of formIds) {
       try {
         const formDoc = await db.get(fid);
@@ -2452,6 +2531,39 @@ app.post("/api/entry-forms/:id/delete", requireAdmin, async (req, res) => {
   }
 });
 
+app.post("/api/entry-forms/:id/copy", requireAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    let baseForm;
+    try {
+      baseForm = await db.get(id);
+    } catch (e) {
+      if (e.statusCode === 404) return res.status(404).json({ error: "Entry form not found" });
+      throw e;
+    }
+    if (!baseForm || baseForm.type !== "elenko_entry_form") {
+      return res.status(404).json({ error: "Entry form not found" });
+    }
+    const nameResult = await db.find({
+      selector: { type: "elenko_entry_form" },
+      fields: ["name"],
+      limit: 5000,
+    });
+    const existing = new Set();
+    for (const d of nameResult.docs || []) {
+      if (d && typeof d.name === "string" && d.name.trim()) existing.add(d.name.trim());
+    }
+    const newName = makeUniqueEntryFormCopyName(baseForm.name, existing);
+    const newFormDoc = buildEntryFormDocFromSource(baseForm, newName);
+    const formResult = await db.insert(newFormDoc);
+    res.status(201).json({ ok: true, id: formResult.id, rev: formResult.rev, name: newName });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Entry form not found" });
+    console.error("Error copying entry form:", err);
+    res.status(500).json({ error: err.message || "Copy failed" });
+  }
+});
+
 app.get("/api/apis", requireAdmin, async (req, res) => {
   try {
     if (!configDb) return res.status(503).json({ error: "Config store not available" });
@@ -2706,7 +2818,7 @@ app.get("/flows", requireAdmin, async (req, res) => {
     if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
     const result = await configDb.find({
       selector: { type: "elenko_flow" },
-      fields: ["_id", "name", "description", "steps"],
+      fields: ["_id", "_rev", "name", "description", "steps"],
       sort: [{ name: "asc" }],
       limit: 500,
     });
@@ -2783,6 +2895,63 @@ app.put("/api/flows/:id", requireAdmin, async (req, res) => {
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).json({ error: "Flow not found" });
     console.error("Error updating flow:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/flows/:id/copy", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    let baseFlow;
+    try {
+      baseFlow = await configDb.get(id);
+    } catch (e) {
+      if (e.statusCode === 404) return res.status(404).json({ error: "Flow not found" });
+      throw e;
+    }
+    if (!baseFlow || baseFlow.type !== "elenko_flow") {
+      return res.status(404).json({ error: "Flow not found" });
+    }
+    const nameResult = await configDb.find({
+      selector: { type: "elenko_flow" },
+      fields: ["name"],
+      limit: 5000,
+    });
+    const existing = new Set();
+    for (const d of nameResult.docs || []) {
+      if (d && typeof d.name === "string" && d.name.trim()) existing.add(d.name.trim());
+    }
+    const newName = makeUniqueFlowCopyName(baseFlow.name, existing);
+    const newDoc = buildFlowDocFromSource(baseFlow, newName);
+    const result = await configDb.insert(newDoc);
+    res.status(201).json({ ok: true, id: result.id, rev: result.rev, name: newName });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Flow not found" });
+    console.error("Error copying flow:", err);
+    res.status(500).json({ error: err.message || "Copy failed" });
+  }
+});
+
+app.post("/api/flows/:id/delete", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const { _rev } = req.body || {};
+    if (!_rev) return res.status(400).json({ error: "Missing _rev" });
+    const doc = await configDb.get(id);
+    if (!doc || doc.type !== "elenko_flow") {
+      return res.status(404).json({ error: "Flow not found" });
+    }
+    if (doc._rev !== _rev) {
+      return res.status(409).json({ error: "Flow was modified; refresh and try again" });
+    }
+    await configDb.destroy(id, _rev);
+    res.json({ ok: true, redirect: "/flows" });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Flow not found" });
+    if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict" });
+    console.error("Error deleting flow:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -3178,8 +3347,18 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       typeof mobileSingleEntryFormId === "string" && mobileSingleEntryFormId.trim()
         ? mobileSingleEntryFormId.trim()
         : "";
-    doc.mobileSingleEntryFormId =
-      mobileSingleId && updatedEntryFormIds.includes(mobileSingleId) ? mobileSingleId : "";
+    // Dropdown lists all entry forms; mobile form may differ from profile-linked forms.
+    // Persist if the id exists as an elenko_entry_form (not only when in entryFormIds).
+    let mobileToSave = "";
+    if (mobileSingleId) {
+      try {
+        const formDoc = await db.get(mobileSingleId);
+        if (formDoc && formDoc.type === "elenko_entry_form") mobileToSave = mobileSingleId;
+      } catch (e) {
+        if (e.statusCode !== 404) throw e;
+      }
+    }
+    doc.mobileSingleEntryFormId = mobileToSave;
     const importFlowIdNormalized =
       typeof infoImportFlowId === "string" && infoImportFlowId.trim()
         ? infoImportFlowId.trim()
@@ -3237,31 +3416,7 @@ app.post("/api/profiles/:id/entry-forms/clone-default", requireAdmin, async (req
     if (!baseForm || baseForm.type !== "elenko_entry_form") {
       return res.status(404).json({ error: "Default entry form not found" });
     }
-    const newFormDoc = {
-      type: "elenko_entry_form",
-      name: nameRaw,
-      labels: Array.isArray(baseForm.labels) ? baseForm.labels : [],
-      theme: baseForm.theme && typeof baseForm.theme === "object" ? baseForm.theme : DEFAULT_ENTRY_VIEW_THEME,
-      layout: baseForm.layout === "grid" || baseForm.layout === "stack" ? baseForm.layout : "table",
-      fieldLayout: Array.isArray(baseForm.fieldLayout) ? baseForm.fieldLayout : [],
-      customCss: baseForm.customCss != null ? String(baseForm.customCss) : "",
-      flowButtonEnabled: !!baseForm.flowButtonEnabled,
-      flowTarget: typeof baseForm.flowTarget === "string" ? baseForm.flowTarget : "log",
-      flowButtonLabel:
-        typeof baseForm.flowButtonLabel === "string" && baseForm.flowButtonLabel.trim()
-          ? baseForm.flowButtonLabel.trim()
-          : "Send to Flow",
-      flowButtonParam: typeof baseForm.flowButtonParam === "string" ? baseForm.flowButtonParam : "",
-      flowConfigs: Array.isArray(baseForm.flowConfigs) && baseForm.flowConfigs.length > 0
-        ? baseForm.flowConfigs.map((c) => ({
-            enabled: !!(c && c.enabled),
-            target: (c && c.target === "localDb") ? "localDb" : (c && c.target === "api") ? "api" : "log",
-            label: (c && typeof c.label === "string" && c.label.trim()) ? c.label.trim() : "Send to Flow",
-            param: (c && typeof c.param === "string") ? c.param.trim() : "",
-            flowId: (c && typeof c.flowId === "string") ? c.flowId.trim() : "",
-          }))
-        : [{ enabled: !!baseForm.flowButtonEnabled, target: typeof baseForm.flowTarget === "string" ? baseForm.flowTarget : "log", label: (typeof baseForm.flowButtonLabel === "string" && baseForm.flowButtonLabel.trim()) ? baseForm.flowButtonLabel.trim() : "Send to Flow", param: typeof baseForm.flowButtonParam === "string" ? baseForm.flowButtonParam : "", flowId: "" }],
-    };
+    const newFormDoc = buildEntryFormDocFromSource(baseForm, nameRaw);
     const formResult = await db.insert(newFormDoc);
     let latestProfile = await db.get(profileId);
     if (!latestProfile || latestProfile.type !== "elenko_profile") {
@@ -4368,9 +4523,18 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .label { color: var(--entry-label, #8b949e); width: 40%; }
     td.value { background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 6px; }
     .empty { color: var(--entry-label, #8b949e); font-style: italic; }
-    .entry-view-stack .entry-field-block { margin-bottom: 1rem; }
+    .entry-view-stack { --entry-stack-field-max-height: 12rem; }
+    .entry-view-stack .entry-field-block { margin-bottom: 1rem; min-width: 0; }
     .entry-view-stack .label { display: block; margin-bottom: 0.25rem; }
-    .entry-view-stack .value { background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 6px; padding: 0.75rem 1rem; }
+    .entry-view-stack .entry-field-block:not(.entry-label-only) .value {
+      max-height: var(--entry-stack-field-max-height, 12rem);
+      overflow-y: auto;
+      overflow-x: hidden;
+      background: var(--entry-field-bg, #161b22);
+      border: 1px solid var(--entry-field-border, #21262d);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+    }
     .entry-view-stack .entry-label-only .label { white-space: nowrap; }
     .entry-view-grid { display: grid; gap: 1rem; }
     .entry-grid-cell .label { display: block; margin-bottom: 0.25rem; color: var(--entry-label, #8b949e); }
@@ -4564,10 +4728,24 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     th, td { padding: 0.75rem 1rem; text-align: left; }
     .label { color: var(--entry-label, #8b949e); width: 40%; }
     td.value { background: var(--entry-field-bg-edit, #161b22); border-radius: 6px; }
+    .entry-view-stack { --entry-stack-field-max-height: 12rem; }
     .entry-view-stack .entry-field-block { margin-bottom: 1rem; min-width: 0; max-width: 100%; }
-    .entry-view-stack .entry-field-block .value { min-width: 0; overflow: hidden; background: var(--entry-field-bg-edit, #161b22); border-radius: 6px; padding: 0.75rem 1rem; }
+    .entry-view-stack .entry-field-block .value {
+      min-width: 0;
+      background: var(--entry-field-bg-edit, #161b22);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+    }
     .entry-view-stack .label { display: block; margin-bottom: 0.25rem; }
     .entry-view-stack .entry-label-only .label { white-space: nowrap; }
+    .entry-view-stack textarea.entry-field-textarea {
+      min-height: 5.5rem;
+      height: 11rem;
+      max-height: 11rem;
+      resize: vertical;
+      overflow-y: auto;
+      box-sizing: border-box;
+    }
     .entry-view-grid { display: grid; gap: 1rem; }
     .entry-grid-cell { min-width: 0; }
     .entry-grid-cell .label { display: block; margin-bottom: 0.25rem; color: var(--entry-label, #8b949e); }
@@ -4618,6 +4796,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       el.style.height = Math.max(el.scrollHeight, 88) + 'px';
     }
     Array.from(form.querySelectorAll('textarea.entry-field-textarea')).forEach((el) => {
+      if (el.closest('.entry-view-stack')) return;
       autoResizeTextarea(el);
       el.addEventListener('input', function() { autoResizeTextarea(el); });
     });
@@ -4708,6 +4887,11 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       ? mobileListFields
       : fieldNames.slice(0, maxMobileListFields);
   const mobileVisibleSet = new Set(effectiveMobileListFields);
+  /** First field in profile order — link target on wide layout (all columns visible). */
+  const desktopLinkField = fieldNames.length > 0 ? fieldNames[0] : null;
+  /** First field in the mobile list — link target on narrow layout (must work when it is not profile field #1). */
+  const mobileLinkField =
+    effectiveMobileListFields.length > 0 ? effectiveMobileListFields[0] : desktopLinkField;
 
   const themeVars = `
     :root {
@@ -4740,16 +4924,25 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   const dataRows =
     fieldNames.length > 0
       ? records.map((rec) => {
-          const cells = fieldNames.map((fn, i) => {
+          const cells = fieldNames.map((fn) => {
             const val = rec[fn];
             const text = val != null ? String(val) : "";
             const escaped = escapeHtml(text);
-          const bodyTextCls = (typeof fn === "string" && fn.trim().toLowerCase() === "bodytext") ? " col-bodytext" : "";
-          const mobileCls = (mobileVisibleSet.has(fn) ? " col-mobile-visible" : " col-mobile-hidden") + bodyTextCls;
-            if (i === 0) {
-              const entryUrl = "/profile/" + encodeURIComponent(doc._id) + "/entry/" + encodeURIComponent(rec._id) + returnQueryStr;
-              const linkText = text.trim().length > 0 ? escaped : "empty";
+            const bodyTextCls = (typeof fn === "string" && fn.trim().toLowerCase() === "bodytext") ? " col-bodytext" : "";
+            const mobileCls = (mobileVisibleSet.has(fn) ? " col-mobile-visible" : " col-mobile-hidden") + bodyTextCls;
+            const entryUrl = "/profile/" + encodeURIComponent(doc._id) + "/entry/" + encodeURIComponent(rec._id) + returnQueryStr;
+            const linkText = text.trim().length > 0 ? escaped : "empty";
+            const isDesktopLink = desktopLinkField != null && fn === desktopLinkField;
+            const isMobileLink = mobileLinkField != null && fn === mobileLinkField;
+
+            if (isDesktopLink && isMobileLink) {
               return `<td class="entry-link-cell${mobileCls}"><span class="entry-cell-clamp"><a href="${entryUrl}">${linkText}</a></span></td>`;
+            }
+            if (isDesktopLink && !isMobileLink) {
+              return `<td class="entry-link-cell${mobileCls}"><span class="entry-cell-clamp"><span class="entry-link-desktop-only"><a href="${entryUrl}">${linkText}</a></span><span class="entry-plain-mobile-only">${escaped}</span></span></td>`;
+            }
+            if (!isDesktopLink && isMobileLink) {
+              return `<td class="entry-link-cell${mobileCls}"><span class="entry-cell-clamp"><span class="entry-plain-desktop-only">${escaped}</span><span class="entry-link-mobile-only"><a href="${entryUrl}">${linkText}</a></span></span></td>`;
             }
             return `<td class="${mobileCls}"><span class="entry-cell-clamp">${escaped}</span></td>`;
           });
@@ -4809,10 +5002,16 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .guardian-import .guardian-msg { font-size: 0.875rem; color: var(--profile-label, #8b949e); }
     .guardian-import .guardian-msg.err { color: #f85149; }
     .guardian-import .guardian-msg.ok { color: #3fb950; }
+    .entry-plain-mobile-only,
+    .entry-link-mobile-only { display: none; }
     @media (max-width: 768px) {
       table { font-size: 0.9rem; }
       th.col-mobile-hidden,
       td.col-mobile-hidden { display: none; }
+      .entry-link-desktop-only { display: none; }
+      .entry-plain-mobile-only { display: inline; }
+      .entry-plain-desktop-only { display: none; }
+      .entry-link-mobile-only { display: inline; }
     }
   </style>
   ${customCss ? `<style>${customCss}</style>` : ""}
@@ -4974,7 +5173,7 @@ function renderEntryFormsListPage(forms, appUi) {
             (f) => `
         <tr>
           <td>${escapeHtml(f.name || f._id)}</td>
-          <td><a href="/entry-forms/${encodeURIComponent(f._id)}/edit" class="edit-link">Edit</a> <a href="/entry-forms/${encodeURIComponent(f._id)}/delete" class="delete-link">Delete</a></td>
+          <td class="row-actions"><a href="/entry-forms/${encodeURIComponent(f._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action" data-id="${escapeHtml(f._id)}" aria-label="Copy" title="Copy">⧉</button><a href="/entry-forms/${encodeURIComponent(f._id)}/delete" class="delete-link icon-action" aria-label="Delete" title="Delete">✕</a></td>
         </tr>`
           )
           .join("")
@@ -5007,9 +5206,35 @@ function renderEntryFormsListPage(forms, appUi) {
     th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
+    .row-actions { white-space: nowrap; }
+    .row-actions .icon-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 2rem;
+      min-height: 2rem;
+      margin: 0 0.15rem;
+      padding: 0.2rem 0.35rem;
+      font-size: 1.15rem;
+      line-height: 1;
+      vertical-align: middle;
+      text-decoration: none;
+      border-radius: 4px;
+    }
+    .row-actions .icon-action:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
     .edit-link { color: var(--app-link, #58a6ff); }
-    .delete-link { color: #f85149; margin-left: 0.5rem; }
-    .delete-link:hover { color: #ff7b72; }
+    .edit-link:hover { background: rgba(88, 166, 255, 0.12); }
+    .copy-btn {
+      border: none;
+      background: none;
+      color: var(--app-label, #8b949e);
+      font: inherit;
+      cursor: pointer;
+    }
+    .copy-btn:hover { color: var(--app-link, #58a6ff); background: rgba(88, 166, 255, 0.08); }
+    .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .delete-link { color: #f85149; }
+    .delete-link:hover { color: #ff7b72; background: rgba(248, 81, 73, 0.12); }
     .empty { color: var(--app-label, #8b949e); font-style: italic; }
   </style>
 </head>
@@ -5022,6 +5247,42 @@ function renderEntryFormsListPage(forms, appUi) {
     <tbody>${rows}
     </tbody>
   </table>
+  <div id="copy-msg" class="copy-msg" style="display:none;margin-top:0.75rem;font-size:0.875rem;"></div>
+  <script>
+    (function() {
+      var msgEl = document.getElementById('copy-msg');
+      document.querySelectorAll('.copy-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/entry-forms/' + encodeURIComponent(id) + '/copy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok && o.data && o.data.id) {
+                window.location.href = '/entry-forms/' + encodeURIComponent(o.data.id) + '/edit';
+                return;
+              }
+              if (msgEl) {
+                msgEl.style.display = 'block';
+                msgEl.style.color = '#f85149';
+                msgEl.textContent = (o.data && o.data.error) ? o.data.error : 'Copy failed';
+              }
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              if (msgEl) {
+                msgEl.style.display = 'block';
+                msgEl.style.color = '#f85149';
+                msgEl.textContent = e.message || 'Copy failed';
+              }
+            });
+        });
+      });
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -5117,7 +5378,7 @@ function renderFlowsListPage(flows, appUi) {
           <td><code class="id-cell">${escapeHtml(f._id || "")}</code></td>
           <td>${escapeHtml(truncate(f.description || "", 50))}</td>
           <td>${escapeHtml(stepSummary(f.steps))}</td>
-          <td><a href="/flows/${encodeURIComponent(f._id)}/edit" class="edit-link">Edit</a></td>
+          <td class="row-actions"><a href="/flows/${encodeURIComponent(f._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action flow-copy-btn" data-id="${escapeHtml(f._id)}" aria-label="Copy" title="Copy">⧉</button><button type="button" class="delete-btn icon-action delete-flow-btn" data-id="${escapeHtml(f._id)}" data-rev="${escapeHtml(f._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
         </tr>`
           )
           .join("")
@@ -5150,7 +5411,43 @@ function renderFlowsListPage(flows, appUi) {
     th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .edit-link { color: var(--app-link, #58a6ff); margin-right: 0.5rem; }
+    .row-actions { white-space: nowrap; }
+    .row-actions .icon-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 2rem;
+      min-height: 2rem;
+      margin: 0 0.15rem;
+      padding: 0.2rem 0.35rem;
+      font-size: 1.15rem;
+      line-height: 1;
+      vertical-align: middle;
+      text-decoration: none;
+      border-radius: 4px;
+    }
+    .row-actions .icon-action:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    .edit-link { color: var(--app-link, #58a6ff); }
+    .edit-link:hover { background: rgba(88, 166, 255, 0.12); }
+    .copy-btn {
+      border: none;
+      background: none;
+      color: var(--app-label, #8b949e);
+      font: inherit;
+      cursor: pointer;
+    }
+    .copy-btn:hover { color: var(--app-link, #58a6ff); background: rgba(88, 166, 255, 0.08); }
+    .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .delete-btn {
+      border: none;
+      background: none;
+      color: #f85149;
+      font: inherit;
+      cursor: pointer;
+      padding: 0.2rem 0.35rem;
+    }
+    .delete-btn:hover { color: #ff7b72; background: rgba(248, 81, 73, 0.12); }
+    .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .empty { color: var(--app-label, #8b949e); font-style: italic; }
     .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
   </style>
@@ -5164,6 +5461,68 @@ function renderFlowsListPage(flows, appUi) {
     <tbody>${rows}
     </tbody>
   </table>
+  <div id="flow-list-msg" class="flow-list-msg" style="display:none;margin-top:0.75rem;font-size:0.875rem;"></div>
+  <script>
+    (function() {
+      var msgEl = document.getElementById('flow-list-msg');
+      function showErr(t) {
+        if (!msgEl) return;
+        msgEl.style.display = 'block';
+        msgEl.style.color = '#f85149';
+        msgEl.textContent = t || 'Request failed';
+      }
+      document.querySelectorAll('.flow-copy-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/flows/' + encodeURIComponent(id) + '/copy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok && o.data && o.data.id) {
+                window.location.href = '/flows/' + encodeURIComponent(o.data.id) + '/edit';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Copy failed');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Copy failed');
+            });
+        });
+      });
+      document.querySelectorAll('.delete-flow-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          var rev = btn.getAttribute('data-rev');
+          if (!id || !rev) { showErr('Missing revision; refresh the page.'); return; }
+          if (!confirm('Delete this flow? Profiles or forms that reference it may need to be updated.')) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/flows/' + encodeURIComponent(id) + '/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ _rev: rev })
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok) {
+                window.location.href = o.data.redirect || '/flows';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Delete failed');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Delete failed');
+            });
+        });
+      });
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -6161,10 +6520,25 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
     .field-layout-table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
     .field-layout-table td { padding: 0.25rem; }
     .field-layout-table input { width: 100%; }
-    .theme-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
-    .theme-row label { margin: 0; flex: 0 0 10rem; }
-    .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; background: var(--app-table-bg, #161b22); }
-    .theme-row input[type="text"] { flex: 1; min-width: 8.5rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 0.875rem; }
+    .el-theme-colours { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem; width: 100%; }
+    .el-theme-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 2.5rem minmax(0, 1fr);
+      align-items: center;
+      gap: 0.5rem;
+      width: 100%;
+      min-width: 0;
+    }
+    .el-theme-row > label { display: block; margin: 0; font-size: 0.875rem; min-width: 0; word-break: break-word; }
+    .el-theme-row > input[type="color"] {
+      width: 2.5rem; height: 2.5rem; min-width: 2.5rem; min-height: 2.5rem; max-width: 2.5rem; max-height: 2.5rem;
+      padding: 2px; margin: 0; cursor: pointer; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px;
+      background: var(--app-table-bg, #161b22); box-sizing: border-box; justify-self: center;
+    }
+    .el-theme-row > input[type="text"] {
+      width: 100%; min-width: 0; margin: 0; padding: 0.5rem; background: var(--app-table-bg, #161b22);
+      border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 0.875rem;
+    }
     .flow-config-table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
     .flow-config-table th, .flow-config-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     .flow-config-table th { color: var(--app-table-header-text, #8b949e); font-weight: 600; font-size: 0.875rem; }
@@ -6188,15 +6562,15 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
     <input type="text" id="name" name="name" required placeholder="e.g. Compact dark" value="${name}">
     <label>Theme (colours)</label>
     <p class="sub" style="margin-top:0.25rem;">Click the swatch to open the colour picker.</p>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem 1rem;margin-top:0.5rem;">
-      <div class="theme-row"><label for="theme-background" style="margin-top:0;">Background</label><input type="color" id="theme-background-color" value="${background}" aria-label="Background"><input type="text" id="theme-background" placeholder="#0f1419" value="${background}"></div>
-      <div class="theme-row"><label for="theme-text" style="margin-top:0;">Text</label><input type="color" id="theme-text-color" value="${text}" aria-label="Text"><input type="text" id="theme-text" placeholder="#e6edf3" value="${text}"></div>
-      <div class="theme-row"><label for="theme-label" style="margin-top:0;">Label</label><input type="color" id="theme-label-color" value="${label}" aria-label="Label"><input type="text" id="theme-label" placeholder="#8b949e" value="${label}"></div>
-      <div class="theme-row"><label for="theme-link" style="margin-top:0;">Link</label><input type="color" id="theme-link-color" value="${link}" aria-label="Link"><input type="text" id="theme-link" placeholder="#58a6ff" value="${link}"></div>
-      <div class="theme-row"><label for="theme-fieldBorder" style="margin-top:0;">Field border</label><input type="color" id="theme-fieldBorder-color" value="${fieldBorder}" aria-label="Field border"><input type="text" id="theme-fieldBorder" placeholder="#21262d" value="${fieldBorder}"></div>
-      <div class="theme-row"><label for="theme-fieldBackground" style="margin-top:0;">Field background</label><input type="color" id="theme-fieldBackground-color" value="${fieldBackground}" aria-label="Field background"><input type="text" id="theme-fieldBackground" placeholder="#161b22" value="${fieldBackground}"></div>
-      <div class="theme-row"><label for="theme-fieldBackgroundEdit" style="margin-top:0;">Field background (edit)</label><input type="color" id="theme-fieldBackgroundEdit-color" value="${fieldBackgroundEdit}" aria-label="Field background edit"><input type="text" id="theme-fieldBackgroundEdit" placeholder="#161b22" value="${fieldBackgroundEdit}"></div>
-      <div class="theme-row"><label for="theme-textEdit" style="margin-top:0;">Text (edit)</label><input type="color" id="theme-textEdit-color" value="${textEdit}" aria-label="Text edit"><input type="text" id="theme-textEdit" placeholder="#e6edf3" value="${textEdit}"></div>
+    <div class="el-theme-colours">
+      <div class="el-theme-row"><label for="theme-background-color">Background</label><input type="color" id="theme-background-color" value="${background}" aria-label="Background"><input type="text" id="theme-background" placeholder="#0f1419" value="${background}"></div>
+      <div class="el-theme-row"><label for="theme-text-color">Text</label><input type="color" id="theme-text-color" value="${text}" aria-label="Text"><input type="text" id="theme-text" placeholder="#e6edf3" value="${text}"></div>
+      <div class="el-theme-row"><label for="theme-label-color">Label</label><input type="color" id="theme-label-color" value="${label}" aria-label="Label"><input type="text" id="theme-label" placeholder="#8b949e" value="${label}"></div>
+      <div class="el-theme-row"><label for="theme-link-color">Link</label><input type="color" id="theme-link-color" value="${link}" aria-label="Link"><input type="text" id="theme-link" placeholder="#58a6ff" value="${link}"></div>
+      <div class="el-theme-row"><label for="theme-fieldBorder-color">Field border</label><input type="color" id="theme-fieldBorder-color" value="${fieldBorder}" aria-label="Field border"><input type="text" id="theme-fieldBorder" placeholder="#21262d" value="${fieldBorder}"></div>
+      <div class="el-theme-row"><label for="theme-fieldBackground-color">Field background</label><input type="color" id="theme-fieldBackground-color" value="${fieldBackground}" aria-label="Field background"><input type="text" id="theme-fieldBackground" placeholder="#161b22" value="${fieldBackground}"></div>
+      <div class="el-theme-row"><label for="theme-fieldBackgroundEdit-color">Field background (edit)</label><input type="color" id="theme-fieldBackgroundEdit-color" value="${fieldBackgroundEdit}" aria-label="Field background edit"><input type="text" id="theme-fieldBackgroundEdit" placeholder="#161b22" value="${fieldBackgroundEdit}"></div>
+      <div class="el-theme-row"><label for="theme-textEdit-color">Text (edit)</label><input type="color" id="theme-textEdit-color" value="${textEdit}" aria-label="Text edit"><input type="text" id="theme-textEdit" placeholder="#e6edf3" value="${textEdit}"></div>
     </div>
     <label for="layout">Layout</label>
     <p class="sub" style="margin-top:0.25rem;">Table layout is the default and generates a two-column table. The first column contains the field names, the second the values. Grid layout places all fields in one row. Stack layout allows positioning the fields directly.</p>
@@ -6889,10 +7263,50 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     .flow-config-table tbody tr:last-child td { border-bottom: none; }
     .flow-config-table input[type="text"] { margin: 0; }
     .flow-config-table select { margin: 0; min-width: 10rem; }
-    .theme-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
-    .theme-row label { margin: 0; flex: 0 0 8rem; }
-    .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; background: var(--app-table-bg, #161b22); }
-    .theme-row input[type="text"] { flex: 1; min-width: 8.5rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 0.875rem; }
+    /* Theme colours: one full-width row per colour — label | swatch | hex (CSS Grid; not 2-column layout). */
+    .el-theme-colours { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem; width: 100%; }
+    .el-theme-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 2.5rem minmax(0, 1fr);
+      align-items: center;
+      gap: 0.5rem;
+      width: 100%;
+      min-width: 0;
+    }
+    .el-theme-row > label {
+      display: block;
+      margin: 0;
+      font-size: 0.875rem;
+      min-width: 0;
+      word-break: break-word;
+    }
+    .el-theme-row > input[type="color"] {
+      width: 2.5rem;
+      height: 2.5rem;
+      min-width: 2.5rem;
+      min-height: 2.5rem;
+      max-width: 2.5rem;
+      max-height: 2.5rem;
+      padding: 2px;
+      margin: 0;
+      cursor: pointer;
+      border: 1px solid var(--app-table-border, #30363d);
+      border-radius: 4px;
+      background: var(--app-table-bg, #161b22);
+      box-sizing: border-box;
+      justify-self: center;
+    }
+    .el-theme-row > input[type="text"] {
+      width: 100%;
+      min-width: 0;
+      margin: 0;
+      padding: 0.5rem;
+      background: var(--app-table-bg, #161b22);
+      border: 1px solid var(--app-table-border, #30363d);
+      border-radius: 6px;
+      color: var(--app-text, #e6edf3);
+      font-size: 0.875rem;
+    }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
@@ -6925,15 +7339,15 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     <button type="button" class="btn btn-secondary" id="add-field">+ Add field</button>
     <label>Theme (colours)</label>
     <p class="sub" style="margin-top:0.25rem;">Colours for the full database (list) view: background, table, links, etc. Click the swatch to open the colour picker.</p>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem 1rem;margin-top:0.5rem;">
-      <div class="theme-row"><label for="theme-background" style="margin-top:0;">Background</label><input type="color" id="theme-background" value="${escapeHtml(themeBg)}" aria-label="Background colour"><input type="text" id="theme-background-hex" value="${escapeHtml(themeBg)}" placeholder="#0f1419"></div>
-      <div class="theme-row"><label for="theme-text" style="margin-top:0;">Text</label><input type="color" id="theme-text" value="${escapeHtml(themeText)}" aria-label="Text colour"><input type="text" id="theme-text-hex" value="${escapeHtml(themeText)}" placeholder="#e6edf3"></div>
-      <div class="theme-row"><label for="theme-label" style="margin-top:0;">Label</label><input type="color" id="theme-label" value="${escapeHtml(themeLabel)}" aria-label="Label colour"><input type="text" id="theme-label-hex" value="${escapeHtml(themeLabel)}" placeholder="#8b949e"></div>
-      <div class="theme-row"><label for="theme-link" style="margin-top:0;">Link</label><input type="color" id="theme-link" value="${escapeHtml(themeLink)}" aria-label="Link colour"><input type="text" id="theme-link-hex" value="${escapeHtml(themeLink)}" placeholder="#58a6ff"></div>
-      <div class="theme-row"><label for="theme-tableBg" style="margin-top:0;">Table background</label><input type="color" id="theme-tableBg" value="${escapeHtml(themeTableBg)}" aria-label="Table background"><input type="text" id="theme-tableBg-hex" value="${escapeHtml(themeTableBg)}" placeholder="#161b22"></div>
-      <div class="theme-row"><label for="theme-tableHeaderBg" style="margin-top:0;">Table header bg</label><input type="color" id="theme-tableHeaderBg" value="${escapeHtml(themeTableHeaderBg)}" aria-label="Table header background"><input type="text" id="theme-tableHeaderBg-hex" value="${escapeHtml(themeTableHeaderBg)}" placeholder="#21262d"></div>
-      <div class="theme-row"><label for="theme-tableHeaderText" style="margin-top:0;">Table header text</label><input type="color" id="theme-tableHeaderText" value="${escapeHtml(themeTableHeaderText)}" aria-label="Table header text"><input type="text" id="theme-tableHeaderText-hex" value="${escapeHtml(themeTableHeaderText)}" placeholder="#8b949e"></div>
-      <div class="theme-row"><label for="theme-tableBorder" style="margin-top:0;">Table border</label><input type="color" id="theme-tableBorder" value="${escapeHtml(themeTableBorder)}" aria-label="Table border"><input type="text" id="theme-tableBorder-hex" value="${escapeHtml(themeTableBorder)}" placeholder="#21262d"></div>
+    <div class="el-theme-colours">
+      <div class="el-theme-row"><label for="theme-background">Background</label><input type="color" id="theme-background" value="${escapeHtml(themeBg)}" aria-label="Background colour"><input type="text" id="theme-background-hex" value="${escapeHtml(themeBg)}" placeholder="#0f1419"></div>
+      <div class="el-theme-row"><label for="theme-text">Text</label><input type="color" id="theme-text" value="${escapeHtml(themeText)}" aria-label="Text colour"><input type="text" id="theme-text-hex" value="${escapeHtml(themeText)}" placeholder="#e6edf3"></div>
+      <div class="el-theme-row"><label for="theme-label">Label</label><input type="color" id="theme-label" value="${escapeHtml(themeLabel)}" aria-label="Label colour"><input type="text" id="theme-label-hex" value="${escapeHtml(themeLabel)}" placeholder="#8b949e"></div>
+      <div class="el-theme-row"><label for="theme-link">Link</label><input type="color" id="theme-link" value="${escapeHtml(themeLink)}" aria-label="Link colour"><input type="text" id="theme-link-hex" value="${escapeHtml(themeLink)}" placeholder="#58a6ff"></div>
+      <div class="el-theme-row"><label for="theme-tableBg">Table background</label><input type="color" id="theme-tableBg" value="${escapeHtml(themeTableBg)}" aria-label="Table background"><input type="text" id="theme-tableBg-hex" value="${escapeHtml(themeTableBg)}" placeholder="#161b22"></div>
+      <div class="el-theme-row"><label for="theme-tableHeaderBg">Table header bg</label><input type="color" id="theme-tableHeaderBg" value="${escapeHtml(themeTableHeaderBg)}" aria-label="Table header background"><input type="text" id="theme-tableHeaderBg-hex" value="${escapeHtml(themeTableHeaderBg)}" placeholder="#21262d"></div>
+      <div class="el-theme-row"><label for="theme-tableHeaderText">Table header text</label><input type="color" id="theme-tableHeaderText" value="${escapeHtml(themeTableHeaderText)}" aria-label="Table header text"><input type="text" id="theme-tableHeaderText-hex" value="${escapeHtml(themeTableHeaderText)}" placeholder="#8b949e"></div>
+      <div class="el-theme-row"><label for="theme-tableBorder">Table border</label><input type="color" id="theme-tableBorder" value="${escapeHtml(themeTableBorder)}" aria-label="Table border"><input type="text" id="theme-tableBorder-hex" value="${escapeHtml(themeTableBorder)}" placeholder="#21262d"></div>
     </div>
     <label for="customCss">Custom CSS</label>
     <textarea id="customCss" name="customCss" placeholder="Optional CSS applied to the full database (list) view only">${customCss}</textarea>
@@ -6956,12 +7370,12 @@ function renderEditProfilePage(doc, forms = [], appUi) {
         .join("")}
     </select>
     <label for="infoImportFlowId" style="margin-top:1.5rem;">Information Import flow ID</label>
-    <p class="sub" style="margin-top:0.25rem;">Optional. When set, the profile page shows an import query field and button that runs this flow. The entered query is sent in the dataset as <code>query</code> (and also <code>guardianQuery</code> for compatibility), so you can reference it in API templates with placeholders like <code>#query#</code>.</p>
+    <p class="sub" style="margin-top:0.25rem;">Optional. When set, the profile page shows an import query field and button that runs this flow. The entered query is sent in the dataset as <code>query</code>, so you can reference it in API templates with placeholders like <code>#query#</code>.</p>
     <input type="text" id="infoImportFlowId" name="infoImportFlowId" placeholder="Flow ID or name" value="${escapeHtml(infoImportFlowId)}">
     <label for="infoImportButtonTitle" style="margin-top:0.75rem;">Information Import button title</label>
     <p class="sub" style="margin-top:0.25rem;">Text shown on the import button in the database view.</p>
     <input type="text" id="infoImportButtonTitle" name="infoImportButtonTitle" placeholder="e.g. Import from Guardian" value="${escapeHtml(infoImportButtonTitle)}">
-    <label style="margin-top:1.5rem;">Visible fields in entry list (up to 3)</label>
+    <label style="margin-top:1.5rem;">Visible fields in Mobile entry list (up to 3)</label>
     <p class="sub" style="margin-top:0.25rem;">On narrow screens (mobile), only these columns stay visible in the entries table. If empty, the first fields are used.</p>
     <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:center;margin-top:0.5rem;">
       <div><label for="listField1" style="margin:0;font-size:0.875rem;">1</label><br>${listFieldSelect1}</div>
@@ -7677,11 +8091,23 @@ function renderEditAppConfigPage(appUi, err) {
     .actions a:hover { text-decoration: underline; }
     .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
     .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
-    .theme-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 1rem; margin-top: 0.5rem; }
-    .theme-row { display: flex; align-items: center; gap: 0.5rem; }
-    .theme-row label { margin: 0; flex: 0 0 6rem; }
-    .theme-row input[type="color"] { width: 2.5rem; height: 2rem; padding: 2px; cursor: pointer; border: 1px solid #30363d; border-radius: 4px; background: #161b22; }
-    .theme-row input[type="text"] { flex: 1; min-width: 8.5rem; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.875rem; }
+    .el-theme-colours { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem; width: 100%; }
+    .el-theme-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 2.5rem minmax(0, 1fr);
+      align-items: center;
+      gap: 0.5rem;
+      width: 100%;
+      min-width: 0;
+    }
+    .el-theme-row > label { display: block; margin: 0; font-size: 0.875rem; min-width: 0; word-break: break-word; }
+    .el-theme-row > input[type="color"] {
+      width: 2.5rem; height: 2.5rem; min-width: 2.5rem; min-height: 2.5rem; max-width: 2.5rem; max-height: 2.5rem;
+      padding: 2px; margin: 0; cursor: pointer; border: 1px solid #30363d; border-radius: 4px; background: #161b22; box-sizing: border-box; justify-self: center;
+    }
+    .el-theme-row > input[type="text"] {
+      width: 100%; min-width: 0; margin: 0; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.875rem;
+    }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .logo-preview { margin-top: 0.75rem; }
@@ -7703,15 +8129,15 @@ function renderEditAppConfigPage(appUi, err) {
     ${rev ? `<input type="hidden" id="appConfigRev" name="_rev" value="${escapeHtml(rev)}">` : ""}
     <label>Theme (colours)</label>
     <p class="sub" style="margin-top:0.25rem;">Click the swatch to pick a colour, or edit the hex value.</p>
-    <div class="theme-grid">
-      <div class="theme-row"><label for="theme-background">Background</label><input type="color" id="theme-background" value="${escapeHtml(bg)}"><input type="text" id="theme-background-hex" value="${escapeHtml(bg)}" placeholder="#0f1419"></div>
-      <div class="theme-row"><label for="theme-text">Text</label><input type="color" id="theme-text" value="${escapeHtml(text)}"><input type="text" id="theme-text-hex" value="${escapeHtml(text)}" placeholder="#e6edf3"></div>
-      <div class="theme-row"><label for="theme-label">Label</label><input type="color" id="theme-label" value="${escapeHtml(label)}"><input type="text" id="theme-label-hex" value="${escapeHtml(label)}" placeholder="#8b949e"></div>
-      <div class="theme-row"><label for="theme-link">Link</label><input type="color" id="theme-link" value="${escapeHtml(link)}"><input type="text" id="theme-link-hex" value="${escapeHtml(link)}" placeholder="#58a6ff"></div>
-      <div class="theme-row"><label for="theme-tableBg">Table background</label><input type="color" id="theme-tableBg" value="${escapeHtml(tableBg)}"><input type="text" id="theme-tableBg-hex" value="${escapeHtml(tableBg)}" placeholder="#161b22"></div>
-      <div class="theme-row"><label for="theme-tableHeaderBg">Table header bg</label><input type="color" id="theme-tableHeaderBg" value="${escapeHtml(tableHeaderBg)}"><input type="text" id="theme-tableHeaderBg-hex" value="${escapeHtml(tableHeaderBg)}" placeholder="#21262d"></div>
-      <div class="theme-row"><label for="theme-tableHeaderText">Table header text</label><input type="color" id="theme-tableHeaderText" value="${escapeHtml(tableHeaderText)}"><input type="text" id="theme-tableHeaderText-hex" value="${escapeHtml(tableHeaderText)}" placeholder="#8b949e"></div>
-      <div class="theme-row"><label for="theme-tableBorder">Table border</label><input type="color" id="theme-tableBorder" value="${escapeHtml(tableBorder)}"><input type="text" id="theme-tableBorder-hex" value="${escapeHtml(tableBorder)}" placeholder="#21262d"></div>
+    <div class="el-theme-colours">
+      <div class="el-theme-row"><label for="theme-background">Background</label><input type="color" id="theme-background" value="${escapeHtml(bg)}"><input type="text" id="theme-background-hex" value="${escapeHtml(bg)}" placeholder="#0f1419"></div>
+      <div class="el-theme-row"><label for="theme-text">Text</label><input type="color" id="theme-text" value="${escapeHtml(text)}"><input type="text" id="theme-text-hex" value="${escapeHtml(text)}" placeholder="#e6edf3"></div>
+      <div class="el-theme-row"><label for="theme-label">Label</label><input type="color" id="theme-label" value="${escapeHtml(label)}"><input type="text" id="theme-label-hex" value="${escapeHtml(label)}" placeholder="#8b949e"></div>
+      <div class="el-theme-row"><label for="theme-link">Link</label><input type="color" id="theme-link" value="${escapeHtml(link)}"><input type="text" id="theme-link-hex" value="${escapeHtml(link)}" placeholder="#58a6ff"></div>
+      <div class="el-theme-row"><label for="theme-tableBg">Table background</label><input type="color" id="theme-tableBg" value="${escapeHtml(tableBg)}"><input type="text" id="theme-tableBg-hex" value="${escapeHtml(tableBg)}" placeholder="#161b22"></div>
+      <div class="el-theme-row"><label for="theme-tableHeaderBg">Table header bg</label><input type="color" id="theme-tableHeaderBg" value="${escapeHtml(tableHeaderBg)}"><input type="text" id="theme-tableHeaderBg-hex" value="${escapeHtml(tableHeaderBg)}" placeholder="#21262d"></div>
+      <div class="el-theme-row"><label for="theme-tableHeaderText">Table header text</label><input type="color" id="theme-tableHeaderText" value="${escapeHtml(tableHeaderText)}"><input type="text" id="theme-tableHeaderText-hex" value="${escapeHtml(tableHeaderText)}" placeholder="#8b949e"></div>
+      <div class="el-theme-row"><label for="theme-tableBorder">Table border</label><input type="color" id="theme-tableBorder" value="${escapeHtml(tableBorder)}"><input type="text" id="theme-tableBorder-hex" value="${escapeHtml(tableBorder)}" placeholder="#21262d"></div>
     </div>
     <label for="logoUrl">Logo / header image URL</label>
     <input type="text" id="logoUrl" name="logoUrl" placeholder="/logo.png or https://…" value="${escapeHtml(logoUrl)}">
