@@ -28,7 +28,12 @@ const SORT_KEY_SPECIAL = ["createdAt", "updatedAt"];
 const SORT_KEY_FIELDS_MAX = 3;
 const DEFAULT_VALUE_SOURCES = ["", "createdAt", "updatedAt", "currentUser"];
 
-const FAVICON_LINKS = "<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/x-icon\"><link rel=\"shortcut icon\" href=\"/favicon.ico\" type=\"image/x-icon\"><link rel=\"icon\" type=\"image/png\" sizes=\"16x16\" href=\"/favicon16.png\"><link rel=\"icon\" type=\"image/png\" sizes=\"32x32\" href=\"/favicon32.png\">";
+/** PNG names must match files in public/ (see README-favicon.txt). Order: sized PNGs first, then .ico fallback — works reliably in Firefox + Chrome. */
+const FAVICON_LINKS =
+  '<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">' +
+  '<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">' +
+  '<link rel="icon" href="/favicon.ico" sizes="any" type="image/x-icon">' +
+  '<link rel="apple-touch-icon" href="/apple-touch-icon.png">';
 
 function normalizeFieldDefaultSources(fieldNames, raw) {
   const len = Array.isArray(fieldNames) ? fieldNames.length : 0;
@@ -41,6 +46,77 @@ function normalizeFieldDefaultSources(fieldNames, raw) {
     result.push(allowed.has(s) ? s : "");
   }
   return result;
+}
+
+/** Desktop list column display: Auto | Hide | 10%…50%. Stored parallel to fieldNames. */
+const FIELD_DISPLAY_PCT_VALUES = new Set([10, 20, 30, 40, 50]);
+
+function parseFieldDisplayToken(raw) {
+  if (raw == null || typeof raw !== "string") return "auto";
+  const t = raw.trim().toLowerCase();
+  if (t === "auto" || t === "hide") return t;
+  const m = t.match(/^(\d{1,2})%$/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (FIELD_DISPLAY_PCT_VALUES.has(n)) return `${n}%`;
+  }
+  return "auto";
+}
+
+function normalizeFieldDisplay(fieldNames, raw) {
+  const len = Array.isArray(fieldNames) ? fieldNames.length : 0;
+  const arr = Array.isArray(raw) ? raw : [];
+  const result = [];
+  for (let i = 0; i < len; i++) {
+    result.push(parseFieldDisplayToken(arr[i]));
+  }
+  return result;
+}
+
+/**
+ * Desktop Elenko list table: Hide hides column on wide view only; %-columns are scaled so their widths sum to 100%.
+ * Auto columns share remaining width (table-layout: fixed).
+ */
+function computeFieldDisplayForTable(fieldNames, fieldDisplayRaw) {
+  const displays = normalizeFieldDisplay(fieldNames, fieldDisplayRaw);
+  const n = fieldNames.length;
+  const pctEntries = [];
+  let sumRaw = 0;
+  for (let i = 0; i < n; i++) {
+    if (displays[i] === "hide") continue;
+    const m = String(displays[i]).match(/^(\d+)%$/);
+    if (m) {
+      const v = parseInt(m[1], 10);
+      pctEntries.push({ i, v });
+      sumRaw += v;
+    }
+  }
+  const normMap = new Map();
+  if (pctEntries.length > 0 && sumRaw > 0) {
+    const scale = 100 / sumRaw;
+    for (const { i, v } of pctEntries) {
+      normMap.set(i, v * scale);
+    }
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    if (displays[i] === "hide") {
+      out.push({ desktopHidden: true, widthMode: "hide", widthStyle: "" });
+    } else if (displays[i] === "auto") {
+      out.push({ desktopHidden: false, widthMode: "auto", widthStyle: "" });
+    } else if (normMap.has(i)) {
+      const pct = normMap.get(i);
+      const rounded = Math.round(pct * 10000) / 10000;
+      out.push({
+        desktopHidden: false,
+        widthMode: "pct",
+        widthStyle: `width: ${rounded}%;`,
+      });
+    } else {
+      out.push({ desktopHidden: false, widthMode: "auto", widthStyle: "" });
+    }
+  }
+  return out;
 }
 
 function formatDateTimeLocal(d) {
@@ -303,6 +379,46 @@ function makeUniqueFlowCopyName(originalName, existingNames) {
   return makeUniqueCopyOfLabel(originalName, existingNames, "flow");
 }
 
+function makeUniqueApiCopyName(originalName, existingNames) {
+  return makeUniqueCopyOfLabel(originalName, existingNames, "API");
+}
+
+function makeUniqueJsProcessingCopyName(originalName, existingNames) {
+  return makeUniqueCopyOfLabel(originalName, existingNames, "script");
+}
+
+/** New elenko_js_processing document from an existing one (new _id; hash recomputed). */
+function buildJsProcessingDocFromSource(baseDoc, name) {
+  const script = typeof baseDoc.script === "string" ? baseDoc.script : "";
+  const timeout = Math.min(Math.max(Number(baseDoc.timeout) || 5000, 100), 60000);
+  return {
+    type: "elenko_js_processing",
+    name,
+    description: typeof baseDoc.description === "string" ? baseDoc.description.trim() : "",
+    script,
+    timeout,
+    hash: computeScriptHash(script),
+  };
+}
+
+/** New elenko_api document from an existing API (new _id; apiKeyRef cleared). */
+function buildApiDocFromSource(baseApi, name) {
+  return {
+    type: "elenko_api",
+    name,
+    description: typeof baseApi.description === "string" ? baseApi.description.trim() : "",
+    url: typeof baseApi.url === "string" ? baseApi.url.trim() : "",
+    method: baseApi.method === "POST" || baseApi.method === "PUT" || baseApi.method === "PATCH" ? baseApi.method : "GET",
+    apiKeyRef: "",
+    responseTarget:
+      baseApi.responseTarget === "create" ? "create" : baseApi.responseTarget === "forward" ? "forward" : "update",
+    template: typeof baseApi.template === "string" ? baseApi.template.trim() : "",
+    responseField: typeof baseApi.responseField === "string" ? baseApi.responseField.trim() : "",
+    responseStart: typeof baseApi.responseStart === "string" ? baseApi.responseStart : "",
+    responseEnd: typeof baseApi.responseEnd === "string" ? baseApi.responseEnd : "",
+  };
+}
+
 /** New elenko_flow document from an existing flow (new _id on insert). */
 function buildFlowDocFromSource(baseFlow, name) {
   return {
@@ -313,9 +429,83 @@ function buildFlowDocFromSource(baseFlow, name) {
   };
 }
 
+function makeUniqueProfileCopyName(originalName, existingNames) {
+  return makeUniqueCopyOfLabel(originalName, existingNames, "profile");
+}
+
+/** Deep clone elenko_profile for Copy (new _id on insert). */
+function buildProfileDocFromSource(baseProfile, name) {
+  const raw = JSON.parse(JSON.stringify(baseProfile));
+  delete raw._id;
+  delete raw._rev;
+  raw.type = "elenko_profile";
+  raw.name = name;
+  raw.createdAt = new Date().toISOString();
+  return raw;
+}
+
 function escapeRegex(s) {
   return String(s).replace(/[\\^$.*+?()|[\]{}]/g, "\\$&");
 }
+
+/** One semicolon-separated CSV line; supports "quoted" fields and doubled quotes (""). */
+function splitSemicolonCsvLine(line) {
+  const out = [];
+  let cur = "";
+  let i = 0;
+  let inQuotes = false;
+  const s = String(line);
+  while (i < s.length) {
+    const c = s[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (s[i + 1] === '"') {
+          cur += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+        i++;
+        continue;
+      }
+      cur += c;
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      inQuotes = true;
+      i++;
+      continue;
+    }
+    if (c === ";") {
+      out.push(cur);
+      cur = "";
+      i++;
+      continue;
+    }
+    cur += c;
+    i++;
+  }
+  out.push(cur);
+  return out.map((cell) => String(cell).trim());
+}
+
+function parseSemicolonCsvText(text) {
+  const normalized = String(text).replace(/^\uFEFF/, "");
+  const lines = normalized.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const rows = lines.map((line) => splitSemicolonCsvLine(line));
+  while (rows.length > 0 && rows[rows.length - 1].every((c) => String(c).trim() === "")) {
+    rows.pop();
+  }
+  return rows;
+}
+
+function csvDataRowIsEmpty(row) {
+  if (!row || !row.length) return true;
+  return row.every((c) => String(c).trim() === "");
+}
+
+const MAX_CSV_IMPORT_ROWS = 50000;
 
 function normalizeFlowSteps(steps) {
   if (!Array.isArray(steps) || steps.length === 0) return [{ target: "log", param: "", label: "Log" }];
@@ -1341,20 +1531,34 @@ function verifyPassword(password, storedHash, storedSalt) {
   return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(storedHash, "hex"));
 }
 
+/** API routes should return JSON so fetch().json() does not fail on HTML error pages. */
+function wantsJsonApiResponse(req) {
+  return typeof req.path === "string" && req.path.startsWith("/api/");
+}
+
 function requireAuth(req, res, next) {
   if (req.session && req.session.user) return next();
   if (req.method === "GET" && req.path === "/") return res.redirect("/login");
+  if (wantsJsonApiResponse(req)) {
+    return res.status(401).json({ error: "Authentication required" });
+  }
   res.status(401).set("Content-Type", "text/html; charset=utf-8").send(renderLoginRequiredPage());
 }
 
 function requireAdmin(req, res, next) {
   if (req.session && req.session.role === "admin") return next();
+  if (wantsJsonApiResponse(req)) {
+    return res.status(403).json({ error: "Admin access required" });
+  }
   res.status(403).set("Content-Type", "text/html; charset=utf-8").send(renderForbiddenPage());
 }
 
 function requireEditor(req, res, next) {
   const role = req.session && req.session.role;
   if (role === "admin" || role === "editor" || role === "user") return next();
+  if (wantsJsonApiResponse(req)) {
+    return res.status(403).json({ error: "Access denied" });
+  }
   res.status(403).set("Content-Type", "text/html; charset=utf-8").send(renderForbiddenPage());
 }
 
@@ -1703,8 +1907,8 @@ async function initCouch(options) {
   }
 }
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "15mb" }));
+app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "elenko-session-secret",
@@ -1915,6 +2119,24 @@ app.get("/logout", (req, res) => {
   res.redirect("/login");
 });
 
+/** Favicon: correct Content-Type + cache; legacy redirects for old misspelled PNG URLs (404 broke Firefox tab icons). */
+function servePublicAsset(relPath, contentType) {
+  return (req, res) => {
+    const filePath = path.join(PUBLIC_DIR, relPath);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.setHeader("Content-Type", contentType);
+    res.sendFile(filePath, (err) => {
+      if (err && !res.headersSent) res.status(404).end();
+    });
+  };
+}
+app.get("/favicon.ico", servePublicAsset("favicon.ico", "image/x-icon"));
+app.get("/favicon-16x16.png", servePublicAsset("favicon-16x16.png", "image/png"));
+app.get("/favicon-32x32.png", servePublicAsset("favicon-32x32.png", "image/png"));
+app.get("/apple-touch-icon.png", servePublicAsset("apple-touch-icon.png", "image/png"));
+app.get("/favicon16.png", (_req, res) => res.redirect(301, "/favicon-16x16.png"));
+app.get("/favicon32.png", (_req, res) => res.redirect(301, "/favicon-32x32.png"));
+
 app.use(express.static(path.join(__dirname, "public")));
 app.use(requireAuth);
 
@@ -1932,6 +2154,23 @@ app.get("/", async (req, res) => {
     res.send(renderStartPage(profiles, role, appUi));
   } catch (err) {
     console.error("Error loading profiles:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/profiles", requireAdmin, async (req, res) => {
+  try {
+    const result = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "_rev", "name", "description", "createdAt"],
+      sort: [{ name: "asc" }],
+    });
+    const profiles = result.docs || [];
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderProfilesListPage(profiles, appUi));
+  } catch (err) {
+    console.error("Error loading profiles list:", err);
     res.status(500).send(renderErrorPage(err.message));
   }
 });
@@ -2067,6 +2306,194 @@ app.get("/config-export-import", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("Error loading config export/import page:", err);
     res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/data-export-import", requireAdmin, async (req, res) => {
+  try {
+    const result = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "name"],
+      sort: [{ name: "asc" }],
+    });
+    const profiles = result.docs || [];
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderDataExportImportPage(profiles, appUi));
+  } catch (err) {
+    console.error("Error loading data export/import page:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
+  const profileId = req.params.id;
+  try {
+    const body = req.body || {};
+    const csvText = typeof body.csvText === "string" ? body.csvText : "";
+    const firstRowHeaders = !!body.firstRowHeaders;
+    console.log("[import-data] request", {
+      profileId,
+      method: req.method,
+      path: req.path,
+      contentType: req.get("content-type"),
+      contentLength: req.get("content-length"),
+      bodyKeys: body && typeof body === "object" ? Object.keys(body) : [],
+      confirmUnmatchedHeaders: !!body.confirmUnmatchedHeaders,
+      csvTextType: typeof body.csvText,
+      csvTextLength: typeof csvText === "string" ? csvText.length : 0,
+      csvTextPreview:
+        typeof csvText === "string" && csvText.length > 0
+          ? csvText.slice(0, 200).replace(/\r/g, "\\r").replace(/\n/g, "\\n")
+          : "",
+      firstRowHeaders,
+      user: req.session && req.session.user,
+      role: req.session && req.session.role,
+    });
+    if (!csvText.trim()) {
+      console.warn("[import-data] rejected: empty csvText", { profileId });
+      return res.status(400).json({ error: "CSV content is empty." });
+    }
+    let profileDoc;
+    try {
+      profileDoc = await db.get(profileId);
+    } catch (e) {
+      if (e.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
+      throw e;
+    }
+    if (!profileDoc || profileDoc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+    if (fieldNames.length === 0) {
+      return res.status(400).json({ error: "This profile has no field names defined." });
+    }
+
+    const rows = parseSemicolonCsvText(csvText);
+    if (rows.length === 0) {
+      return res.status(400).json({ error: "No rows found in the CSV file." });
+    }
+
+    const confirmUnmatchedHeaders = !!body.confirmUnmatchedHeaders;
+
+    let dataRows;
+    let colToField = null;
+    if (firstRowHeaders) {
+      const headerRow = rows[0];
+      const fnByLower = new Map(fieldNames.map((fn) => [String(fn).trim().toLowerCase(), fn]));
+      colToField = new Map();
+      headerRow.forEach((cell, colIdx) => {
+        const key = String(cell).trim().toLowerCase();
+        if (fnByLower.has(key)) colToField.set(colIdx, fnByLower.get(key));
+      });
+      if (colToField.size === 0) {
+        return res.status(400).json({
+          error:
+            "No column in the first row matched a profile field name. Fix headers or turn off the header-matching option.",
+        });
+      }
+      if (!confirmUnmatchedHeaders) {
+        const seenUnmatched = new Set();
+        const unmatchedHeaders = [];
+        for (const cell of headerRow) {
+          const raw = String(cell).trim();
+          if (!raw) continue;
+          const lk = raw.toLowerCase();
+          if (fnByLower.has(lk)) continue;
+          if (seenUnmatched.has(lk)) continue;
+          seenUnmatched.add(lk);
+          unmatchedHeaders.push(raw);
+        }
+        if (unmatchedHeaders.length > 0) {
+          console.log("[import-data] confirmation required (CSV headers not in profile)", {
+            profileId,
+            unmatchedHeaders,
+            matchedColumnCount: colToField.size,
+            profileFieldCount: fieldNames.length,
+          });
+          return res.json({
+            ok: false,
+            needUnmatchedHeadersConfirm: true,
+            unmatchedHeaders,
+            matchedColumnCount: colToField.size,
+          });
+        }
+      }
+      dataRows = rows.slice(1);
+    } else {
+      dataRows = rows;
+    }
+
+    const nonEmptyDataRows = dataRows.filter((row) => !csvDataRowIsEmpty(row));
+    if (nonEmptyDataRows.length > MAX_CSV_IMPORT_ROWS) {
+      return res.status(400).json({ error: `Too many data rows (max ${MAX_CSV_IMPORT_ROWS}).` });
+    }
+
+    const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
+    const profileFormIds = getProfileEntryFormIds(profileDoc);
+    const defaultFormId = profileFormIds.length > 0 ? profileFormIds[0] : "";
+    const now = new Date().toISOString();
+    let imported = 0;
+    const errors = [];
+
+    for (let r = 0; r < dataRows.length; r++) {
+      const row = dataRows[r];
+      const lineNo = firstRowHeaders ? r + 2 : r + 1;
+      if (csvDataRowIsEmpty(row)) continue;
+      try {
+        const record = { type: "elenko_record", profileId };
+        if (defaultFormId) record.entryFormId = defaultFormId;
+        if (firstRowHeaders && colToField) {
+          for (const fn of fieldNames) {
+            record[fn] = "";
+          }
+          for (const [colIdx, fn] of colToField) {
+            const cell = row[colIdx];
+            record[fn] = cell != null ? String(cell) : "";
+          }
+        } else {
+          for (let i = 0; i < fieldNames.length; i++) {
+            record[fieldNames[i]] = row[i] != null ? String(row[i]) : "";
+          }
+        }
+        record.createdAt = now;
+        record.updatedAt = now;
+        record.sortKey = buildSortKey(record, sortKeyFields);
+        await db.insert(record);
+        imported++;
+      } catch (e) {
+        const msg = e && e.message ? String(e.message) : String(e);
+        if (errors.length < 50) {
+          errors.push({ row: lineNo, message: msg });
+        }
+      }
+    }
+
+    clearProfileListCache(profileId);
+    console.log("[import-data] success", {
+      profileId,
+      imported,
+      failed: errors.length,
+      rowErrorSample: errors.slice(0, 3),
+    });
+    res.json({
+      ok: true,
+      imported,
+      failed: errors.length,
+      rowErrors: errors.slice(0, 50),
+    });
+  } catch (err) {
+    console.error("[import-data] error", {
+      profileId,
+      message: err && err.message,
+      name: err && err.name,
+      code: err && err.code,
+      statusCode: err && err.statusCode,
+      stack: err && err.stack,
+      contentType: req.get("content-type"),
+      contentLength: req.get("content-length"),
+    });
+    res.status(500).json({ error: err.message || "Import failed" });
   }
 });
 
@@ -2585,7 +3012,7 @@ app.get("/apis", requireAdmin, async (req, res) => {
     if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
     const result = await configDb.find({
       selector: { type: "elenko_api" },
-      fields: ["_id", "name", "description", "url", "method"],
+      fields: ["_id", "_rev", "name", "description", "url", "method"],
       sort: [{ name: "asc" }],
       limit: 500,
     });
@@ -2703,15 +3130,45 @@ app.post("/api/apis/:id/copy", requireAdmin, async (req, res) => {
     if (!doc || doc.type !== "elenko_api") {
       return res.status(404).json({ error: "API not found" });
     }
-    const copy = { ...doc };
-    delete copy._id;
-    delete copy._rev;
-    copy.name = "Copy of " + (doc.name || doc._id || "API");
-    const result = await configDb.insert(copy);
-    res.status(201).json({ ok: true, id: result.id, rev: result.rev });
+    const nameResult = await configDb.find({
+      selector: { type: "elenko_api" },
+      fields: ["name"],
+      limit: 5000,
+    });
+    const existing = new Set();
+    for (const d of nameResult.docs || []) {
+      if (d && typeof d.name === "string" && d.name.trim()) existing.add(d.name.trim());
+    }
+    const newName = makeUniqueApiCopyName(doc.name, existing);
+    const newDoc = buildApiDocFromSource(doc, newName);
+    const result = await configDb.insert(newDoc);
+    res.status(201).json({ ok: true, id: result.id, rev: result.rev, name: newName });
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).json({ error: "API not found" });
     console.error("Error copying API:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/apis/:id/delete", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const { _rev } = req.body || {};
+    if (!_rev) return res.status(400).json({ error: "Missing _rev" });
+    const doc = await configDb.get(id);
+    if (!doc || doc.type !== "elenko_api") {
+      return res.status(404).json({ error: "API not found" });
+    }
+    if (doc._rev !== _rev) {
+      return res.status(409).json({ error: "API was modified; refresh and try again" });
+    }
+    await configDb.destroy(id, _rev);
+    res.json({ ok: true, redirect: "/apis" });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "API not found" });
+    if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict" });
+    console.error("Error deleting API:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2978,7 +3435,7 @@ app.get("/js-processing", requireAdmin, async (req, res) => {
     if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
     const result = await configDb.find({
       selector: { type: "elenko_js_processing" },
-      fields: ["_id", "name", "description", "timeout"],
+      fields: ["_id", "_rev", "name", "description", "timeout"],
       sort: [{ name: "asc" }],
       limit: 500,
     });
@@ -3071,6 +3528,63 @@ app.put("/api/js-processing/:id", requireAdmin, async (req, res) => {
   }
 });
 
+app.post("/api/js-processing/:id/copy", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    let baseDoc;
+    try {
+      baseDoc = await configDb.get(id);
+    } catch (e) {
+      if (e.statusCode === 404) return res.status(404).json({ error: "JS Processing document not found" });
+      throw e;
+    }
+    if (!baseDoc || baseDoc.type !== "elenko_js_processing") {
+      return res.status(404).json({ error: "JS Processing document not found" });
+    }
+    const nameResult = await configDb.find({
+      selector: { type: "elenko_js_processing" },
+      fields: ["name"],
+      limit: 5000,
+    });
+    const existing = new Set();
+    for (const d of nameResult.docs || []) {
+      if (d && typeof d.name === "string" && d.name.trim()) existing.add(d.name.trim());
+    }
+    const newName = makeUniqueJsProcessingCopyName(baseDoc.name, existing);
+    const newDoc = buildJsProcessingDocFromSource(baseDoc, newName);
+    const result = await configDb.insert(newDoc);
+    res.status(201).json({ ok: true, id: result.id, rev: result.rev, name: newName });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "JS Processing document not found" });
+    console.error("Error copying JS Processing:", err);
+    res.status(500).json({ error: err.message || "Copy failed" });
+  }
+});
+
+app.post("/api/js-processing/:id/delete", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const { _rev } = req.body || {};
+    if (!_rev) return res.status(400).json({ error: "Missing _rev" });
+    const doc = await configDb.get(id);
+    if (!doc || doc.type !== "elenko_js_processing") {
+      return res.status(404).json({ error: "JS Processing document not found" });
+    }
+    if (doc._rev !== _rev) {
+      return res.status(409).json({ error: "JS Processing was modified; refresh and try again" });
+    }
+    await configDb.destroy(id, _rev);
+    res.json({ ok: true, redirect: "/js-processing" });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "JS Processing document not found" });
+    if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict" });
+    console.error("Error deleting JS Processing:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/profile/create", requireAdmin, async (req, res) => {
   const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
@@ -3079,7 +3593,7 @@ app.get("/profile/create", requireAdmin, async (req, res) => {
 
 app.post("/api/profiles", requireAdmin, async (req, res) => {
   try {
-    const { name, description, fieldNames, fieldDefaultSources, customCss, listFields: rawListFields } = req.body || {};
+    const { name, description, fieldNames, fieldDefaultSources, fieldDisplay, customCss, listFields: rawListFields } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name is required" });
     }
@@ -3101,6 +3615,7 @@ app.post("/api/profiles", requireAdmin, async (req, res) => {
       customCss: customCss != null ? String(customCss) : "",
       fieldNames: fields,
       fieldDefaultSources: normalizeFieldDefaultSources(fields, fieldDefaultSources),
+      fieldDisplay: normalizeFieldDisplay(fields, fieldDisplay),
       listFields,
       createdAt: new Date().toISOString(),
     };
@@ -3313,6 +3828,7 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
     doc.customCss = customCss != null ? String(customCss) : "";
     doc.fieldNames = fields;
     doc.fieldDefaultSources = normalizeFieldDefaultSources(fields, req.body.fieldDefaultSources);
+    doc.fieldDisplay = normalizeFieldDisplay(fields, req.body.fieldDisplay);
     let updatedEntryFormIds;
     if (Array.isArray(entryFormIds)) {
       updatedEntryFormIds = entryFormIds
@@ -3952,6 +4468,39 @@ app.get("/profile/:id/delete", requireAdmin, async (req, res) => {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Profile not found"));
     console.error("Error loading profile:", err);
     res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/profiles/:id/copy", requireAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    let baseDoc;
+    try {
+      baseDoc = await db.get(id);
+    } catch (e) {
+      if (e.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
+      throw e;
+    }
+    if (!baseDoc || baseDoc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const nameResult = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["name"],
+      limit: 5000,
+    });
+    const existing = new Set();
+    for (const d of nameResult.docs || []) {
+      if (d && typeof d.name === "string" && d.name.trim()) existing.add(d.name.trim());
+    }
+    const newName = makeUniqueProfileCopyName(baseDoc.name, existing);
+    const newDoc = buildProfileDocFromSource(baseDoc, newName);
+    const result = await db.insert(newDoc);
+    res.status(201).json({ ok: true, id: result.id, rev: result.rev, name: newName });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
+    console.error("Error copying profile:", err);
+    res.status(500).json({ error: err.message || "Copy failed" });
   }
 });
 
@@ -4887,8 +5436,18 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       ? mobileListFields
       : fieldNames.slice(0, maxMobileListFields);
   const mobileVisibleSet = new Set(effectiveMobileListFields);
-  /** First field in profile order — link target on wide layout (all columns visible). */
-  const desktopLinkField = fieldNames.length > 0 ? fieldNames[0] : null;
+  let colMeta = computeFieldDisplayForTable(fieldNames, doc.fieldDisplay);
+  if (fieldNames.length > 0 && colMeta.length === fieldNames.length && colMeta.every((m) => m.desktopHidden)) {
+    colMeta = fieldNames.map(() => ({ desktopHidden: false, widthMode: "auto", widthStyle: "" }));
+  }
+  /** First non–desktop-hidden field — link target on wide layout. */
+  let desktopLinkField = null;
+  for (let i = 0; i < fieldNames.length; i++) {
+    if (colMeta[i] && !colMeta[i].desktopHidden) {
+      desktopLinkField = fieldNames[i];
+      break;
+    }
+  }
   /** First field in the mobile list — link target on narrow layout (must work when it is not profile field #1). */
   const mobileLinkField =
     effectiveMobileListFields.length > 0 ? effectiveMobileListFields[0] : desktopLinkField;
@@ -4908,10 +5467,14 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   const headerRow =
     fieldNames.length > 0
       ? `<tr>${fieldNames
-          .map((f) => {
+          .map((f, idx) => {
             const bodyTextCls = (typeof f === "string" && f.trim().toLowerCase() === "bodytext") ? " col-bodytext" : "";
-            const cls = (mobileVisibleSet.has(f) ? "col col-mobile-visible" : "col col-mobile-hidden") + bodyTextCls;
-            return `<th class="${cls}">${escapeHtml(f)}</th>`;
+            const mobileCls = (mobileVisibleSet.has(f) ? "col col-mobile-visible" : "col col-mobile-hidden") + bodyTextCls;
+            const m = colMeta[idx] || { desktopHidden: false, widthMode: "auto", widthStyle: "" };
+            const deskCls = m.desktopHidden ? " col-desktop-hidden" : "";
+            const dispCls = m.desktopHidden ? "" : m.widthMode === "pct" ? " col-disp-pct" : " col-disp-auto";
+            const styleAttr = !m.desktopHidden && m.widthStyle ? ` style="${escapeHtml(m.widthStyle)}"` : "";
+            return `<th class="${mobileCls}${deskCls}${dispCls}"${styleAttr}>${escapeHtml(f)}</th>`;
           })
           .join("")}</tr>`
       : "<tr><th>—</th></tr>";
@@ -4924,27 +5487,31 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   const dataRows =
     fieldNames.length > 0
       ? records.map((rec) => {
-          const cells = fieldNames.map((fn) => {
+          const cells = fieldNames.map((fn, colIdx) => {
             const val = rec[fn];
             const text = val != null ? String(val) : "";
             const escaped = escapeHtml(text);
             const bodyTextCls = (typeof fn === "string" && fn.trim().toLowerCase() === "bodytext") ? " col-bodytext" : "";
             const mobileCls = (mobileVisibleSet.has(fn) ? " col-mobile-visible" : " col-mobile-hidden") + bodyTextCls;
+            const m = colMeta[colIdx] || { desktopHidden: false, widthMode: "auto", widthStyle: "" };
+            const deskCls = m.desktopHidden ? " col-desktop-hidden" : "";
+            const dispCls = m.desktopHidden ? "" : m.widthMode === "pct" ? " col-disp-pct" : " col-disp-auto";
+            const styleAttr = !m.desktopHidden && m.widthStyle ? ` style="${escapeHtml(m.widthStyle)}"` : "";
             const entryUrl = "/profile/" + encodeURIComponent(doc._id) + "/entry/" + encodeURIComponent(rec._id) + returnQueryStr;
             const linkText = text.trim().length > 0 ? escaped : "empty";
             const isDesktopLink = desktopLinkField != null && fn === desktopLinkField;
             const isMobileLink = mobileLinkField != null && fn === mobileLinkField;
 
             if (isDesktopLink && isMobileLink) {
-              return `<td class="entry-link-cell${mobileCls}"><span class="entry-cell-clamp"><a href="${entryUrl}">${linkText}</a></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp"><a href="${entryUrl}">${linkText}</a></span></td>`;
             }
             if (isDesktopLink && !isMobileLink) {
-              return `<td class="entry-link-cell${mobileCls}"><span class="entry-cell-clamp"><span class="entry-link-desktop-only"><a href="${entryUrl}">${linkText}</a></span><span class="entry-plain-mobile-only">${escaped}</span></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp"><span class="entry-link-desktop-only"><a href="${entryUrl}">${linkText}</a></span><span class="entry-plain-mobile-only">${escaped}</span></span></td>`;
             }
             if (!isDesktopLink && isMobileLink) {
-              return `<td class="entry-link-cell${mobileCls}"><span class="entry-cell-clamp"><span class="entry-plain-desktop-only">${escaped}</span><span class="entry-link-mobile-only"><a href="${entryUrl}">${linkText}</a></span></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp"><span class="entry-plain-desktop-only">${escaped}</span><span class="entry-link-mobile-only"><a href="${entryUrl}">${linkText}</a></span></span></td>`;
             }
-            return `<td class="${mobileCls}"><span class="entry-cell-clamp">${escaped}</span></td>`;
+            return `<td class="${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${escaped}</span></td>`;
           });
           return `\n        <tr>${cells.join("")}</tr>`;
         })
@@ -4973,7 +5540,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .actions a:hover { text-decoration: underline; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.35rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.9rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
-    table { width: 100%; table-layout: auto; border-collapse: collapse; background: var(--profile-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    table.elenko-db-table { width: 100%; border-collapse: collapse; background: var(--profile-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
     th, td { padding: 0.35rem 1rem; text-align: left; border-bottom: 1px solid var(--profile-table-border, #21262d); line-height: 1.35; }
     th { background: var(--profile-table-header-bg, #21262d); color: var(--profile-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
@@ -4995,8 +5562,12 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .pagination .btn-pag.disabled { color: #484f58; pointer-events: none; }
     .pagination .page-num { color: var(--profile-label, #8b949e); font-size: 0.875rem; }
     th.col-bodytext, td.col-bodytext { max-width: 50vw; width: 50%; }
+    th.col-bodytext.col-disp-pct, td.col-bodytext.col-disp-pct { max-width: none; }
     .guardian-import { margin: 0 0 1rem 0; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
-    .guardian-import input[type="text"] { padding: 0.5rem 0.75rem; background: var(--profile-table-bg, #161b22); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; color: var(--profile-text, #e6edf3); font-size: 1rem; min-width: 12rem; }
+    .guardian-import input[type="text"] { padding: 0.5rem 0.75rem; background: var(--profile-table-bg, #161b22); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; color: var(--profile-text, #e6edf3); font-size: 1rem; min-width: 12rem; max-width: 100%; box-sizing: border-box; }
+    @media (min-width: 769px) {
+      .guardian-import input[type="text"] { min-width: 36rem; flex: 1 1 36rem; max-width: min(100%, 48rem); }
+    }
     .guardian-import button { padding: 0.4rem 0.75rem; background: var(--profile-table-header-bg, #21262d); color: var(--profile-link, #58a6ff); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
     .guardian-import button:hover { background: #30363d; }
     .guardian-import .guardian-msg { font-size: 0.875rem; color: var(--profile-label, #8b949e); }
@@ -5004,6 +5575,12 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .guardian-import .guardian-msg.ok { color: #3fb950; }
     .entry-plain-mobile-only,
     .entry-link-mobile-only { display: none; }
+    @media (min-width: 769px) {
+      table.elenko-db-table { table-layout: fixed; }
+      th.col-desktop-hidden, td.col-desktop-hidden { display: none !important; }
+      th.col-disp-auto, td.col-disp-auto { width: auto; min-width: 2.5rem; }
+      th.col-bodytext.col-disp-auto, td.col-bodytext.col-disp-auto { width: auto; max-width: none; }
+    }
     @media (max-width: 768px) {
       table { font-size: 0.9rem; }
       th.col-mobile-hidden,
@@ -5012,6 +5589,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       .entry-plain-mobile-only { display: inline; }
       .entry-plain-desktop-only { display: none; }
       .entry-link-mobile-only { display: inline; }
+      th.col-desktop-hidden, td.col-desktop-hidden { display: table-cell !important; }
     }
   </style>
   ${customCss ? `<style>${customCss}</style>` : ""}
@@ -5032,7 +5610,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     <span class="page-num">Page ${escapeHtml(String(page))}${escapeHtml(pageOfTotal)}</span>
     ${hasNext ? `<a href="${nextUrl}" class="btn-pag btn-pag-next">Next →</a>` : `<span class="btn-pag btn-pag-next disabled">Next →</span>`}
   </div>
-  <table>
+  <table class="elenko-db-table">
     <thead>${headerRow}</thead>
     <tbody>${dataRows.join("")}${emptyRow}
     </tbody>
@@ -5527,6 +6105,172 @@ function renderFlowsListPage(flows, appUi) {
 </html>`;
 }
 
+function renderProfilesListPage(profiles, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
+  const rows =
+    profiles.length > 0
+      ? profiles
+          .map((p) => {
+            const createdDate = p.createdAt ? formatDateOnly(p.createdAt) : "—";
+            return `
+        <tr>
+          <td><a href="/profile/${encodeURIComponent(p._id)}/edit">${escapeHtml(p.name || p._id)}</a></td>
+          <td>${escapeHtml(truncate(p.description || "", 80))}</td>
+          <td>${escapeHtml(createdDate)}</td>
+          <td class="row-actions"><a href="/profile/${encodeURIComponent(p._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action profile-copy-btn" data-id="${escapeHtml(p._id)}" aria-label="Copy" title="Copy">⧉</button><button type="button" class="delete-btn icon-action delete-profile-btn" data-id="${escapeHtml(p._id)}" data-rev="${escapeHtml(p._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
+        </tr>`;
+          })
+          .join("")
+      : `
+        <tr>
+          <td colspan="4" class="empty">No Elenko database profiles yet. <a href="/profile/create">Create one</a>.</td>
+        </tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Elenko profiles</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 56rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
+    .actions a:hover { text-decoration: underline; }
+    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
+    .btn:hover { background: #2ea043; text-decoration: none; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    .row-actions { white-space: nowrap; }
+    .row-actions .icon-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 2rem;
+      min-height: 2rem;
+      margin: 0 0.15rem;
+      padding: 0.2rem 0.35rem;
+      font-size: 1.15rem;
+      line-height: 1;
+      vertical-align: middle;
+      text-decoration: none;
+      border-radius: 4px;
+    }
+    .row-actions .icon-action:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    .edit-link { color: var(--app-link, #58a6ff); }
+    .edit-link:hover { background: rgba(88, 166, 255, 0.12); }
+    .copy-btn {
+      border: none;
+      background: none;
+      color: var(--app-label, #8b949e);
+      font: inherit;
+      cursor: pointer;
+    }
+    .copy-btn:hover { color: var(--app-link, #58a6ff); background: rgba(88, 166, 255, 0.08); }
+    .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .delete-btn {
+      border: none;
+      background: none;
+      color: #f85149;
+      font: inherit;
+      cursor: pointer;
+      padding: 0.2rem 0.35rem;
+    }
+    .delete-btn:hover { color: #ff7b72; background: rgba(248, 81, 73, 0.12); }
+    .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .empty a { color: var(--app-link, #58a6ff); }
+    #profiles-list-msg { margin-top: 0.75rem; font-size: 0.875rem; }
+  </style>
+</head>
+<body>
+  <div class="actions"><a href="/">← Start</a><a href="/profile/create" class="btn">Create Elenko database</a></div>
+  <h1>Elenko profiles</h1>
+  <p class="sub">All database profiles. Name opens the profile edit page (not the entry list). Use ⧉ to duplicate a profile (entries are not copied).</p>
+  <table>
+    <thead><tr><th>Name</th><th>Description</th><th>Creation date</th><th>Actions</th></tr></thead>
+    <tbody>${rows}
+    </tbody>
+  </table>
+  <div id="profiles-list-msg" style="display:none;"></div>
+  <script>
+    (function() {
+      var msgEl = document.getElementById('profiles-list-msg');
+      function showErr(t) {
+        if (!msgEl) return;
+        msgEl.style.display = 'block';
+        msgEl.style.color = '#f85149';
+        msgEl.textContent = t || 'Request failed';
+      }
+      document.querySelectorAll('.profile-copy-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/profiles/' + encodeURIComponent(id) + '/copy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok && o.data && o.data.id) {
+                window.location.href = '/profile/' + encodeURIComponent(o.data.id) + '/edit';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Copy failed');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Copy failed');
+            });
+        });
+      });
+      document.querySelectorAll('.delete-profile-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          var rev = btn.getAttribute('data-rev');
+          if (!id || !rev) { showErr('Missing revision; refresh the page.'); return; }
+          if (!confirm('Delete this Elenko profile? Entries will be removed or listed under Marked for deletion if you confirm there.')) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/profiles/' + encodeURIComponent(id) + '/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ _rev: rev })
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok) {
+                var red = o.data && o.data.redirect;
+                if (red === '/deletions') window.location.href = '/deletions';
+                else window.location.href = '/profiles';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Delete failed');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Delete failed');
+            });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 function renderEditFlowPage(doc, err, appUi) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
@@ -5721,7 +6465,7 @@ function renderJsProcessingListPage(list, appUi) {
           <td><code class="id-cell">${escapeHtml(d._id || "")}</code></td>
           <td>${escapeHtml(truncate(d.description || "", 50))}</td>
           <td>${escapeHtml(String(d.timeout != null ? d.timeout : 5000))} ms</td>
-          <td><a href="/js-processing/${encodeURIComponent(d._id)}/edit" class="edit-link">Edit</a></td>
+          <td class="row-actions"><a href="/js-processing/${encodeURIComponent(d._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action js-copy-btn" data-id="${escapeHtml(d._id)}" aria-label="Copy" title="Copy">⧉</button><button type="button" class="delete-btn icon-action delete-js-btn" data-id="${escapeHtml(d._id)}" data-rev="${escapeHtml(d._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
         </tr>`
           )
           .join("")
@@ -5754,9 +6498,46 @@ function renderJsProcessingListPage(list, appUi) {
     th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .edit-link { color: var(--app-link, #58a6ff); margin-right: 0.5rem; }
+    .row-actions { white-space: nowrap; }
+    .row-actions .icon-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 2rem;
+      min-height: 2rem;
+      margin: 0 0.15rem;
+      padding: 0.2rem 0.35rem;
+      font-size: 1.15rem;
+      line-height: 1;
+      vertical-align: middle;
+      text-decoration: none;
+      border-radius: 4px;
+    }
+    .row-actions .icon-action:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    .edit-link { color: var(--app-link, #58a6ff); }
+    .edit-link:hover { background: rgba(88, 166, 255, 0.12); }
+    .copy-btn {
+      border: none;
+      background: none;
+      color: var(--app-label, #8b949e);
+      font: inherit;
+      cursor: pointer;
+    }
+    .copy-btn:hover { color: var(--app-link, #58a6ff); background: rgba(88, 166, 255, 0.08); }
+    .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .delete-btn {
+      border: none;
+      background: none;
+      color: #f85149;
+      font: inherit;
+      cursor: pointer;
+      padding: 0.2rem 0.35rem;
+    }
+    .delete-btn:hover { color: #ff7b72; background: rgba(248, 81, 73, 0.12); }
+    .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .empty { color: var(--app-label, #8b949e); font-style: italic; }
     .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
+    #js-list-msg { margin-top: 0.75rem; font-size: 0.875rem; }
   </style>
 </head>
 <body>
@@ -5768,6 +6549,68 @@ function renderJsProcessingListPage(list, appUi) {
     <tbody>${rows}
     </tbody>
   </table>
+  <div id="js-list-msg" style="display:none;"></div>
+  <script>
+    (function() {
+      var msgEl = document.getElementById('js-list-msg');
+      function showErr(t) {
+        if (!msgEl) return;
+        msgEl.style.display = 'block';
+        msgEl.style.color = '#f85149';
+        msgEl.textContent = t || 'Request failed';
+      }
+      document.querySelectorAll('.js-copy-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/js-processing/' + encodeURIComponent(id) + '/copy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok && o.data && o.data.id) {
+                window.location.href = '/js-processing/' + encodeURIComponent(o.data.id) + '/edit';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Copy failed');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Copy failed');
+            });
+        });
+      });
+      document.querySelectorAll('.delete-js-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          var rev = btn.getAttribute('data-rev');
+          if (!id || !rev) { showErr('Missing revision; refresh the page.'); return; }
+          if (!confirm('Delete this JS Processing document? Flows that reference it may need to be updated.')) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/js-processing/' + encodeURIComponent(id) + '/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ _rev: rev })
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok) {
+                window.location.href = o.data.redirect || '/js-processing';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Delete failed');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Delete failed');
+            });
+        });
+      });
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -5950,7 +6793,7 @@ function renderApisListPage(apis, appUi) {
           <td>${escapeHtml(truncate(a.description || "", 40))}</td>
           <td>${escapeHtml(a.method || "GET")}</td>
           <td>${escapeHtml(truncate(a.url || "", 50))}</td>
-          <td><a href="/apis/${encodeURIComponent(a._id)}/edit" class="edit-link">Edit</a> <a href="#" class="copy-link" data-id="${escapeHtml(a._id)}">Copy</a></td>
+          <td class="row-actions"><a href="/apis/${encodeURIComponent(a._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action api-copy-btn" data-id="${escapeHtml(a._id)}" aria-label="Copy" title="Copy">⧉</button><button type="button" class="delete-btn icon-action delete-api-btn" data-id="${escapeHtml(a._id)}" data-rev="${escapeHtml(a._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
         </tr>`
           )
           .join("")
@@ -5983,9 +6826,46 @@ function renderApisListPage(apis, appUi) {
     th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .edit-link, .copy-link { color: var(--app-link, #58a6ff); margin-right: 0.5rem; }
+    .row-actions { white-space: nowrap; }
+    .row-actions .icon-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 2rem;
+      min-height: 2rem;
+      margin: 0 0.15rem;
+      padding: 0.2rem 0.35rem;
+      font-size: 1.15rem;
+      line-height: 1;
+      vertical-align: middle;
+      text-decoration: none;
+      border-radius: 4px;
+    }
+    .row-actions .icon-action:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    .edit-link { color: var(--app-link, #58a6ff); }
+    .edit-link:hover { background: rgba(88, 166, 255, 0.12); }
+    .copy-btn {
+      border: none;
+      background: none;
+      color: var(--app-label, #8b949e);
+      font: inherit;
+      cursor: pointer;
+    }
+    .copy-btn:hover { color: var(--app-link, #58a6ff); background: rgba(88, 166, 255, 0.08); }
+    .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .delete-btn {
+      border: none;
+      background: none;
+      color: #f85149;
+      font: inherit;
+      cursor: pointer;
+      padding: 0.2rem 0.35rem;
+    }
+    .delete-btn:hover { color: #ff7b72; background: rgba(248, 81, 73, 0.12); }
+    .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .empty { color: var(--app-label, #8b949e); font-style: italic; }
     .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
+    #api-list-msg { margin-top: 0.75rem; font-size: 0.875rem; }
   </style>
 </head>
 <body>
@@ -5997,24 +6877,67 @@ function renderApisListPage(apis, appUi) {
     <tbody>${rows}
     </tbody>
   </table>
-  <div id="msg" class="msg"></div>
+  <div id="api-list-msg" style="display:none;"></div>
   <script>
-    document.querySelectorAll('.copy-link').forEach(function(link) {
-      link.onclick = function(e) {
-        e.preventDefault();
-        var id = link.getAttribute('data-id');
-        var msg = document.getElementById('msg');
-        msg.textContent = '';
-        msg.className = 'msg';
-        fetch('/api/apis/' + encodeURIComponent(id) + '/copy', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
-          .then(function(r) { return r.json(); })
-          .then(function(data) {
-            if (data.id) { window.location.href = '/apis/' + encodeURIComponent(data.id) + '/edit'; }
-            else { msg.textContent = data.error || 'Failed'; msg.className = 'msg err'; }
+    (function() {
+      var msgEl = document.getElementById('api-list-msg');
+      function showErr(t) {
+        if (!msgEl) return;
+        msgEl.style.display = 'block';
+        msgEl.style.color = '#f85149';
+        msgEl.textContent = t || 'Request failed';
+      }
+      document.querySelectorAll('.api-copy-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/apis/' + encodeURIComponent(id) + '/copy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok && o.data && o.data.id) {
+                window.location.href = '/apis/' + encodeURIComponent(o.data.id) + '/edit';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Copy failed');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Copy failed');
+            });
+        });
+      });
+      document.querySelectorAll('.delete-api-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          var rev = btn.getAttribute('data-rev');
+          if (!id || !rev) { showErr('Missing revision; refresh the page.'); return; }
+          if (!confirm('Delete this REST API? Flows or forms that reference it may need to be updated.')) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/apis/' + encodeURIComponent(id) + '/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ _rev: rev })
           })
-          .catch(function(err) { msg.textContent = err.message || 'Request failed'; msg.className = 'msg err'; });
-      };
-    });
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok) {
+                window.location.href = o.data.redirect || '/apis';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Delete failed');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Delete failed');
+            });
+        });
+      });
+    })();
   </script>
 </body>
 </html>`;
@@ -7059,7 +7982,7 @@ function renderStartPage(profiles, role, appUi) {
     const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
   const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/config-export-import">Export / Import configuration</option><option value="/entry-forms">Single Entry forms</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
   const thead = '<tr><th>Name</th><th>Description</th><th class="col-mobile-hidden">Creation date</th></tr>';
 
@@ -7163,6 +8086,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
   const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
   const fieldDefaultSources = Array.isArray(doc.fieldDefaultSources) ? doc.fieldDefaultSources : [];
   const initialDefaultSources = fieldNames.map((_, i) => (fieldDefaultSources[i] !== undefined && DEFAULT_VALUE_SOURCES.includes(fieldDefaultSources[i]) ? fieldDefaultSources[i] : ""));
+  const initialFieldDisplay = normalizeFieldDisplay(fieldNames, doc.fieldDisplay);
   const rev = escapeHtml(doc._rev || "");
   const customCss = doc.customCss || "";
   const listFields = Array.isArray(doc.listFields)
@@ -7229,7 +8153,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
   <style>
     ${appThemeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 48rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 58rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
     .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
@@ -7239,12 +8163,14 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     textarea:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     select { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
     select:focus { outline: none; border-color: var(--app-link, #58a6ff); }
-    .field-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center; }
+    .field-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center; flex-wrap: wrap; }
     .field-row input[name="fieldNames"] { flex: 1; min-width: 10rem; }
     .field-row select[name="fieldDefaultSources"] { flex: 0 0 auto; width: auto; min-width: 10rem; max-width: 14rem; }
-    .field-list-header { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.25rem; font-size: 0.875rem; color: #8b949e; }
+    .field-row select[name="fieldDisplay"] { flex: 0 0 6.75rem; min-width: 6.75rem; max-width: 7.5rem; font-size: 0.875rem; }
+    .field-list-header { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.25rem; font-size: 0.875rem; color: #8b949e; flex-wrap: wrap; }
     .field-list-header .col-name { flex: 1; min-width: 10rem; }
     .field-list-header .col-prefill { flex: 0 0 auto; width: auto; min-width: 10rem; max-width: 14rem; }
+    .field-list-header .col-display { flex: 0 0 6.75rem; min-width: 6.75rem; font-size: 0.8rem; }
     .field-list-header .col-action { flex: 0 0 auto; min-width: 5rem; }
     .field-list { margin: 1rem 0; }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
@@ -7257,6 +8183,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     .btn-danger:disabled { opacity: 0.6; cursor: not-allowed; }
     .btn-remove { background: transparent; color: #f85149; padding: 0.25rem 0.5rem; }
     .btn-remove:hover { color: #ff7b72; }
+    .field-row .btn-remove { font-size: 1.15rem; line-height: 1; min-width: 2rem; padding: 0.2rem 0.4rem; }
     .flow-config-table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
     .flow-config-table th, .flow-config-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     .flow-config-table th { color: var(--app-table-header-text, #8b949e); font-weight: 600; font-size: 0.875rem; }
@@ -7332,9 +8259,9 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     <label for="description">Description</label>
     <textarea id="description" name="description" placeholder="Optional description">${description}</textarea>
     <label class="field-list-label">Field names</label>
-    <p class="sub" style="margin-top:0.25rem;">Optional default value is used when creating a new entry (form is prefilled; you can change it before saving).</p>
+    <p class="sub" style="margin-top:0.25rem;">Optional default value is used when creating a new entry (form is prefilled; you can change it before saving). <strong>Display</strong> sets desktop list column width: <em>Auto</em> shares leftover space; <em>Hide</em> hides the column on desktop (still visible on mobile if selected in the mobile list below); percentage widths are scaled so they sum to 100% together.</p>
     <div class="field-list" id="field-list">
-      <div class="field-list-header"><span class="col-name">Field name</span><span class="col-prefill">Prefill value</span><span class="col-action"></span></div>
+      <div class="field-list-header"><span class="col-name">Field name</span><span class="col-prefill">Prefill value</span><span class="col-display">Display</span><span class="col-action"></span></div>
     </div>
     <button type="button" class="btn btn-secondary" id="add-field">+ Add field</button>
     <label>Theme (colours)</label>
@@ -7441,6 +8368,16 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     }
     const initialFields = ${JSON.stringify(fieldNames)};
     const initialDefaultSources = ${JSON.stringify(initialDefaultSources)};
+    const initialFieldDisplay = ${JSON.stringify(initialFieldDisplay)};
+    const displayOptions = [
+      { value: 'auto', label: 'Auto' },
+      { value: 'hide', label: 'Hide' },
+      { value: '10%', label: '10%' },
+      { value: '20%', label: '20%' },
+      { value: '30%', label: '30%' },
+      { value: '40%', label: '40%' },
+      { value: '50%', label: '50%' }
+    ];
 
     const defaultSourceOptions = [
       { value: '', label: 'None' },
@@ -7449,20 +8386,24 @@ function renderEditProfilePage(doc, forms = [], appUi) {
       { value: 'currentUser', label: 'Current user' }
     ];
 
-    function addFieldRow(value, defaultSource) {
+    function addFieldRow(value, defaultSource, displayVal) {
       const row = document.createElement('div');
       row.className = 'field-row';
       const esc = (v) => (v || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       const selectOpts = defaultSourceOptions.map(function(opt) {
         return '<option value="' + esc(opt.value) + '"' + (defaultSource === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
       }).join('');
-      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + esc(value) + '"><select name="fieldDefaultSources" title="Default for new entries">' + selectOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button>';
+      const disp = displayVal && typeof displayVal === 'string' ? displayVal : 'auto';
+      const dispOpts = displayOptions.map(function(opt) {
+        return '<option value="' + esc(opt.value) + '"' + (disp === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
+      }).join('');
+      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + esc(value) + '"><select name="fieldDefaultSources" title="Default for new entries">' + selectOpts + '</select><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
       row.querySelector('.btn-remove').onclick = () => row.remove();
       fieldList.appendChild(row);
     }
 
-    addBtn.onclick = () => addFieldRow('', '');
-    (initialFields.length ? initialFields : ['', '']).forEach((v, i) => addFieldRow(v, initialDefaultSources[i] || ''));
+    addBtn.onclick = () => addFieldRow('', '', 'auto');
+    (initialFields.length ? initialFields : ['', '']).forEach((v, i) => addFieldRow(v, initialDefaultSources[i] || '', (initialFieldDisplay && initialFieldDisplay[i]) ? initialFieldDisplay[i] : 'auto'));
 
     const cssFileInput = document.getElementById('customCssFile');
     const cssTextarea = document.getElementById('customCss');
@@ -7623,13 +8564,16 @@ function renderEditProfilePage(doc, forms = [], appUi) {
       const fieldRows = Array.from(document.getElementById('field-list').querySelectorAll('.field-row'));
       const fieldNames = [];
       const fieldDefaultSources = [];
+      const fieldDisplay = [];
       fieldRows.forEach((row) => {
         const input = row.querySelector('input[name="fieldNames"]');
         const select = row.querySelector('select[name="fieldDefaultSources"]');
+        const dispSel = row.querySelector('select[name="fieldDisplay"]');
         const name = input ? input.value.trim() : '';
         if (name) {
           fieldNames.push(name);
           fieldDefaultSources.push(select ? select.value : '');
+          fieldDisplay.push(dispSel ? dispSel.value : 'auto');
         }
       });
       const entryFormIds = Array.from(document.querySelectorAll('select[name="entryFormIds"]'))
@@ -7656,6 +8600,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
             customCss,
             fieldNames,
             fieldDefaultSources,
+            fieldDisplay,
             entryFormId: entryFormIds[0] || '',
             entryFormIds,
             theme,
@@ -7704,7 +8649,7 @@ function renderCreateProfilePage(appUi) {
   <style>
     ${appThemeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 32rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 42rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
     .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
@@ -7712,8 +8657,12 @@ function renderCreateProfilePage(appUi) {
     input[type="text"]:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     textarea { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; font-family: inherit; min-height: 4rem; resize: vertical; }
     textarea:focus { outline: none; border-color: var(--app-link, #58a6ff); }
-    .field-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center; }
-    .field-row input { flex: 1; }
+    .field-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center; flex-wrap: wrap; }
+    .field-row input { flex: 1; min-width: 8rem; }
+    .field-row select[name="fieldDisplay"] { flex: 0 0 6.75rem; min-width: 6.75rem; font-size: 0.875rem; }
+    .field-list-header { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.25rem; font-size: 0.875rem; color: #8b949e; flex-wrap: wrap; }
+    .field-list-header .col-name { flex: 1; min-width: 8rem; }
+    .field-list-header .col-display { flex: 0 0 6.75rem; min-width: 6.75rem; font-size: 0.8rem; }
     .field-list { margin: 1rem 0; }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
     .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
@@ -7722,6 +8671,7 @@ function renderCreateProfilePage(appUi) {
     .btn-secondary:hover { background: #30363d; }
     .btn-remove { background: transparent; color: #f85149; padding: 0.25rem 0.5rem; }
     .btn-remove:hover { color: #ff7b72; }
+    .field-row .btn-remove { font-size: 1.15rem; line-height: 1; min-width: 2rem; padding: 0.2rem 0.4rem; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
@@ -7740,7 +8690,10 @@ function renderCreateProfilePage(appUi) {
     <label for="customCssFile">Load CSS from file</label>
     <input type="file" id="customCssFile" accept=".css,text/css">
     <label class="field-list-label">Field names</label>
-    <div class="field-list" id="field-list"></div>
+    <p class="sub" style="margin-top:0.25rem;"><strong>Display</strong> sets desktop list column width (Auto, Hide, or percentages scaled to 100% together).</p>
+    <div class="field-list" id="field-list">
+      <div class="field-list-header"><span class="col-name">Field name</span><span class="col-display">Display</span><span class="col-action"></span></div>
+    </div>
     <button type="button" class="btn btn-secondary" id="add-field">+ Add field</button>
     <hr>
     <h2 style="margin-top:1.5rem;">Create from import</h2>
@@ -7766,16 +8719,30 @@ function renderCreateProfilePage(appUi) {
     const form = document.getElementById('create-form');
     const msgEl = document.getElementById('msg');
 
-    function addFieldRow(value) {
+    const displayOptions = [
+      { value: 'auto', label: 'Auto' },
+      { value: 'hide', label: 'Hide' },
+      { value: '10%', label: '10%' },
+      { value: '20%', label: '20%' },
+      { value: '30%', label: '30%' },
+      { value: '40%', label: '40%' },
+      { value: '50%', label: '50%' }
+    ];
+    function addFieldRow(value, displayVal) {
       const row = document.createElement('div');
       row.className = 'field-row';
-      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + (value || '').replace(/"/g, '&quot;') + '"><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button>';
+      const esc = (v) => (v || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+      const disp = displayVal && typeof displayVal === 'string' ? displayVal : 'auto';
+      const dispOpts = displayOptions.map(function(opt) {
+        return '<option value="' + esc(opt.value) + '"' + (disp === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
+      }).join('');
+      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + (value || '').replace(/"/g, '&quot;') + '"><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
       row.querySelector('.btn-remove').onclick = () => row.remove();
       fieldList.appendChild(row);
     }
 
-    addBtn.onclick = () => addFieldRow();
-    addFieldRow(); addFieldRow();
+    addBtn.onclick = () => addFieldRow('', 'auto');
+    addFieldRow('', 'auto'); addFieldRow('', 'auto');
 
     const cssFileInput = document.getElementById('customCssFile');
     const cssTextarea = document.getElementById('customCss');
@@ -7853,12 +8820,23 @@ function renderCreateProfilePage(appUi) {
       const name = document.getElementById('name').value.trim();
       const description = document.getElementById('description').value.trim();
       const customCss = document.getElementById('customCss').value;
-      const fieldNames = Array.from(document.querySelectorAll('input[name="fieldNames"]')).map(i => i.value.trim()).filter(Boolean);
+      const fieldRows = Array.from(document.getElementById('field-list').querySelectorAll('.field-row'));
+      const fieldNames = [];
+      const fieldDisplay = [];
+      fieldRows.forEach((row) => {
+        const input = row.querySelector('input[name="fieldNames"]');
+        const dispSel = row.querySelector('select[name="fieldDisplay"]');
+        const fn = input ? input.value.trim() : '';
+        if (fn) {
+          fieldNames.push(fn);
+          fieldDisplay.push(dispSel ? dispSel.value : 'auto');
+        }
+      });
       try {
         const r = await fetch('/api/profiles', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, description, customCss, fieldNames })
+          body: JSON.stringify({ name, description, customCss, fieldNames, fieldDisplay })
         });
         const data = await r.json();
         if (!r.ok) { msgEl.textContent = data.error || 'Failed'; msgEl.className = 'msg err'; return; }
@@ -8308,6 +9286,234 @@ function renderEditAppConfigPage(appUi, err) {
 </html>`;
 }
 
+function renderDataExportImportPage(profiles, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const profileOptions = profiles.length
+    ? '<option value="">— Select database —</option>' + profiles.map((p) => `<option value="${escapeHtml(p._id)}">${escapeHtml(p.name || p._id)}</option>`).join("")
+    : '<option value="">No databases</option>';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Export / Import data</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 36rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="radio"] { margin-right: 0.5rem; }
+    input[type="file"] { margin-top: 0.35rem; color: var(--app-label, #8b949e); font-size: 0.9rem; max-width: 100%; }
+    input[type="checkbox"] { margin-right: 0.5rem; vertical-align: middle; }
+    .checkbox-row { margin-top: 0.75rem; }
+    .checkbox-row label { display: flex; align-items: flex-start; gap: 0.35rem; margin-top: 0; cursor: pointer; }
+    .checkbox-row label span { color: var(--app-text, #e6edf3); font-weight: normal; }
+    select { padding: 0.35rem 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; min-width: 12rem; width: 100%; max-width: 24rem; }
+    .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
+    .btn-primary { background: #238636; color: #fff; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .actions .back-nav {
+      display: inline-block;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      background: var(--app-bg, #0f1419);
+      color: var(--app-link, #58a6ff);
+      border: 1px solid transparent;
+    }
+    .actions .back-nav:hover { text-decoration: underline; background: var(--app-bg, #0f1419); color: var(--app-link, #58a6ff); }
+    .section { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--app-table-border, #30363d); }
+    .radio-group { margin-top: 0.5rem; }
+    .radio-group label { display: inline; margin-top: 0; }
+  </style>
+</head>
+<body>
+  <div class="actions">
+    <a href="/" class="back-nav">← Profiles</a>
+  </div>
+  <h1>Export / Import data</h1>
+  <p class="sub">Export entry data from an Elenko database or import rows from a semicolon-separated CSV file into one.</p>
+
+  <div class="radio-group">
+    <label><input type="radio" name="dataMode" value="export" checked> Export</label>
+    <label style="margin-left:1rem;"><input type="radio" name="dataMode" value="import"> Import</label>
+  </div>
+
+  <div class="section">
+    <label for="data-profile">Elenko database</label>
+    <select id="data-profile" aria-describedby="data-profile-hint">${profileOptions}</select>
+    <p class="sub" id="data-profile-hint" style="margin-top:0.5rem;">Profile whose entries will be exported or the target for an import.</p>
+  </div>
+
+  <div id="export-data-section" class="section">
+    <button type="button" id="export-data-btn" class="btn btn-primary" disabled title="Not available yet">Export data</button>
+    <p class="sub" style="margin-top:0.75rem;">Export to file will be added in a later step.</p>
+  </div>
+
+  <div id="import-data-section" class="section" style="display:none;">
+    <label for="import-csv-file">CSV file (semicolon-separated)</label>
+    <input type="file" id="import-csv-file" accept=".csv,text/csv,text/plain">
+    <p class="sub" style="margin-top:0.35rem;">Separator is <code>;</code>. Optional quotes around values; use <code>""</code> for a literal quote inside a field.</p>
+    <div class="checkbox-row">
+      <label>
+        <input type="checkbox" id="import-header-match" checked>
+        <span>Check for matching field names in the first row</span>
+      </label>
+    </div>
+    <p class="sub" style="margin-top:0.35rem;">When checked, the first row lists column titles; they are matched to profile field names (case-insensitive). When unchecked, columns are read in profile field order (first column → first field, etc.).</p>
+    <button type="button" id="import-data-btn" class="btn btn-primary" style="margin-top:1rem;">Import data</button>
+  </div>
+
+  <div id="data-import-msg" class="sub" style="display:none; margin-top:1rem; white-space:pre-wrap;"></div>
+
+  <script>
+    (function() {
+      var exportSection = document.getElementById('export-data-section');
+      var importSection = document.getElementById('import-data-section');
+      var msgEl = document.getElementById('data-import-msg');
+      var importBtn = document.getElementById('import-data-btn');
+      var fileInput = document.getElementById('import-csv-file');
+      var profileSel = document.getElementById('data-profile');
+      var headerChk = document.getElementById('import-header-match');
+
+      function setMode(isImport) {
+        if (exportSection) exportSection.style.display = isImport ? 'none' : 'block';
+        if (importSection) importSection.style.display = isImport ? 'block' : 'none';
+        if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+      }
+      document.querySelectorAll('input[name="dataMode"]').forEach(function(r) {
+        r.addEventListener('change', function() {
+          setMode(r.value === 'import');
+        });
+      });
+
+      if (importBtn) {
+        importBtn.addEventListener('click', function() {
+          var pid = profileSel && profileSel.value ? profileSel.value.trim() : '';
+          if (!pid) {
+            if (msgEl) {
+              msgEl.style.display = 'block';
+              msgEl.style.color = '#f85149';
+              msgEl.textContent = 'Select an Elenko database first.';
+            }
+            return;
+          }
+          var file = fileInput && fileInput.files && fileInput.files[0];
+          if (!file) {
+            if (msgEl) {
+              msgEl.style.display = 'block';
+              msgEl.style.color = '#f85149';
+              msgEl.textContent = 'Choose a CSV file.';
+            }
+            return;
+          }
+          importBtn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'block'; msgEl.style.color = 'var(--app-label, #8b949e)'; msgEl.textContent = 'Reading file…'; }
+          var reader = new FileReader();
+          reader.onload = function() {
+            var text = reader.result != null ? String(reader.result) : '';
+            function runImport(confirmUnmatched) {
+              fetch('/api/profiles/' + encodeURIComponent(pid) + '/import-data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  csvText: text,
+                  firstRowHeaders: !!(headerChk && headerChk.checked),
+                  confirmUnmatchedHeaders: !!confirmUnmatched
+                })
+              })
+                .then(function(r) {
+                  return r.text().then(function(t) {
+                    var d = null;
+                    try {
+                      d = t && t.length ? JSON.parse(t) : null;
+                    } catch (parseErr) {
+                      return {
+                        ok: false,
+                        data: {
+                          error:
+                            'Server response was not JSON (HTTP ' +
+                            r.status +
+                            '). ' +
+                            (parseErr && parseErr.message ? parseErr.message : '') +
+                            (t && t.length ? ' — starts with: ' + t.slice(0, 120).replace(/\\s+/g, ' ') : ''),
+                        },
+                      };
+                    }
+                    return { ok: r.ok, data: d };
+                  });
+                })
+                .then(function(o) {
+                  if (o.ok && o.data && o.data.needUnmatchedHeadersConfirm && !confirmUnmatched) {
+                    var un = o.data.unmatchedHeaders || [];
+                    var msg =
+                      'These CSV column title(s) do not match any profile field. Values in those columns will not be imported:\\n\\n' +
+                      un.map(function(u) { return '\\u2022 ' + u; }).join('\\n') +
+                      '\\n\\nContinue with import anyway?';
+                    if (window.confirm(msg)) {
+                      runImport(true);
+                    } else {
+                      importBtn.disabled = false;
+                      if (msgEl) {
+                        msgEl.style.display = 'block';
+                        msgEl.style.color = 'var(--app-label, #8b949e)';
+                        msgEl.textContent = 'Import cancelled.';
+                      }
+                    }
+                    return;
+                  }
+                  importBtn.disabled = false;
+                  if (!msgEl) return;
+                  msgEl.style.display = 'block';
+                  if (o.ok && o.data && o.data.ok) {
+                    msgEl.style.color = '#7ee787';
+                    var lines = ['Imported ' + (o.data.imported || 0) + ' row(s).'];
+                    if (o.data.failed) lines.push('Failed: ' + o.data.failed + ' row(s).');
+                    if (o.data.rowErrors && o.data.rowErrors.length) {
+                      lines.push('');
+                      o.data.rowErrors.forEach(function(err) {
+                        lines.push('Line ' + err.row + ': ' + err.message);
+                      });
+                    }
+                    msgEl.textContent = lines.join(String.fromCharCode(10));
+                  } else {
+                    msgEl.style.color = '#f85149';
+                    msgEl.textContent = (o.data && o.data.error) ? o.data.error : 'Import failed';
+                  }
+                })
+                .catch(function(e) {
+                  importBtn.disabled = false;
+                  if (msgEl) {
+                    msgEl.style.display = 'block';
+                    msgEl.style.color = '#f85149';
+                    msgEl.textContent = e.message || 'Request failed';
+                  }
+                });
+            }
+            runImport(false);
+          };
+          reader.onerror = function() {
+            importBtn.disabled = false;
+            if (msgEl) {
+              msgEl.style.display = 'block';
+              msgEl.style.color = '#f85149';
+              msgEl.textContent = 'Could not read the file.';
+            }
+          };
+          reader.readAsText(file, 'UTF-8');
+        });
+      }
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 function renderConfigExportImportPage(profiles, appUi) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
@@ -8333,10 +9539,17 @@ function renderConfigExportImportPage(profiles, appUi) {
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
     .btn-primary { background: #238636; color: #fff; }
     .btn-primary:hover { background: #2ea043; }
-    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; margin-left: 0.5rem; }
-    .btn-secondary:hover { background: #30363d; }
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .actions .back-nav {
+      display: inline-block;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      background: var(--app-bg, #0f1419);
+      color: var(--app-link, #58a6ff);
+      border: 1px solid transparent;
+    }
+    .actions .back-nav:hover { text-decoration: underline; background: var(--app-bg, #0f1419); color: var(--app-link, #58a6ff); }
     .section { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--app-table-border, #30363d); }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
@@ -8348,7 +9561,7 @@ function renderConfigExportImportPage(profiles, appUi) {
 </head>
 <body>
   <div class="actions">
-    <a href="/" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem;">← Profiles</a>
+    <a href="/" class="back-nav">← Profiles</a>
   </div>
   <h1>Export / Import configuration</h1>
   <p class="sub">Export configuration to a JSON file or import from a previously exported file. User data, API keys, and passwords are never exported.</p>
@@ -8935,6 +10148,39 @@ function slugifyForApiKeyId(name) {
   const slug = s.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "key";
   return "key_" + (slug.slice(0, 80) || "key");
 }
+
+/** Log JSON body parse failures (e.g. strict mode, invalid token at position 1) and return JSON for /api/*. */
+app.use((err, req, res, next) => {
+  if (err && err.status === 400 && err.type === "entity.parse.failed") {
+    const raw = typeof err.body === "string" ? err.body : "";
+    const first = raw.length > 0 ? raw[0] : "";
+    console.error("[express.json] entity.parse.failed", {
+      message: err.message,
+      method: req.method,
+      path: req.path,
+      originalUrl: req.originalUrl,
+      contentType: req.get("content-type"),
+      contentLength: req.get("content-length"),
+      rawLength: raw.length,
+      firstCodeUnit: first ? first.charCodeAt(0) : null,
+      firstCharHint:
+        first === "<"
+          ? "starts with '<' (often HTML or XML, not JSON)"
+          : first === "" || !first
+            ? "empty body string after read"
+            : "see message",
+      rawPreview: raw.slice(0, 1200).replace(/\r/g, "\\r").replace(/\n/g, "\\n"),
+      stack: err.stack,
+    });
+    if (wantsJsonApiResponse(req)) {
+      return res.status(400).json({
+        error: "Invalid JSON in request body",
+        detail: err.message,
+      });
+    }
+  }
+  next(err);
+});
 
 async function main() {
   await initCouch();
