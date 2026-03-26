@@ -1,7 +1,6 @@
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env"), override: true });
 const crypto = require("crypto");
-const vm = require("vm");
 const { Worker } = require("worker_threads");
 const fs = require("fs");
 const express = require("express");
@@ -9,6 +8,44 @@ const session = require("express-session");
 const iconv = require("iconv-lite");
 const marked = require("marked");
 const nano = require("nano");
+
+const originalConsoleError = console.error.bind(console);
+
+function truncateString(s, maxLen) {
+  const str = String(s);
+  if (str.length <= maxLen) return str;
+  return str.slice(0, maxLen) + "…[truncated]";
+}
+
+function serializeConsoleArgForFlow(arg) {
+  if (arg instanceof Error) {
+    return {
+      name: arg.name,
+      message: arg.message,
+      stack: arg.stack,
+    };
+  }
+  if (typeof arg === "string") return truncateString(arg, 4000);
+  if (typeof arg === "number" || typeof arg === "boolean" || arg == null) return arg;
+  try {
+    const json = JSON.stringify(arg);
+    return typeof json === "string" ? truncateString(json, 4000) : json;
+  } catch (_) {
+    try {
+      return truncateString(String(arg), 4000);
+    } catch {
+      return "[unserializable]";
+    }
+  }
+}
+
+function serializeConsoleArgsForFlow(args) {
+  try {
+    return Array.isArray(args) ? args.map(serializeConsoleArgForFlow) : [];
+  } catch (_) {
+    return [];
+  }
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -536,41 +573,7 @@ function computeScriptHash(script) {
   return crypto.createHash("sha256").update(typeof script === "string" ? script : "").digest("hex");
 }
 
-/** Run user script in a minimal VM sandbox. No require, process, or file access. input/output are the only data. */
-function runScriptInSandbox(script, input, timeoutMs) {
-  const timeout = Math.min(Math.max(Number(timeoutMs) || 5000, 100), 60000);
-  const scriptLogs = [];
-  const output = {};
-  Object.defineProperty(output, "_writeLog", {
-    enumerable: false,
-    configurable: false,
-    writable: false,
-    value: function writeScriptLog(obj) {
-      try {
-        const raw = obj == null ? null : obj;
-        const safe = JSON.parse(JSON.stringify(raw));
-        scriptLogs.push(safe);
-      } catch (_) {
-        scriptLogs.push({ value: String(obj) });
-      }
-      return null;
-    },
-  });
-  const sandbox = {
-    input: input && typeof input === "object" ? input : {},
-    output,
-    __returnValue: undefined,
-  };
-  const wrapped = "__returnValue = (function() {\n" + (typeof script === "string" ? script : "") + "\n})();";
-  try {
-    const context = vm.createContext(sandbox);
-    vm.runInContext(wrapped, context, { timeout });
-    const output = sandbox.output && typeof sandbox.output === "object" ? sandbox.output : {};
-    return { returnValue: sandbox.__returnValue, output, scriptLogs, error: null };
-  } catch (err) {
-    return { returnValue: undefined, output: {}, scriptLogs, error: err && err.message ? err.message : String(err) };
-  }
-}
+// JavaScript sandbox execution moved to `scriptWorker.js`.
 
 function previewApiKey(apiKey) {
   const s = apiKey == null ? "" : String(apiKey);
@@ -863,7 +866,7 @@ async function runPipeline(context, flowDoc) {
       }
       const timeoutMs = Math.min(Math.max(Number(jsDoc.timeout) || 5000, 100), 60000);
       const input = context.dataset && typeof context.dataset === "object" ? { ...context.dataset } : {};
-      const result = runScriptInSandbox(script, input, timeoutMs);
+      const result = await runScriptInFlowWorker(script, input, timeoutMs);
       if (result.error) {
         sendFlowMessage("flow.scriptError", {
           stepIndex: i,
@@ -938,7 +941,57 @@ const KEY_LEN = 32;
 let flowWorker;
 let apiWorker;
 
+// Forward *server.js* console errors to the flow log as well.
+// Keep console.log unchanged; only wrap console.error.
+console.error = function (...args) {
+  // Preserve existing stderr behavior.
+  originalConsoleError(...args);
+  // Avoid breaking anything if flow forwarding fails.
+  try {
+    sendFlowMessage("console.error", {
+      args: serializeConsoleArgsForFlow(args),
+    });
+  } catch (_) {
+    // no-op
+  }
+};
+
 const pendingApiRequests = new Map();
+
+const pendingScriptRequests = new Map();
+
+function runScriptInFlowWorker(script, input, timeoutMs) {
+  if (!flowWorker) return Promise.reject(new Error("Flow worker not available"));
+  const requestId = "pipeScript-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+  const scriptTimeout = Math.min(Math.max(Number(timeoutMs) || 5000, 100), 60000) + 2000;
+
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      if (pendingScriptRequests.has(requestId)) {
+        pendingScriptRequests.delete(requestId);
+        reject(new Error("Script execution timeout"));
+      }
+    }, scriptTimeout);
+    pendingScriptRequests.set(requestId, { resolve, reject, timeoutId });
+
+    try {
+      flowWorker.postMessage({
+        kind: "flow.scriptRequest",
+        payload: {
+          requestId,
+          script,
+          input,
+          timeoutMs,
+        },
+        ts: new Date().toISOString(),
+      });
+    } catch (err) {
+      clearTimeout(timeoutId);
+      pendingScriptRequests.delete(requestId);
+      reject(err);
+    }
+  });
+}
 
 let cachedAppConfig = null;
 let cachedAppConfigLoadedAt = 0;
@@ -1395,6 +1448,25 @@ function startFlowWorker() {
     }
   });
   flowWorker.on("message", (msg) => {
+    if (msg && msg.kind === "flow.scriptResponse") {
+      const requestId = msg.requestId;
+      if (requestId != null && pendingScriptRequests.has(requestId)) {
+        const p = pendingScriptRequests.get(requestId);
+        pendingScriptRequests.delete(requestId);
+        if (p.timeoutId) clearTimeout(p.timeoutId);
+        p.resolve({
+          returnValue: msg.returnValue,
+          output: msg.output && typeof msg.output === "object" ? msg.output : {},
+          scriptLogs: Array.isArray(msg.scriptLogs) ? msg.scriptLogs : [],
+          error: msg.error,
+        });
+      }
+      return;
+    }
+    if (msg && msg.kind === "scriptWorker.error") {
+      console.error("Script worker error:", msg.error || msg);
+      return;
+    }
     if (msg.kind === "callApi") {
       const apiDocId = (msg.apiDocId != null ? String(msg.apiDocId) : "").trim();
       if (!apiDocId || !apiWorker) {
@@ -1516,7 +1588,8 @@ function sendFlowMessage(kind, payload) {
       ts: new Date().toISOString(),
     });
   } catch (err) {
-    console.error("Failed to send flow message:", err);
+    // Use the original console implementation to avoid recursion into this wrapper.
+    originalConsoleError("Failed to send flow message:", err);
   }
 }
 

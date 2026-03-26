@@ -1,4 +1,4 @@
-const { parentPort, workerData } = require("worker_threads");
+const { parentPort, workerData, Worker } = require("worker_threads");
 const fs = require("fs");
 const path = require("path");
 
@@ -8,7 +8,7 @@ const path = require("path");
 // Default to a logs/ subdirectory next to this file so that
 // Docker bind mounts like ./logs:/app/logs pick it up even if
 // FLOW_LOG_FILE is not set.
-const logFile = process.env.FLOW_LOG_FILE || path.join(__dirname, "logs", "flow.log");
+const logFile = process.env.FLOW_LOG_FILE || path.join(__dirname, "logs", "elenko.log");
 const logDir = path.dirname(logFile);
 
 // When FLOW_DEBUG is set (e.g. 1, true, yes), log every message that passes through,
@@ -33,6 +33,24 @@ try {
 }
 
 console.log("Flow worker: logging to", logFile, debug ? "(debug: log all messages)" : "");
+
+let scriptWorker = null;
+try {
+  const scriptWorkerPath = path.join(__dirname, "scriptWorker.js");
+  scriptWorker = new Worker(scriptWorkerPath, {
+    workerData: {},
+  });
+  scriptWorker.on("error", (err) => {
+    // Forward to main via a flow log message; also surface errors to stderr.
+    parentPort.postMessage({
+      kind: "scriptWorker.error",
+      error: err && err.message ? err.message : String(err),
+    });
+    console.error("Flow worker: scriptWorker error:", err);
+  });
+} catch (err) {
+  console.error("Flow worker: failed to start scriptWorker:", err);
+}
 
 const queue = [];
 let writing = false;
@@ -70,10 +88,49 @@ if (!parentPort) {
 }
 
 parentPort.on("message", (msg) => {
-  if (debug) {
+  const kind = msg && msg.kind ? msg.kind : "";
+  const skipLogging = kind === "flow.scriptRequest" || kind === "flow.scriptResponse";
+  if (debug && !skipLogging) {
     queue.push(msg);
     writeNext();
   }
+
+  if (kind === "flow.scriptRequest") {
+    if (!scriptWorker) {
+      parentPort.postMessage({
+        kind: "flow.scriptResponse",
+        requestId: msg.payload && msg.payload.requestId,
+        returnValue: undefined,
+        output: {},
+        scriptLogs: [],
+        error: "scriptWorker not available",
+      });
+      return;
+    }
+    try {
+      scriptWorker.postMessage({
+        kind: "scriptRequest",
+        requestId: msg.payload && msg.payload.requestId,
+        script: msg.payload && msg.payload.script,
+        input: msg.payload && msg.payload.input,
+        timeoutMs: msg.payload && msg.payload.timeoutMs,
+      });
+    } catch (err) {
+      parentPort.postMessage({
+        kind: "flow.scriptResponse",
+        requestId: msg.payload && msg.payload.requestId,
+        returnValue: undefined,
+        output: {},
+        scriptLogs: [],
+        error: "Failed to post scriptRequest: " + (err && err.message ? err.message : String(err)),
+      });
+    }
+    return;
+  }
+
+  // Response messages produced by scriptWorker are forwarded to main as flow.scriptResponse.
+  if (kind === "scriptResponse") return;
+
   const target = msg.payload && msg.payload.target;
   if (msg.kind === "entry.sendToFlow" && target === "localDb") {
     parentPort.postMessage({
@@ -94,9 +151,23 @@ parentPort.on("message", (msg) => {
     });
     return;
   }
-  if (!debug) {
+  if (!debug && !skipLogging) {
     queue.push(msg);
     writeNext();
   }
 });
+
+if (scriptWorker) {
+  scriptWorker.on("message", (msg) => {
+    if (!msg || msg.kind !== "scriptResponse") return;
+    parentPort.postMessage({
+      kind: "flow.scriptResponse",
+      requestId: msg.requestId,
+      returnValue: msg.returnValue,
+      output: msg.output && typeof msg.output === "object" ? msg.output : {},
+      scriptLogs: Array.isArray(msg.scriptLogs) ? msg.scriptLogs : [],
+      error: msg.error,
+    });
+  });
+}
 

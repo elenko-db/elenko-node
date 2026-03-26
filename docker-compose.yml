@@ -27,7 +27,7 @@ services:
       COUCHDB_URL: http://admin:admin@couchdb:5984
       COUCHDB_DB: elenko
       PORT: 3000
-      FLOW_LOG_FILE: /app/logs/flow.log
+      FLOW_LOG_FILE: /app/logs/elenko.log
     
     volumes:
       - ./logs:/app/logs
