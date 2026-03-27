@@ -141,6 +141,15 @@ parentPort.on("message", (msg) => {
     });
     return;
   }
+  if (msg.kind === "entry.sendToFlow" && target === "response") {
+    parentPort.postMessage({
+      kind: "createResponseInProfile",
+      sourceDocId: msg.payload.entryId,
+      profileId: msg.payload.profileId,
+      dataset: msg.payload.dataset,
+    });
+    return;
+  }
   if (msg.kind === "entry.sendToFlow" && target === "api") {
     parentPort.postMessage({
       kind: "callApi",

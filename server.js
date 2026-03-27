@@ -307,7 +307,8 @@ function normalizeEntryFormDoc(body) {
     });
   const flowButtonEnabled = !!(body.flowButtonEnabled === true || body.flowButtonEnabled === "true");
   const flowTargetRaw = typeof body.flowTarget === "string" ? body.flowTarget.trim() : "";
-  const flowTarget = flowTargetRaw === "localDb" ? "localDb" : flowTargetRaw === "api" ? "api" : "log";
+  const flowTarget =
+    flowTargetRaw === "localDb" ? "localDb" : flowTargetRaw === "api" ? "api" : flowTargetRaw === "response" ? "response" : "log";
   const flowButtonLabel = typeof body.flowButtonLabel === "string" ? body.flowButtonLabel.trim() : "";
   const flowButtonParam = typeof body.flowButtonParam === "string" ? body.flowButtonParam.trim() : "";
   const linkedQueryRaw = body && typeof body.linkedQuery === "object" && body.linkedQuery ? body.linkedQuery : {};
@@ -341,7 +342,9 @@ function normalizeEntryFormDoc(body) {
     const enabled = !!(item.enabled === true || item.enabled === "true");
     const flowId = typeof item.flowId === "string" ? item.flowId.trim() : "";
     const targetRaw = typeof item.target === "string" ? item.target.trim() : "";
-    const target = flowId ? (targetRaw === "localDb" ? "localDb" : targetRaw === "api" ? "api" : "") : (targetRaw === "localDb" ? "localDb" : targetRaw === "api" ? "api" : "log");
+    const target = flowId
+      ? (targetRaw === "localDb" ? "localDb" : targetRaw === "api" ? "api" : targetRaw === "response" ? "response" : "")
+      : (targetRaw === "localDb" ? "localDb" : targetRaw === "api" ? "api" : targetRaw === "response" ? "response" : "log");
     const label = typeof item.label === "string" ? item.label.trim() : "";
     const param = typeof item.param === "string" ? item.param.trim() : "";
     return { enabled, target, label: label || "Send to Flow", param, flowId };
@@ -400,7 +403,7 @@ function buildEntryFormDocFromSource(baseForm, name) {
       Array.isArray(baseForm.flowConfigs) && baseForm.flowConfigs.length > 0
         ? baseForm.flowConfigs.map((c) => ({
             enabled: !!(c && c.enabled),
-            target: c && c.target === "localDb" ? "localDb" : c && c.target === "api" ? "api" : "log",
+            target: c && c.target === "localDb" ? "localDb" : c && c.target === "api" ? "api" : c && c.target === "response" ? "response" : "log",
             label: c && typeof c.label === "string" && c.label.trim() ? c.label.trim() : "Send to Flow",
             param: c && typeof c.param === "string" ? c.param.trim() : "",
             flowId: c && typeof c.flowId === "string" ? c.flowId.trim() : "",
@@ -581,6 +584,8 @@ function normalizeFlowSteps(steps) {
           ? "localDb"
           : t === "api"
           ? "api"
+          : t === "response"
+          ? "response"
           : t === "script"
           ? "script"
           : t === "update"
@@ -659,9 +664,15 @@ function isMobileRequest(req) {
 }
 
 /** Create an entry in the target profile from context.dataset. Returns the created document. Used by flow worker and pipeline. */
-async function createEntryInProfileFromContext(dbInstance, context, targetProfileId) {
+async function createEntryInProfileFromContext(dbInstance, context, targetProfileId, options = {}) {
   const tid = (targetProfileId != null ? String(targetProfileId) : "").trim();
   if (!tid) throw new Error("createEntryInProfileFromContext: missing targetProfileId");
+  const opts = options && typeof options === "object" ? options : {};
+  const responseToDocId =
+    opts.responseToDocId != null && String(opts.responseToDocId).trim()
+      ? String(opts.responseToDocId).trim()
+      : "";
+  const markAsResponse = !!(opts.isResponse && responseToDocId);
   let targetProfile = null;
   try {
     targetProfile = await dbInstance.get(tid);
@@ -686,6 +697,10 @@ async function createEntryInProfileFromContext(dbInstance, context, targetProfil
     profileId: resolvedProfileId,
     sourceDocId: (context.entryId != null ? String(context.entryId) : "") || (context.sourceDocId != null ? String(context.sourceDocId) : ""),
   };
+  if (markAsResponse) {
+    record.isResponse = true;
+    record.responseToDocId = responseToDocId;
+  }
   for (const fn of fieldNames) {
     record[fn] = dataset[fn] != null ? String(dataset[fn]).trim() : "";
   }
@@ -700,7 +715,36 @@ async function createEntryInProfileFromContext(dbInstance, context, targetProfil
   }
   const result = await dbInstance.insert(record);
   clearProfileListCache(resolvedProfileId);
-  return { ...record, _id: result.id, _rev: result.rev };
+  const created = { ...record, _id: result.id, _rev: result.rev };
+  if (markAsResponse) {
+    try {
+      const parentDoc = await dbInstance.get(responseToDocId);
+      if (parentDoc && parentDoc.type === "elenko_record") {
+        const existingIds = Array.isArray(parentDoc.responseDocIds) ? parentDoc.responseDocIds.map((x) => String(x)) : [];
+        if (!existingIds.includes(created._id)) existingIds.push(created._id);
+        parentDoc.hasResponses = existingIds.length > 0;
+        parentDoc.responseDocIds = existingIds;
+        parentDoc.updatedAt = new Date().toISOString();
+        await dbInstance.insert(parentDoc);
+        clearProfileListCache(parentDoc.profileId);
+      }
+    } catch (_) {
+      // Parent document may have been deleted; keep created response as-is.
+    }
+  }
+  return created;
+}
+
+async function createResponseEntryFromContext(dbInstance, context, parentEntryId) {
+  if (!dbInstance) throw new Error("Database unavailable");
+  const pid = parentEntryId != null ? String(parentEntryId).trim() : "";
+  if (!pid) throw new Error("Missing parent entry id for response");
+  const targetProfileId = context && context.profileId ? String(context.profileId).trim() : "";
+  if (!targetProfileId) throw new Error("Missing profile id for response");
+  return createEntryInProfileFromContext(dbInstance, context, targetProfileId, {
+    isResponse: true,
+    responseToDocId: pid,
+  });
 }
 
 /** Update the current entry (context.entryId) from context.dataset. Used by multi-step flows. */
@@ -830,6 +874,8 @@ async function runPipeline(context, flowDoc) {
         ? "localDb"
         : rawTarget === "api"
         ? "api"
+        : rawTarget === "response"
+        ? "response"
         : rawTarget === "script"
         ? "script"
         : rawTarget === "update"
@@ -860,6 +906,15 @@ async function runPipeline(context, flowDoc) {
       if (context.profileId && db) {
         const created = await createEntryInProfileFromContext(db, context, context.profileId);
         context.dataset = { ...(context.dataset || {}), _lastCreatedId: created._id };
+      }
+      continue;
+    }
+    if (target === "response") {
+      if (suppressSinglePersist) continue;
+      hasExplicitPersistStep = true;
+      if (context.profileId && context.entryId && db) {
+        const created = await createResponseEntryFromContext(db, context, context.entryId);
+        context.dataset = { ...(context.dataset || {}), _lastCreatedId: created._id, _lastResponseId: created._id };
       }
       continue;
     }
@@ -1599,6 +1654,22 @@ function startFlowWorker() {
       })();
       return;
     }
+    if (msg.kind === "createResponseInProfile") {
+      const sourceDocId = (msg.sourceDocId != null ? String(msg.sourceDocId) : "").trim();
+      const profileId = (msg.profileId != null ? String(msg.profileId) : "").trim();
+      if (!sourceDocId || !profileId) {
+        console.error("Flow worker: createResponseInProfile missing sourceDocId/profileId");
+        return;
+      }
+      (async () => {
+        try {
+          await createResponseEntryFromContext(db, { dataset: msg.dataset, profileId, entryId: sourceDocId }, sourceDocId);
+        } catch (err) {
+          console.error("Flow worker: createResponseInProfile failed:", err);
+        }
+      })();
+      return;
+    }
     if (msg.kind !== "createEntryInProfile") return;
     const targetProfileId = (msg.targetProfileId != null ? String(msg.targetProfileId) : "").trim();
     if (!targetProfileId) {
@@ -1927,6 +1998,16 @@ async function initCouch(options) {
     await db.createIndex({
       index: { fields: ["type", "profileId", "sortKey"] },
       name: "records-by-profile-sortkey",
+    });
+  } catch (e) {
+    // Index may already exist
+  }
+
+  // Index for response documents linked to a parent entry
+  try {
+    await db.createIndex({
+      index: { fields: ["type", "profileId", "isResponse", "responseToDocId"] },
+      name: "records-by-response-parent",
     });
   } catch (e) {
     // Index may already exist
@@ -2945,8 +3026,8 @@ app.post("/api/entry-forms", requireAdmin, async (req, res) => {
       const c = flowConfigsRaw[i];
       const flowId = (c && typeof c.flowId === "string") ? c.flowId.trim() : "";
       const target = (c && typeof c.target === "string") ? c.target.trim() : "";
-      if (!flowId && target !== "log" && target !== "localDb" && target !== "api") {
-        return res.status(400).json({ error: "When using Single step, please select a Target (Log file, Send to Local Database, or Call API) for each flow button." });
+      if (!flowId && target !== "log" && target !== "localDb" && target !== "api" && target !== "response") {
+        return res.status(400).json({ error: "When using Single step, please select a Target (Log file, Send to Local Database, Call API, or Save as response) for each flow button." });
       }
     }
     const doc = {
@@ -3013,8 +3094,8 @@ app.put("/api/entry-forms/:id", requireAdmin, async (req, res) => {
       const c = flowConfigsRaw[i];
       const flowId = (c && typeof c.flowId === "string") ? c.flowId.trim() : "";
       const target = (c && typeof c.target === "string") ? c.target.trim() : "";
-      if (!flowId && target !== "log" && target !== "localDb" && target !== "api") {
-        return res.status(400).json({ error: "When using Single step, please select a Target (Log file, Send to Local Database, or Call API) for each flow button." });
+      if (!flowId && target !== "log" && target !== "localDb" && target !== "api" && target !== "response") {
+        return res.status(400).json({ error: "When using Single step, please select a Target (Log file, Send to Local Database, Call API, or Save as response) for each flow button." });
       }
     }
     if (!normalized.name) {
@@ -4426,8 +4507,8 @@ app.post("/api/profile/:id/entry/:entryId/send-to-flow", requireAuth, async (req
     const flowConfigs = Array.isArray(formDoc && formDoc.flowConfigs) ? formDoc.flowConfigs : [];
     const flowConfig = (typeof flowIndex === "number" && flowIndex >= 0 && flowConfigs[flowIndex]) ? flowConfigs[flowIndex] : null;
     const target = flowConfig
-      ? (flowConfig.target === "api" || flowConfig.target === "localDb" || flowConfig.target === "log" ? flowConfig.target : "log")
-      : (formDoc && (formDoc.flowTarget === "api" || formDoc.flowTarget === "localDb" || formDoc.flowTarget === "log") ? formDoc.flowTarget : "log");
+      ? (flowConfig.target === "api" || flowConfig.target === "localDb" || flowConfig.target === "response" || flowConfig.target === "log" ? flowConfig.target : "log")
+      : (formDoc && (formDoc.flowTarget === "api" || formDoc.flowTarget === "localDb" || formDoc.flowTarget === "response" || formDoc.flowTarget === "log") ? formDoc.flowTarget : "log");
     const flowButtonParam = flowConfig ? (typeof flowConfig.param === "string" ? flowConfig.param : "") : (formDoc && typeof formDoc.flowButtonParam === "string" ? formDoc.flowButtonParam : "");
     const flowId = flowConfig && typeof flowConfig.flowId === "string" ? flowConfig.flowId.trim() : "";
     if (flowId && configDb) {
@@ -4911,7 +4992,9 @@ app.get("/profile/:id", async (req, res) => {
     const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
     const useSortKey = sortKeyFields.length > 0;
     const sortDirection = doc.sortDirection === "desc" ? "desc" : "asc";
-    const fieldsForFind = fieldNames.length ? ["_id", "_rev", "sortKey", ...fieldNames] : ["_id", "_rev", "sortKey"];
+    // Fetch only one utility field used for row icon decoration.
+    // It is not rendered as a visible table column.
+    const fieldsForFind = fieldNames.length ? ["_id", "_rev", "sortKey", "isResponse", ...fieldNames] : ["_id", "_rev", "sortKey", "isResponse"];
     const SORT_FETCH_LIMIT = 50000;
 
     let totalPages = null;
@@ -5496,6 +5579,71 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     return escapeHtml(value);
   }
 
+  async function loadResponsesForEntry() {
+    if (!db || !entryId || !profileId) return [];
+    const byIdMap = new Map();
+    const listedIds = Array.isArray(record && record.responseDocIds) ? record.responseDocIds.map((x) => String(x).trim()).filter(Boolean) : [];
+    for (const rid of listedIds) {
+      try {
+        const d = await db.get(rid);
+        if (d && d.type === "elenko_record" && d.profileId === profileId && d.isResponse === true && d.responseToDocId === entryId) {
+          byIdMap.set(d._id, d);
+        }
+      } catch (_) {}
+    }
+    try {
+      const byRef = await db.find({
+        selector: {
+          type: "elenko_record",
+          profileId,
+          isResponse: true,
+          responseToDocId: entryId,
+        },
+        limit: 5000,
+      });
+      for (const d of byRef.docs || []) {
+        if (d && d._id) byIdMap.set(String(d._id), d);
+      }
+    } catch (_) {}
+    const out = [...byIdMap.values()];
+    out.sort((a, b) => {
+      const av = a && a.createdAt ? String(a.createdAt) : "";
+      const bv = b && b.createdAt ? String(b.createdAt) : "";
+      return av.localeCompare(bv);
+    });
+    return out;
+  }
+
+  const responseFieldTypeByName = new Map();
+  for (const o of orderedItems) {
+    if (!o || o.type !== "field") continue;
+    if (!responseFieldTypeByName.has(o.fieldName)) responseFieldTypeByName.set(o.fieldName, o.fieldType || "text");
+  }
+  const responseRecords = await loadResponsesForEntry();
+  const responsesHtml =
+    responseRecords.length > 0
+      ? `<div class="entry-responses">` +
+        responseRecords
+          .map((resp) => {
+            const rows = profileFieldNames
+              .map((fn) => {
+                const rawVal = resp && resp[fn] != null ? String(resp[fn]) : "";
+                const fieldType = responseFieldTypeByName.get(fn) || "text";
+                const valueHtml = formatValueHtml({ type: "field", fieldType, fieldName: fn }, rawVal);
+                return `<tr><td class="label">${escapeHtml(fn)}</td><td class="value">${valueHtml}</td></tr>`;
+              })
+              .join("");
+            return (
+              `<div class="entry-response-block">` +
+              `<div class="entry-response-marker">↳ Response</div>` +
+              `<table><tbody>${rows}</tbody></table>` +
+              `</div>`
+            );
+          })
+          .join("") +
+        `</div>`
+      : "";
+
   let contentHtml;
   if (orderedItems.length === 0) {
     contentHtml = '<div class="empty">No fields defined.</div>';
@@ -5597,6 +5745,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     contentHtml = `<table><tbody>${rows}</tbody></table>`;
     if (linkedQueryHtml) contentHtml += linkedQueryHtml;
   }
+  if (responsesHtml) contentHtml += responsesHtml;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -5659,6 +5808,10 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .linked-query-table tr:last-child td { border-bottom: none; }
     .linked-query-firstcol { color: var(--entry-link, #58a6ff); text-decoration: none; }
     .linked-query-firstcol:hover { text-decoration: underline; }
+    .entry-responses { margin-top: 1rem; display: flex; flex-direction: column; gap: 0.75rem; }
+    .entry-response-block { background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 8px; padding: 0.5rem 0.75rem; }
+    .entry-response-block table { margin-top: 0.25rem; }
+    .entry-response-marker { color: var(--entry-label, #8b949e); font-weight: 600; }
   </style>
   ${formCustomCss ? `<style>${formCustomCss}</style>` : ""}
 </head>
@@ -6096,17 +6249,21 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             const linkText = text.trim().length > 0 ? escaped : "empty";
             const isDesktopLink = desktopLinkField != null && fn === desktopLinkField;
             const isMobileLink = mobileLinkField != null && fn === mobileLinkField;
+            const responseMarker =
+              colIdx === 0 && rec && rec.isResponse === true
+                ? '<span class="response-row-marker" title="Response" aria-label="Response">↳</span>'
+                : "";
 
             if (isDesktopLink && isMobileLink) {
-              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp"><a href="${entryUrl}">${linkText}</a></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}<a href="${entryUrl}">${linkText}</a></span></td>`;
             }
             if (isDesktopLink && !isMobileLink) {
-              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp"><span class="entry-link-desktop-only"><a href="${entryUrl}">${linkText}</a></span><span class="entry-plain-mobile-only">${escaped}</span></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}<span class="entry-link-desktop-only"><a href="${entryUrl}">${linkText}</a></span><span class="entry-plain-mobile-only">${escaped}</span></span></td>`;
             }
             if (!isDesktopLink && isMobileLink) {
-              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp"><span class="entry-plain-desktop-only">${escaped}</span><span class="entry-link-mobile-only"><a href="${entryUrl}">${linkText}</a></span></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}<span class="entry-plain-desktop-only">${escaped}</span><span class="entry-link-mobile-only"><a href="${entryUrl}">${linkText}</a></span></span></td>`;
             }
-            return `<td class="${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${escaped}</span></td>`;
+            return `<td class="${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}${escaped}</span></td>`;
           });
           return `\n        <tr>${cells.join("")}</tr>`;
         })
@@ -6140,6 +6297,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     th { background: var(--profile-table-header-bg, #21262d); color: var(--profile-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
     .entry-cell-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+    .response-row-marker { display: inline-block; color: var(--profile-label, #8b949e); margin-right: 0.35rem; font-weight: 600; }
     .entry-link-cell a { color: var(--profile-link, #58a6ff); text-decoration: none; }
     .entry-link-cell a:hover { text-decoration: underline; }
     .empty { color: var(--profile-label, #8b949e); font-style: italic; }
@@ -6952,6 +7110,8 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'localDb'
           : (step && step.target === 'api')
           ? 'api'
+          : (step && step.target === 'response')
+          ? 'response'
           : (step && step.target === 'script')
           ? 'script'
           : (step && step.target === 'update')
@@ -6968,6 +7128,8 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'API id or name'
           : target === 'localDb'
           ? 'Profile id or name'
+          : target === 'response'
+          ? 'Not used'
           : target === 'update'
           ? 'Not used'
           : target === 'create'
@@ -6979,6 +7141,7 @@ function renderEditFlowPage(doc, err, appUi) {
         '<option value="log"' + (target === 'log' ? ' selected' : '') + '>Log (passthrough)</option>' +
         '<option value="api"' + (target === 'api' ? ' selected' : '') + '>Call API</option>' +
         '<option value="localDb"' + (target === 'localDb' ? ' selected' : '') + '>Send to Local DB</option>' +
+        '<option value="response"' + (target === 'response' ? ' selected' : '') + '>Save as response (same profile)</option>' +
         '<option value="script"' + (target === 'script' ? ' selected' : '') + '>Run script (JS Processing)</option>' +
         '<option value="update"' + (target === 'update' ? ' selected' : '') + '>Update current document</option>' +
         '<option value="create"' + (target === 'create' ? ' selected' : '') + '>Create new document in this profile</option>' +
@@ -6998,6 +7161,8 @@ function renderEditFlowPage(doc, err, appUi) {
             stepParam.placeholder = 'API id or name';
           } else if (this.value === 'localDb') {
             stepParam.placeholder = 'Profile id or name';
+          } else if (this.value === 'response') {
+            stepParam.placeholder = 'Not used';
           } else if (this.value === 'update') {
             stepParam.placeholder = 'Not used';
           } else if (this.value === 'create') {
@@ -8309,7 +8474,7 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
   const customCss = doc ? escapeHtml(doc.customCss || "") : "";
   const flowConfigs = Array.isArray(doc && doc.flowConfigs) && doc.flowConfigs.length > 0
     ? doc.flowConfigs
-    : [{ enabled: !!(doc && doc.flowButtonEnabled), target: (doc && doc.flowTarget === "api") ? "api" : (doc && doc.flowTarget === "localDb") ? "localDb" : "log", label: (doc && typeof doc.flowButtonLabel === "string" && doc.flowButtonLabel.trim()) ? doc.flowButtonLabel.trim() : "Send to Flow", param: (doc && typeof doc.flowButtonParam === "string") ? doc.flowButtonParam : "", flowId: "" }];
+    : [{ enabled: !!(doc && doc.flowButtonEnabled), target: (doc && doc.flowTarget === "api") ? "api" : (doc && doc.flowTarget === "localDb") ? "localDb" : (doc && doc.flowTarget === "response") ? "response" : "log", label: (doc && typeof doc.flowButtonLabel === "string" && doc.flowButtonLabel.trim()) ? doc.flowButtonLabel.trim() : "Send to Flow", param: (doc && typeof doc.flowButtonParam === "string") ? doc.flowButtonParam : "", flowId: "" }];
   const initialFlowConfigsJson = JSON.stringify(flowConfigs);
   const labelsArr = (doc && Array.isArray(doc.labels) ? doc.labels : []);
   const fieldLayout = (doc && Array.isArray(doc.fieldLayout) ? doc.fieldLayout : []);
@@ -8561,7 +8726,7 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
       const enabled = !!cfg.enabled;
       const flowId = (cfg && cfg.flowId != null) ? String(cfg.flowId) : '';
       const isSingleStep = !flowId;
-      const target = (cfg.target === 'localDb' || cfg.target === 'api') ? cfg.target : 'log';
+      const target = (cfg.target === 'localDb' || cfg.target === 'api' || cfg.target === 'response') ? cfg.target : 'log';
       const label = (cfg && cfg.label != null) ? String(cfg.label).replace(/"/g, '&quot;') : '';
       const param = (cfg && cfg.param != null) ? String(cfg.param).replace(/"/g, '&quot;') : '';
       let flowOpts = '<option value="">Single step</option>';
@@ -8570,7 +8735,7 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
         const name = (f.name || f._id || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         flowOpts += '<option value="' + id + '"' + (f._id === flowId ? ' selected' : '') + '>' + name + '</option>';
       });
-      const targetOptsSingle = '<option value="log"' + (target === 'log' ? ' selected' : '') + '>Log file</option><option value="localDb"' + (target === 'localDb' ? ' selected' : '') + '>Send to Local Database</option><option value="api"' + (target === 'api' ? ' selected' : '') + '>Call API</option>';
+      const targetOptsSingle = '<option value="log"' + (target === 'log' ? ' selected' : '') + '>Log file</option><option value="localDb"' + (target === 'localDb' ? ' selected' : '') + '>Send to Local Database</option><option value="api"' + (target === 'api' ? ' selected' : '') + '>Call API</option><option value="response"' + (target === 'response' ? ' selected' : '') + '>Save as response</option>';
       const targetOptsNa = '<option value="">n/a</option>';
       const targetOpts = isSingleStep ? targetOptsSingle : targetOptsNa;
       tr.innerHTML = '<td><input type="checkbox" class="flow-cfg-enabled" ' + (enabled ? 'checked' : '') + '></td><td><select class="flow-cfg-flow">' + flowOpts + '</select></td><td><select class="flow-cfg-target">' + targetOpts + '</select></td><td><input type="text" class="flow-cfg-label" placeholder="Send to Flow" value="' + label + '"></td><td><input type="text" class="flow-cfg-param" placeholder="Profile ID or API id" value="' + param + '"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
@@ -8582,8 +8747,8 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
           targetSel.innerHTML = '<option value="">n/a</option>';
           targetSel.value = '';
         } else {
-          const cur = (targetSel.value === 'localDb' || targetSel.value === 'api') ? targetSel.value : 'log';
-          targetSel.innerHTML = '<option value="log"' + (cur === 'log' ? ' selected' : '') + '>Log file</option><option value="localDb"' + (cur === 'localDb' ? ' selected' : '') + '>Send to Local Database</option><option value="api"' + (cur === 'api' ? ' selected' : '') + '>Call API</option>';
+          const cur = (targetSel.value === 'localDb' || targetSel.value === 'api' || targetSel.value === 'response') ? targetSel.value : 'log';
+          targetSel.innerHTML = '<option value="log"' + (cur === 'log' ? ' selected' : '') + '>Log file</option><option value="localDb"' + (cur === 'localDb' ? ' selected' : '') + '>Send to Local Database</option><option value="api"' + (cur === 'api' ? ' selected' : '') + '>Call API</option><option value="response"' + (cur === 'response' ? ' selected' : '') + '>Save as response</option>';
           targetSel.value = cur;
         }
       }
@@ -8714,10 +8879,10 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
         return { enabled, flowId, target, label, param };
       });
       const flowConfigErr = flowConfigs.find(function(c) {
-        return !c.flowId && (c.target === '' || (c.target !== 'log' && c.target !== 'localDb' && c.target !== 'api'));
+        return !c.flowId && (c.target === '' || (c.target !== 'log' && c.target !== 'localDb' && c.target !== 'api' && c.target !== 'response'));
       });
       if (flowConfigErr) {
-        msgEl.textContent = 'When using Single step, please select a Target (Log file, Send to Local Database, or Call API) for each flow button.';
+        msgEl.textContent = 'When using Single step, please select a Target (Log file, Send to Local Database, Call API, or Save as response) for each flow button.';
         msgEl.className = 'msg err';
         return;
       }
