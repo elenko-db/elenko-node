@@ -61,6 +61,8 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const CONFIG_BACKUPS_DIR = path.join(PUBLIC_DIR, "backups");
 const MAX_ENTRIES_PER_PROFILE = 500000;
 const ENTRIES_PAGE_SIZE = 25;
+const ENTRIES_PAGE_SIZE_MIN = 5;
+const ENTRIES_PAGE_SIZE_MAX = 200;
 const SORT_KEY_SPECIAL = ["createdAt", "updatedAt"];
 const SORT_KEY_FIELDS_MAX = 3;
 const DEFAULT_VALUE_SOURCES = ["", "createdAt", "updatedAt", "currentUser"];
@@ -3973,7 +3975,7 @@ app.get("/profile/create", requireAdmin, async (req, res) => {
 
 app.post("/api/profiles", requireAdmin, async (req, res) => {
   try {
-    const { name, description, fieldNames, fieldDefaultSources, fieldDisplay, customCss, listFields: rawListFields } = req.body || {};
+    const { name, description, fieldNames, fieldDefaultSources, fieldDisplay, customCss, listFields: rawListFields, entriesPageSize } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name is required" });
     }
@@ -3988,6 +3990,11 @@ app.post("/api/profiles", requireAdmin, async (req, res) => {
             .filter((f) => fields.includes(f))
             .slice(0, 3)
         : fields.slice(0, 3);
+    const rawPageSize = Number(entriesPageSize);
+    const pageSize =
+      Number.isFinite(rawPageSize) && rawPageSize >= ENTRIES_PAGE_SIZE_MIN && rawPageSize <= ENTRIES_PAGE_SIZE_MAX
+        ? Math.floor(rawPageSize)
+        : ENTRIES_PAGE_SIZE;
     const doc = {
       type: "elenko_profile",
       name: name.trim(),
@@ -3997,6 +4004,7 @@ app.post("/api/profiles", requireAdmin, async (req, res) => {
       fieldDefaultSources: normalizeFieldDefaultSources(fields, fieldDefaultSources),
       fieldDisplay: normalizeFieldDisplay(fields, fieldDisplay),
       listFields,
+      entriesPageSize: pageSize,
       createdAt: new Date().toISOString(),
     };
     const result = await db.insert(doc);
@@ -4189,6 +4197,8 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       mobileSingleEntryFormId,
       infoImportFlowId,
       infoImportButtonTitle,
+      entriesPageSize,
+      splitView,
       guardianFlowId,
       sortKeyFields: rawSortKeyFields,
       sortDirection,
@@ -4267,6 +4277,16 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
         ? infoImportButtonTitle.trim()
         : "Import from Guardian";
     doc.infoImportButtonTitle = importButtonTitle;
+    const rawPageSize = Number(entriesPageSize);
+    doc.entriesPageSize =
+      Number.isFinite(rawPageSize) && rawPageSize >= ENTRIES_PAGE_SIZE_MIN && rawPageSize <= ENTRIES_PAGE_SIZE_MAX
+        ? Math.floor(rawPageSize)
+        : ENTRIES_PAGE_SIZE;
+    const splitCfg = splitView && typeof splitView === "object" ? splitView : {};
+    doc.splitView = {
+      enabled: !!(splitCfg.enabled === true || splitCfg.enabled === "true"),
+      orientation: splitCfg.orientation === "horizontal" ? "horizontal" : "vertical",
+    };
     const sortKeyFields = Array.isArray(rawSortKeyFields)
       ? rawSortKeyFields
           .filter((f) => typeof f === "string" && f.trim())
@@ -4647,7 +4667,7 @@ app.get("/profile/:id/entry/:entryId", async (req, res) => {
       }
     }
     const role = (req.session && req.session.role) || "editor";
-    const returnQuery = { q: req.query.q, page: req.query.page };
+    const returnQuery = { q: req.query.q, page: req.query.page, split: req.query.split };
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(await renderViewEntryPage(doc, record, role, formDoc, returnQuery));
   } catch (err) {
@@ -4979,9 +4999,16 @@ app.get("/profile/:id", async (req, res) => {
       return res.redirect(profileBase);
     }
     const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+    const profileEntriesPageSizeRaw = Number(doc.entriesPageSize);
+    const profileEntriesPageSize =
+      Number.isFinite(profileEntriesPageSizeRaw) &&
+      profileEntriesPageSizeRaw >= ENTRIES_PAGE_SIZE_MIN &&
+      profileEntriesPageSizeRaw <= ENTRIES_PAGE_SIZE_MAX
+        ? Math.floor(profileEntriesPageSizeRaw)
+        : ENTRIES_PAGE_SIZE;
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const searchQuery = (req.query.q || "").trim();
-    const skip = (page - 1) * ENTRIES_PAGE_SIZE;
+    const skip = (page - 1) * profileEntriesPageSize;
 
     const selector = { type: "elenko_record", profileId };
     if (searchQuery && fieldNames.length > 0) {
@@ -5003,7 +5030,7 @@ app.get("/profile/:id", async (req, res) => {
       try {
         const countResult = await db.view("records", "countByProfile", { key: profileId });
         const totalEntries = countResult.rows && countResult.rows[0] ? countResult.rows[0].value : 0;
-        totalPages = Math.max(1, Math.ceil(totalEntries / ENTRIES_PAGE_SIZE));
+        totalPages = Math.max(1, Math.ceil(totalEntries / profileEntriesPageSize));
       } catch (e) {
         totalPages = 1;
       }
@@ -5014,8 +5041,8 @@ app.get("/profile/:id", async (req, res) => {
       const sortConfig = JSON.stringify({ sortKeyFields, sortDirection });
       const cached = profileListCache.get(cacheKey);
       if (cached && cached.sortConfig === sortConfig && Array.isArray(cached.docs)) {
-        totalPages = Math.max(1, Math.ceil(cached.docs.length / ENTRIES_PAGE_SIZE));
-        allDocs = cached.docs.slice(skip, skip + ENTRIES_PAGE_SIZE + 1);
+        totalPages = Math.max(1, Math.ceil(cached.docs.length / profileEntriesPageSize));
+        allDocs = cached.docs.slice(skip, skip + profileEntriesPageSize + 1);
       } else {
         const sortResult = await db.find({
           selector,
@@ -5037,8 +5064,8 @@ app.get("/profile/:id", async (req, res) => {
         };
         fullDocs.sort(cmp);
         profileListCache.set(cacheKey, { docs: fullDocs, sortConfig });
-        totalPages = Math.max(1, Math.ceil(fullDocs.length / ENTRIES_PAGE_SIZE));
-        allDocs = fullDocs.slice(skip, skip + ENTRIES_PAGE_SIZE + 1);
+        totalPages = Math.max(1, Math.ceil(fullDocs.length / profileEntriesPageSize));
+        allDocs = fullDocs.slice(skip, skip + profileEntriesPageSize + 1);
       }
     } else if (useSortKey && searchQuery) {
       // Search with sort-key profile: use cached sorted docs or fetch, sort, cache, then paginate
@@ -5046,8 +5073,8 @@ app.get("/profile/:id", async (req, res) => {
       const searchCacheKey = profileId + SEARCH_CACHE_KEY_SEP + sortConfig + SEARCH_CACHE_KEY_SEP + searchQuery;
       const cached = searchListCache.get(searchCacheKey);
       if (cached && Array.isArray(cached.docs)) {
-        totalPages = Math.max(1, Math.ceil(cached.docs.length / ENTRIES_PAGE_SIZE));
-        allDocs = cached.docs.slice(skip, skip + ENTRIES_PAGE_SIZE + 1);
+        totalPages = Math.max(1, Math.ceil(cached.docs.length / profileEntriesPageSize));
+        allDocs = cached.docs.slice(skip, skip + profileEntriesPageSize + 1);
       } else {
         const sortResult = await db.find({
           selector,
@@ -5068,22 +5095,22 @@ app.get("/profile/:id", async (req, res) => {
         };
         fullDocs.sort(cmp);
         searchListCache.set(searchCacheKey, { docs: fullDocs });
-        totalPages = Math.max(1, Math.ceil(fullDocs.length / ENTRIES_PAGE_SIZE));
-        allDocs = fullDocs.slice(skip, skip + ENTRIES_PAGE_SIZE + 1);
+        totalPages = Math.max(1, Math.ceil(fullDocs.length / profileEntriesPageSize));
+        allDocs = fullDocs.slice(skip, skip + profileEntriesPageSize + 1);
       }
     } else {
       const recordsResult = await db.find({
         selector,
         fields: fieldsForFind,
         sort: [{ _id: "asc" }],
-        limit: ENTRIES_PAGE_SIZE + 1,
+        limit: profileEntriesPageSize + 1,
         skip,
       });
       allDocs = recordsResult.docs || [];
       if (searchQuery && allDocs.length > 0) totalPages = null; // unknown total for search without sort key
     }
-    const records = allDocs.slice(0, ENTRIES_PAGE_SIZE);
-    const hasNext = allDocs.length > ENTRIES_PAGE_SIZE;
+    const records = allDocs.slice(0, profileEntriesPageSize);
+    const hasNext = allDocs.length > profileEntriesPageSize;
     const hasPrev = page > 1;
     const role = (req.session && req.session.role) || "editor";
     res.set("Content-Type", "text/html; charset=utf-8");
@@ -5491,6 +5518,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   const returnParts = [];
   if (returnQuery && returnQuery.page) returnParts.push("page=" + encodeURIComponent(String(returnQuery.page)));
   if (returnQuery && returnQuery.q) returnParts.push("q=" + encodeURIComponent(returnQuery.q));
+  const isSplitEmbed = !!(returnQuery && String(returnQuery.split || "") === "1");
   const returnQueryStr = returnParts.length > 0 ? "?" + returnParts.join("&") : "";
   const backUrl = "/profile/" + encodeURIComponent(profileId) + returnQueryStr;
   const editUrl = "/profile/" + encodeURIComponent(profileId) + "/entry/" + encodeURIComponent(entryId) + "/edit" + returnQueryStr;
@@ -5757,12 +5785,16 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   <style>
     ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--entry-bg, #0f1419); color: var(--entry-text, #e6edf3); max-width: 36rem; }
-    h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: var(--entry-label, #8b949e); margin-bottom: 1.5rem; }
-    .actions { margin-bottom: 1.5rem; }
-    .actions a { color: var(--entry-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
-    .actions a:hover { text-decoration: underline; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 1.25rem; background: var(--entry-bg, #0f1419); color: var(--entry-text, #e6edf3); max-width: 48rem; }
+    h1 { font-weight: 600; margin: 0; font-size: 1.25rem; line-height: 1.2; }
+    .sub { color: var(--entry-label, #8b949e); margin: 0; }
+    .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 0.75rem; }
+    .topbar-main { min-width: 0; flex: 1 1 auto; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
+    .topbar-links { margin: 0; display: inline-flex; align-items: baseline; gap: 0.75rem; }
+    .topbar-links a { color: var(--entry-link, #58a6ff); text-decoration: none; }
+    .topbar-links a:hover { text-decoration: underline; }
+    .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
+    .topbar-actions { flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 0.5rem; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 0.75rem 1rem; text-align: left; }
     .label { color: var(--entry-label, #8b949e); width: 40%; }
@@ -5816,14 +5848,20 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   ${formCustomCss ? `<style>${formCustomCss}</style>` : ""}
 </head>
 <body>
-  <div class="actions"><a href="${escapeHtml(backUrl)}">← Back to database</a>${canEdit ? ` <a href="${editUrl}">Edit</a>` : ""}</div>
-  <div class="actions entry-flow-actions" style="margin-top:0.5rem;display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;">
-    ${flowButtonsHtml}
-    <button type="button" id="refresh-entry-btn" class="btn-flow btn-flow-secondary" style="${hasFlowButtons ? "margin-left:0;" : ""}">Refresh</button>
+  <div class="topbar">
+    <div class="topbar-main">
+      <div class="topbar-links">${isSplitEmbed ? "" : `<a href="${escapeHtml(backUrl)}" title="Back to database" aria-label="Back to database">⮜</a>`}${canEdit ? `<a href="${editUrl}">Edit</a>` : ""}</div>
+      <div class="topbar-titleline">
+        <h1>${title}</h1>
+        ${formLabel ? `<span class="sub">Form: ${escapeHtml(formLabel)}</span>` : ""}
+      </div>
+    </div>
+    <div class="topbar-actions entry-flow-actions">
+      ${flowButtonsHtml}
+      <button type="button" id="refresh-entry-btn" class="btn-flow btn-flow-secondary">Refresh</button>
+    </div>
   </div>
-  ${hasFlowButtons ? '<div id="flow-msg" class="flow-msg"></div>' : ""}
-  <h1>${title}</h1>
-  ${formLabel ? `<p class="sub">Form: ${escapeHtml(formLabel)}</p>` : ""}
+  ${hasFlowButtons ? '<div id="flow-msg" class="flow-msg" style="margin-bottom:0.5rem;"></div>' : ""}
   ${contentHtml}
   ${hasFlowButtons ? "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; background: #238636; color: #fff; }.btn-flow:hover { background: #2ea043; }.btn-flow:disabled { opacity: 0.6; cursor: not-allowed; }.btn-flow-secondary { background: #21262d; }.btn-flow-secondary:hover { background: #30363d; }.flow-msg { margin-top: 0.5rem; font-size: 0.875rem; }.flow-msg.ok { color: #3fb950; }.flow-msg.err { color: #f85149; }</style>\n  <script>\n    (function() {\n      var msgEl = document.getElementById(\"flow-msg\");\n      document.querySelectorAll(\".entry-flow-actions .btn-flow[data-entry-id]\").forEach(function(btn) {\n        if (btn.id === \"refresh-entry-btn\") return;\n        btn.onclick = function() {\n          var pid = btn.getAttribute(\"data-profile-id\");\n          var eid = btn.getAttribute(\"data-entry-id\");\n          if (!pid || !eid) return;\n          btn.disabled = true;\n          if (msgEl) { msgEl.textContent = \"\"; msgEl.className = \"flow-msg\"; }\n          var body = {};\n          var idx = btn.getAttribute(\"data-flow-index\");\n          if (idx !== null && idx !== \"\") body.flowIndex = parseInt(idx, 10);\n          var url = \"/api/profile/\" + encodeURIComponent(pid) + \"/entry/\" + encodeURIComponent(eid) + \"/send-to-flow\";\n          fetch(url, { method: \"POST\", headers: { \"Content-Type\": \"application/json\" }, body: JSON.stringify(body) })\n            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })\n            .then(function(o) {\n              if (o.ok && msgEl) { msgEl.textContent = \"Sent to Flow.\"; msgEl.className = \"flow-msg ok\"; }\n              else if (msgEl) { msgEl.textContent = o.data.error || \"Failed\"; msgEl.className = \"flow-msg err\"; }\n              btn.disabled = false;\n            })\n            .catch(function(e) { if (msgEl) { msgEl.textContent = e.message || \"Request failed\"; msgEl.className = \"flow-msg err\"; } btn.disabled = false; });\n        };\n      });\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>" : "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }.btn-flow-secondary { background: #21262d; color: #e6edf3; }.btn-flow-secondary:hover { background: #30363d; }</style>\n  <script>\n    (function() {\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>"}
   <script>
@@ -5877,6 +5915,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   if (returnQuery && returnQuery.q) returnParts.push("q=" + encodeURIComponent(returnQuery.q));
   const returnQueryStr = returnParts.length > 0 ? "?" + returnParts.join("&") : "";
   const backUrl = "/profile/" + encodeURIComponent(profileId) + returnQueryStr;
+  const viewUrl = "/profile/" + encodeURIComponent(profileId) + "/entry/" + encodeURIComponent(entryId) + returnQueryStr;
   const formCustomCss = formDoc && formDoc.customCss ? formDoc.customCss : "";
 
   const theme = formDoc && formDoc.theme ? formDoc.theme : DEFAULT_ENTRY_VIEW_THEME;
@@ -5909,6 +5948,14 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   }
   function labelClass(o) {
     return o.type === "label" ? "label static-label" : "label field-label";
+  }
+  function editControlHtml(o, value) {
+    const escapedName = escapeHtml(o.fieldName);
+    const escapedValue = escapeHtml(value);
+    if (o.fieldType === "url") {
+      return `<input type="url" class="entry-field" name="${escapedName}" placeholder="${escapedName}" value="${escapedValue}">`;
+    }
+    return `<textarea class="entry-field entry-field-textarea" name="${escapedName}" placeholder="${escapedName}" rows="3">${escapedValue}</textarea>`;
   }
 
   let contentHtml;
@@ -6015,14 +6062,18 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   <style>
     ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--entry-bg, #0f1419); color: var(--entry-text, #e6edf3); max-width: 36rem; }
-    h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: var(--entry-label, #8b949e); margin-bottom: 1.5rem; }
-    .actions { margin-bottom: 1.5rem; }
-    .actions a { color: var(--entry-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
-    .actions a:hover { text-decoration: underline; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 1.25rem; background: var(--entry-bg, #0f1419); color: var(--entry-text, #e6edf3); max-width: 48rem; }
+    h1 { font-weight: 600; margin: 0; font-size: 1.2rem; line-height: 1.2; }
+    .sub { color: var(--entry-label, #8b949e); margin: 0; }
+    .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 0.75rem; }
+    .topbar-main { min-width: 0; flex: 1 1 auto; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
+    .topbar-links { display: inline-flex; align-items: baseline; gap: 0.75rem; }
+    .topbar-links a { color: var(--entry-link, #58a6ff); text-decoration: none; }
+    .topbar-links a:hover { text-decoration: underline; }
+    .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
+    .topbar-actions { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 0.75rem 1rem; text-align: left; }
+    th, td { padding: 0.4rem 0.6rem; text-align: left; }
     .label { color: var(--entry-label, #8b949e); width: 40%; }
     td.value { background: var(--entry-field-bg-edit, #161b22); border-radius: 6px; }
     .entry-view-stack { --entry-stack-field-max-height: 12rem; }
@@ -6031,14 +6082,14 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       min-width: 0;
       background: var(--entry-field-bg-edit, #161b22);
       border-radius: 6px;
-      padding: 0.75rem 1rem;
+      padding: 0.4rem 0.6rem;
     }
     .entry-view-stack .label { display: block; margin-bottom: 0.25rem; }
     .entry-view-stack .entry-label-only .label { white-space: nowrap; }
     .entry-view-stack textarea.entry-field-textarea {
-      min-height: 5.5rem;
-      height: 11rem;
-      max-height: 11rem;
+      min-height: 1.75rem;
+      height: 1.75rem;
+      max-height: none;
       resize: vertical;
       overflow-y: auto;
       box-sizing: border-box;
@@ -6046,14 +6097,14 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     .entry-view-grid { display: grid; gap: 1rem; }
     .entry-grid-cell { min-width: 0; }
     .entry-grid-cell .label { display: block; margin-bottom: 0.25rem; color: var(--entry-label, #8b949e); }
-    .entry-grid-cell .value { min-width: 0; overflow: hidden; background: var(--entry-field-bg-edit, #161b22); border-radius: 6px; padding: 0.75rem 1rem; }
+    .entry-grid-cell .value { min-width: 0; overflow: hidden; background: var(--entry-field-bg-edit, #161b22); border-radius: 6px; padding: 0.4rem 0.6rem; }
     .entry-grid-cell.entry-label-only .label { white-space: nowrap; }
     .entry-label-row .label { white-space: nowrap; }
     td.value { min-width: 0; overflow: hidden; }
-    input.entry-field, textarea.entry-field { width: 100%; min-width: 0; max-width: 100%; padding: 0.5rem; background: var(--entry-field-bg-edit, #161b22); color: var(--entry-text-edit, #e6edf3); border: 1px solid transparent; border-radius: 4px; font-size: 1rem; box-sizing: border-box; }
+    input.entry-field, textarea.entry-field { width: 100%; min-width: 0; max-width: 100%; padding: 0.35rem 0.45rem; background: var(--entry-field-bg-edit, #161b22); color: var(--entry-text-edit, #e6edf3); border: 1px solid transparent; border-radius: 4px; font-size: 0.95rem; box-sizing: border-box; }
     input.entry-field:focus, textarea.entry-field:focus { outline: none; border-color: var(--entry-link, #58a6ff); }
-    textarea.entry-field-textarea { resize: vertical; min-height: 5.5rem; line-height: 1.35; white-space: pre-wrap; overflow-wrap: break-word; }
-    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; margin-top: 1rem; }
+    textarea.entry-field-textarea { resize: vertical; min-height: 1.75rem; line-height: 1.25; white-space: pre-wrap; overflow-wrap: break-word; }
+    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.45rem 0.8rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }
     .btn:hover { background: #2ea043; }
     .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; }
     .btn-secondary:hover { background: #30363d; }
@@ -6067,15 +6118,21 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   ${formCustomCss ? `<style>${formCustomCss}</style>` : ""}
 </head>
 <body>
-  <div class="actions">
-    <a href="${escapeHtml(backUrl)}">← Back to database</a>
-    ${formChoicesHtml}
-    <button type="submit" form="entry-form" class="btn" style="margin-left:1rem;">Save</button>
-    <a href="${escapeHtml(backUrl)}" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
-    <button type="button" class="btn btn-delete" id="delete-entry-btn" style="margin-left:0.5rem;">Delete</button>
+  <div class="topbar">
+    <div class="topbar-main">
+      <div class="topbar-links"><a href="${escapeHtml(viewUrl)}" title="Back to entry" aria-label="Back to entry">⮜</a></div>
+      <div class="topbar-titleline">
+        <h1>${title}</h1>
+        <span class="sub">Edit entry</span>
+      </div>
+      ${formChoicesHtml}
+    </div>
+    <div class="topbar-actions">
+      <button type="submit" form="entry-form" class="btn">Save</button>
+      <button type="button" class="btn btn-delete" id="delete-entry-btn">Delete</button>
+      <a href="${escapeHtml(viewUrl)}" class="btn btn-secondary">Cancel</a>
+    </div>
   </div>
-  <h1>${title}</h1>
-  <p class="sub">Edit entry${formLabel ? ` – Form: ${escapeHtml(formLabel)}` : ""}</p>
   <form id="entry-form">
     <input type="hidden" id="rev" value="${rev}">
     ${contentHtml}
@@ -6119,7 +6176,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
         if (result.rev) document.getElementById('rev').value = result.rev;
         msgEl.textContent = 'Entry saved.';
         msgEl.className = 'msg ok';
-        setTimeout(() => { window.location.href = ${JSON.stringify(backUrl)}; }, 800);
+        setTimeout(() => { window.location.href = ${JSON.stringify(viewUrl)}; }, 800);
       } catch (err) {
         msgEl.textContent = err.message || 'Request failed';
         msgEl.className = 'msg err';
@@ -6161,6 +6218,8 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   const qParam = searchQuery ? "&q=" + encodeURIComponent(searchQuery) : "";
   const prevUrl = hasPrev ? profileBase + "?page=" + (page - 1) + qParam : null;
   const nextUrl = hasNext ? profileBase + "?page=" + (page + 1) + qParam : null;
+  const firstUrl = page > 1 ? profileBase + "?page=1" + qParam : null;
+  const lastUrl = totalPages != null && page < totalPages ? profileBase + "?page=" + totalPages + qParam : null;
   const pageOfTotal = totalPages != null ? " of " + totalPages : "";
   const infoImportFlowId =
     typeof doc.infoImportFlowId === "string" && doc.infoImportFlowId.trim()
@@ -6170,6 +6229,9 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     typeof doc.infoImportButtonTitle === "string" && doc.infoImportButtonTitle.trim()
       ? doc.infoImportButtonTitle.trim()
       : "Import from Guardian";
+  const splitViewCfg = doc && doc.splitView && typeof doc.splitView === "object" ? doc.splitView : null;
+  const splitViewEnabled = !!(splitViewCfg && splitViewCfg.enabled);
+  const splitViewOrientation = splitViewCfg && splitViewCfg.orientation === "horizontal" ? "horizontal" : "vertical";
 
   const maxMobileListFields = 3;
   const rawMobileListFields = Array.isArray(doc.listFields) ? doc.listFields : [];
@@ -6255,17 +6317,17 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
                 : "";
 
             if (isDesktopLink && isMobileLink) {
-              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}<a href="${entryUrl}">${linkText}</a></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}<a class="entry-open-link" data-entry-id="${escapeHtml(rec._id || "")}" href="${entryUrl}">${linkText}</a></span></td>`;
             }
             if (isDesktopLink && !isMobileLink) {
-              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}<span class="entry-link-desktop-only"><a href="${entryUrl}">${linkText}</a></span><span class="entry-plain-mobile-only">${escaped}</span></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}<span class="entry-link-desktop-only"><a class="entry-open-link" data-entry-id="${escapeHtml(rec._id || "")}" href="${entryUrl}">${linkText}</a></span><span class="entry-plain-mobile-only">${escaped}</span></span></td>`;
             }
             if (!isDesktopLink && isMobileLink) {
-              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}<span class="entry-plain-desktop-only">${escaped}</span><span class="entry-link-mobile-only"><a href="${entryUrl}">${linkText}</a></span></span></td>`;
+              return `<td class="entry-link-cell${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}<span class="entry-plain-desktop-only">${escaped}</span><span class="entry-link-mobile-only"><a class="entry-open-link" data-entry-id="${escapeHtml(rec._id || "")}" href="${entryUrl}">${linkText}</a></span></span></td>`;
             }
             return `<td class="${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}${escaped}</span></td>`;
           });
-          return `\n        <tr>${cells.join("")}</tr>`;
+          return `\n        <tr class="entry-row" data-entry-id="${escapeHtml(rec._id || "")}">${cells.join("")}</tr>`;
         })
       : [];
 
@@ -6284,12 +6346,16 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   <style>
     ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--profile-bg, #0f1419); color: var(--profile-text, #e6edf3); min-height: 100vh; }
-    h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: var(--profile-label, #8b949e); margin-bottom: 1.5rem; }
-    .actions { margin-bottom: 1.5rem; }
-    .actions a { color: var(--profile-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
-    .actions a:hover { text-decoration: underline; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 1.25rem; background: var(--profile-bg, #0f1419); color: var(--profile-text, #e6edf3); min-height: 100vh; }
+    h1 { font-weight: 600; margin: 0; font-size: 1.25rem; line-height: 1.2; }
+    .sub { color: var(--profile-label, #8b949e); margin: 0; }
+    .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 0.75rem; }
+    .topbar-main { min-width: 0; flex: 1 1 auto; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
+    .topbar-links { margin: 0; display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
+    .topbar-links a { color: var(--profile-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
+    .topbar-links a:hover { text-decoration: underline; }
+    .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
+    .topbar-actions { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: flex-end; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.35rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.9rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
     table.elenko-db-table { width: 100%; border-collapse: collapse; background: var(--profile-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
@@ -6301,31 +6367,50 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .entry-link-cell a { color: var(--profile-link, #58a6ff); text-decoration: none; }
     .entry-link-cell a:hover { text-decoration: underline; }
     .empty { color: var(--profile-label, #8b949e); font-style: italic; }
-    .search-bar { margin-bottom: 1rem; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
-    .search-bar input[type="search"] { padding: 0.5rem 0.75rem; background: var(--profile-table-bg, #161b22); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; color: var(--profile-text, #e6edf3); font-size: 1rem; min-width: 12rem; }
+    .top-tools { margin-bottom: 0.75rem; display: flex; flex-wrap: nowrap; gap: 0.75rem; align-items: center; }
+    .search-bar { margin: 0; display: flex; flex-wrap: nowrap; gap: 0.5rem; align-items: center; flex: 1 1 45%; min-width: 0; }
+    .search-bar input[type="search"] { padding: 0.5rem 0.75rem; background: var(--profile-table-bg, #161b22); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; color: var(--profile-text, #e6edf3); font-size: 1rem; min-width: 10rem; flex: 1 1 auto; }
     .search-bar input[type="search"]:focus { outline: none; border-color: var(--profile-link, #58a6ff); }
     .search-bar .btn-search { padding: 0.5rem 0.75rem; background: var(--profile-table-header-bg, #21262d); color: var(--profile-link, #58a6ff); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
     .search-bar .btn-search:hover { background: #30363d; }
     .search-bar .btn-clear { padding: 0.5rem 0.75rem; background: transparent; color: var(--profile-label, #8b949e); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
     .search-bar .btn-clear:hover { background: #30363d; color: var(--profile-text, #e6edf3); }
-    .pagination { margin-bottom: 1rem; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .pagination { margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
     .pagination .btn-pag { display: inline-block; padding: 0.5rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.875rem; }
     .pagination .btn-pag-prev, .pagination .btn-pag-next { background: var(--profile-table-header-bg, #21262d); color: var(--profile-link, #58a6ff); }
+    .pagination .btn-pag-first, .pagination .btn-pag-last, .pagination .btn-pag-row { background: var(--profile-table-header-bg, #21262d); color: var(--profile-link, #58a6ff); border: 1px solid var(--profile-table-border, #21262d); cursor: pointer; }
     .pagination .btn-pag-prev:hover, .pagination .btn-pag-next:hover { background: #30363d; }
+    .pagination .btn-pag-first:hover, .pagination .btn-pag-last:hover, .pagination .btn-pag-row:hover { background: #30363d; }
+    .pagination .btn-pag-row:disabled { color: #484f58; cursor: not-allowed; background: var(--profile-table-header-bg, #21262d); }
     .pagination .btn-pag.disabled { color: #484f58; pointer-events: none; }
     .pagination .page-num { color: var(--profile-label, #8b949e); font-size: 0.875rem; }
     th.col-bodytext, td.col-bodytext { max-width: 50vw; width: 50%; }
     th.col-bodytext.col-disp-pct, td.col-bodytext.col-disp-pct { max-width: none; }
-    .guardian-import { margin: 0 0 1rem 0; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
-    .guardian-import input[type="text"] { padding: 0.5rem 0.75rem; background: var(--profile-table-bg, #161b22); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; color: var(--profile-text, #e6edf3); font-size: 1rem; min-width: 12rem; max-width: 100%; box-sizing: border-box; }
+    .guardian-import { margin: 0; display: flex; gap: 0.5rem; align-items: center; flex-wrap: nowrap; flex: 1 1 55%; min-width: 0; }
+    .guardian-import input[type="text"] { padding: 0.5rem 0.75rem; background: var(--profile-table-bg, #161b22); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; color: var(--profile-text, #e6edf3); font-size: 1rem; min-width: 10rem; max-width: 100%; box-sizing: border-box; flex: 1 1 auto; }
     @media (min-width: 769px) {
-      .guardian-import input[type="text"] { min-width: 36rem; flex: 1 1 36rem; max-width: min(100%, 48rem); }
+      .top-tools { flex-wrap: nowrap; }
+      .guardian-import label { white-space: nowrap; }
     }
     .guardian-import button { padding: 0.4rem 0.75rem; background: var(--profile-table-header-bg, #21262d); color: var(--profile-link, #58a6ff); border: 1px solid var(--profile-table-border, #21262d); border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
     .guardian-import button:hover { background: #30363d; }
     .guardian-import .guardian-msg { font-size: 0.875rem; color: var(--profile-label, #8b949e); }
     .guardian-import .guardian-msg.err { color: #f85149; }
     .guardian-import .guardian-msg.ok { color: #3fb950; }
+    .split-view-wrap { display: flex; gap: 0.75rem; min-height: 65vh; align-items: stretch; }
+    .split-view-wrap.split-vertical { flex-direction: row; }
+    .split-view-wrap.split-horizontal { flex-direction: column; height: 68vh; min-height: 28rem; }
+    .split-list-pane { background: transparent; min-width: 0; min-height: 0; flex: 1 1 50%; }
+    .split-entry-pane { border: 1px solid var(--profile-table-border, #21262d); border-radius: 8px; background: var(--profile-table-bg, #161b22); min-width: 0; min-height: 0; flex: 1 1 50%; overflow: hidden; }
+    .split-entry-frame { width: 100%; height: 100%; min-height: 18rem; border: 0; background: #fff; }
+    .split-entry-empty { color: var(--profile-label, #8b949e); padding: 1rem; }
+    .split-divider { border-radius: 6px; background: var(--profile-table-border, #21262d); opacity: 0.9; user-select: none; touch-action: none; }
+    .split-view-wrap.split-vertical .split-divider { width: 0.45rem; cursor: col-resize; }
+    .split-view-wrap.split-horizontal .split-divider { height: 0.45rem; cursor: row-resize; }
+    .split-view-wrap.split-vertical .split-list-pane, .split-view-wrap.split-vertical .split-entry-pane { min-height: 65vh; }
+    .split-view-wrap.split-horizontal .split-list-pane, .split-view-wrap.split-horizontal .split-entry-pane { min-height: 0; }
+    .split-view-wrap.split-horizontal .split-list-pane { overflow: auto; }
+    .entry-row.selected td { background: rgba(88, 166, 255, 0.12); }
     .entry-plain-mobile-only,
     .entry-link-mobile-only { display: none; }
     @media (min-width: 769px) {
@@ -6336,6 +6421,10 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     }
     @media (max-width: 768px) {
       table { font-size: 0.9rem; }
+      .top-tools { flex-direction: column; align-items: stretch; gap: 0.5rem; }
+      .search-bar, .guardian-import { flex: 1 1 auto; width: 100%; }
+      .search-bar { flex-wrap: wrap; }
+      .guardian-import { flex-wrap: wrap; }
       th.col-mobile-hidden,
       td.col-mobile-hidden { display: none; }
       .entry-link-desktop-only { display: none; }
@@ -6348,26 +6437,52 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   ${customCss ? `<style>${customCss}</style>` : ""}
 </head>
 <body>
-  <div class="actions"><a href="/">← Profiles</a>${canEdit ? (isAdmin ? `<a href="/profile/${encodeURIComponent(doc._id)}/edit">Edit profile</a>` : "") + `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn">Create entry</a>` : ""}</div>
-  ${canEdit && infoImportFlowId ? `<form id="info-import-form" class="guardian-import"><label for="info-import-query" style="margin:0;color:var(--profile-label, #8b949e);">Query:</label><input type="text" id="info-import-query" placeholder="e.g. renewable energy"><button type="submit">${escapeHtml(infoImportButtonTitle)}</button><span id="info-import-msg" class="guardian-msg"></span></form>` : ""}
-  <h1>${title}</h1>
-  ${description ? `<p class="sub">${description}</p>` : ""}
-  <form method="get" action="${profileBase}" class="search-bar">
-    <input type="search" name="q" value="${escapeHtml(searchQuery)}" placeholder="Search entries…" aria-label="Search entries">
-    <input type="hidden" name="page" value="1">
-    <button type="submit" class="btn-search">Search</button>
-    ${searchQuery ? `<a href="${profileBase}?clearSearch=1" class="btn-clear">Clear</a>` : ""}
-  </form>
-  <div class="pagination">
-    ${hasPrev ? `<a href="${prevUrl}" class="btn-pag btn-pag-prev">← Previous</a>` : `<span class="btn-pag btn-pag-prev disabled">← Previous</span>`}
-    <span class="page-num">Page ${escapeHtml(String(page))}${escapeHtml(pageOfTotal)}</span>
-    ${hasNext ? `<a href="${nextUrl}" class="btn-pag btn-pag-next">Next →</a>` : `<span class="btn-pag btn-pag-next disabled">Next →</span>`}
+  <div class="topbar">
+    <div class="topbar-main">
+      <div class="topbar-links"><a href="/" title="Profiles" aria-label="Profiles">⮜</a>${canEdit && isAdmin ? `<a href="/profile/${encodeURIComponent(doc._id)}/edit">Edit profile</a>` : ""}</div>
+      <div class="topbar-titleline">
+        <h1>${title}</h1>
+        ${description ? `<span class="sub">${description}</span>` : ""}
+      </div>
+    </div>
+    <div class="topbar-actions">${canEdit ? `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn">Create entry</a>` : ""}</div>
   </div>
+  ${splitViewEnabled && splitViewOrientation !== "horizontal" ? `<div class="split-view-wrap split-${splitViewOrientation}" data-orientation="${splitViewOrientation}"><div class="split-list-pane">` : ""}
+  <div class="top-tools">
+    <form method="get" action="${profileBase}" class="search-bar">
+      <input type="search" name="q" value="${escapeHtml(searchQuery)}" placeholder="Search entries…" aria-label="Search entries">
+      <input type="hidden" name="page" value="1">
+      <button type="submit" class="btn-search">Search</button>
+      ${searchQuery ? `<a href="${profileBase}?clearSearch=1" class="btn-clear">Clear</a>` : ""}
+    </form>
+    ${canEdit && infoImportFlowId ? `<form id="info-import-form" class="guardian-import"><label for="info-import-query" style="margin:0;color:var(--profile-label, #8b949e);">Query:</label><input type="text" id="info-import-query" placeholder="e.g. renewable energy"><button type="submit">${escapeHtml(infoImportButtonTitle)}</button><span id="info-import-msg" class="guardian-msg"></span></form>` : ""}
+  </div>
+  <div class="pagination">
+    ${firstUrl ? `<a href="${firstUrl}" class="btn-pag btn-pag-first">|◀</a>` : `<span class="btn-pag btn-pag-first disabled">|◀</span>`}
+    ${hasPrev ? `<a href="${prevUrl}" class="btn-pag btn-pag-prev">◀◀</a>` : `<span class="btn-pag btn-pag-prev disabled">◀◀</span>`}
+    <button type="button" class="btn-pag btn-pag-row" id="btn-prev-row">◀</button>
+    <span class="page-num">Page ${escapeHtml(String(page))}${escapeHtml(pageOfTotal)}</span>
+    <button type="button" class="btn-pag btn-pag-row" id="btn-next-row">▶</button>
+    ${hasNext ? `<a href="${nextUrl}" class="btn-pag btn-pag-next">▶▶</a>` : `<span class="btn-pag btn-pag-next disabled">▶▶</span>`}
+    ${lastUrl ? `<a href="${lastUrl}" class="btn-pag btn-pag-last">▶|</a>` : `<span class="btn-pag btn-pag-last disabled">▶|</span>`}
+  </div>
+  ${
+    splitViewEnabled && splitViewOrientation === "horizontal"
+      ? `<div class="split-view-wrap split-horizontal" data-orientation="horizontal"><div class="split-entry-pane"><iframe id="split-entry-frame" class="split-entry-frame" title="Selected entry view"></iframe><div id="split-entry-empty" class="split-entry-empty">Select an entry from the first-column link to open it here.</div></div><div class="split-divider" id="split-divider" aria-hidden="true"></div><div class="split-list-pane">`
+      : ""
+  }
   <table class="elenko-db-table">
     <thead>${headerRow}</thead>
     <tbody>${dataRows.join("")}${emptyRow}
     </tbody>
   </table>
+  ${
+    splitViewEnabled
+      ? splitViewOrientation === "horizontal"
+        ? `</div></div>`
+        : `</div><div class="split-divider" id="split-divider" aria-hidden="true"></div><div class="split-entry-pane"><iframe id="split-entry-frame" class="split-entry-frame" title="Selected entry view"></iframe><div id="split-entry-empty" class="split-entry-empty">Select an entry from the first-column link to open it here.</div></div></div>`
+      : ""
+  }
   ${canEdit && infoImportFlowId ? `<script>
     (function() {
       var form = document.getElementById('info-import-form');
@@ -6406,6 +6521,152 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       });
     })();
   </script>` : ""}
+  ${splitViewEnabled ? `<script>
+    (function() {
+      var wrap = document.querySelector('.split-view-wrap');
+      var listPane = wrap ? wrap.querySelector('.split-list-pane') : null;
+      var entryPane = wrap ? wrap.querySelector('.split-entry-pane') : null;
+      var divider = document.getElementById('split-divider');
+      var orientation = wrap ? (wrap.getAttribute('data-orientation') || 'vertical') : 'vertical';
+      var ratioKey = 'elenko:splitRatio:' + ${JSON.stringify(String(doc._id || ""))} + ':' + orientation;
+      var frame = document.getElementById('split-entry-frame');
+      var empty = document.getElementById('split-entry-empty');
+      if (!frame || !wrap || !listPane || !entryPane || !divider) return;
+      function applyRatio(rawRatio) {
+        var ratio = Number(rawRatio);
+        if (!Number.isFinite(ratio)) ratio = 50;
+        ratio = Math.max(20, Math.min(80, ratio));
+        if (orientation === 'horizontal') {
+          // Horizontal layout renders entry pane first (top), list pane second (bottom).
+          // So the drag ratio maps directly to entryPane size.
+          entryPane.style.flex = '0 0 ' + ratio + '%';
+          listPane.style.flex = '1 1 ' + (100 - ratio) + '%';
+        } else {
+          listPane.style.flex = '0 0 ' + ratio + '%';
+          entryPane.style.flex = '1 1 ' + (100 - ratio) + '%';
+        }
+        return ratio;
+      }
+      function loadStoredRatio() {
+        try {
+          var v = window.localStorage.getItem(ratioKey);
+          if (v == null || v === '') return 50;
+          return Number(v);
+        } catch (_) {
+          return 50;
+        }
+      }
+      function saveRatio(ratio) {
+        try { window.localStorage.setItem(ratioKey, String(ratio)); } catch (_) {}
+      }
+      var currentRatio = applyRatio(loadStoredRatio());
+      function setSelected(entryId) {
+        document.querySelectorAll('tr.entry-row.selected').forEach(function(tr) { tr.classList.remove('selected'); });
+        if (!entryId) return;
+        var rows = document.querySelectorAll('tr.entry-row');
+        for (var i = 0; i < rows.length; i++) {
+          if ((rows[i].getAttribute('data-entry-id') || '') === entryId) {
+            rows[i].classList.add('selected');
+            break;
+          }
+        }
+      }
+      function openInSplit(url, entryId) {
+        if (!url) return;
+        var splitUrl = url;
+        if (splitUrl.indexOf('split=1') < 0) {
+          splitUrl += (splitUrl.indexOf('?') >= 0 ? '&' : '?') + 'split=1';
+        }
+        frame.src = splitUrl;
+        if (empty) empty.style.display = 'none';
+        setSelected(entryId || '');
+      }
+      var dragging = false;
+      function updateFromPointer(clientX, clientY) {
+        if (!wrap) return;
+        var rect = wrap.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return;
+        var ratio = orientation === 'horizontal'
+          ? ((clientY - rect.top) / rect.height) * 100
+          : ((clientX - rect.left) / rect.width) * 100;
+        currentRatio = applyRatio(ratio);
+      }
+      divider.addEventListener('pointerdown', function(ev) {
+        dragging = true;
+        divider.setPointerCapture(ev.pointerId);
+        ev.preventDefault();
+      });
+      divider.addEventListener('pointermove', function(ev) {
+        if (!dragging) return;
+        updateFromPointer(ev.clientX, ev.clientY);
+      });
+      divider.addEventListener('pointerup', function() {
+        if (!dragging) return;
+        dragging = false;
+        saveRatio(currentRatio);
+      });
+      divider.addEventListener('pointercancel', function() {
+        if (!dragging) return;
+        dragging = false;
+        saveRatio(currentRatio);
+      });
+      window.addEventListener('resize', function() { applyRatio(currentRatio); });
+      document.querySelectorAll('a.entry-open-link').forEach(function(a) {
+        a.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          openInSplit(a.getAttribute('href'), a.getAttribute('data-entry-id') || '');
+        });
+      });
+      var first = document.querySelector('a.entry-open-link');
+      if (first) openInSplit(first.getAttribute('href'), first.getAttribute('data-entry-id') || '');
+    })();
+  </script>` : ""}
+  <script>
+    (function() {
+      var prevBtn = document.getElementById('btn-prev-row');
+      var nextBtn = document.getElementById('btn-next-row');
+      if (!prevBtn || !nextBtn) return;
+      function getRows() {
+        return Array.prototype.slice.call(document.querySelectorAll('tr.entry-row'));
+      }
+      function selectedRowIndex(rows) {
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i].classList.contains('selected')) return i;
+        }
+        return rows.length > 0 ? 0 : -1;
+      }
+      function refreshButtons() {
+        var rows = getRows();
+        var idx = selectedRowIndex(rows);
+        prevBtn.disabled = !(rows.length > 0 && idx > 0);
+        nextBtn.disabled = !(rows.length > 0 && idx >= 0 && idx < rows.length - 1);
+      }
+      function activateRowAt(index) {
+        var rows = getRows();
+        if (!rows.length) return;
+        var idx = Math.max(0, Math.min(rows.length - 1, index));
+        var row = rows[idx];
+        var link = row ? row.querySelector('a.entry-open-link') : null;
+        if (!link) return;
+        link.click();
+        setTimeout(refreshButtons, 0);
+      }
+      prevBtn.addEventListener('click', function() {
+        var rows = getRows();
+        var idx = selectedRowIndex(rows);
+        if (idx > 0) activateRowAt(idx - 1);
+      });
+      nextBtn.addEventListener('click', function() {
+        var rows = getRows();
+        var idx = selectedRowIndex(rows);
+        if (idx >= 0 && idx < rows.length - 1) activateRowAt(idx + 1);
+      });
+      document.querySelectorAll('a.entry-open-link').forEach(function(a) {
+        a.addEventListener('click', function() { setTimeout(refreshButtons, 0); });
+      });
+      refreshButtons();
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -9320,6 +9581,16 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     typeof doc.infoImportButtonTitle === "string" && doc.infoImportButtonTitle.trim()
       ? doc.infoImportButtonTitle.trim()
       : "Import from Guardian";
+  const entriesPageSizeRaw = Number(doc.entriesPageSize);
+  const entriesPageSize =
+    Number.isFinite(entriesPageSizeRaw) &&
+    entriesPageSizeRaw >= ENTRIES_PAGE_SIZE_MIN &&
+    entriesPageSizeRaw <= ENTRIES_PAGE_SIZE_MAX
+      ? Math.floor(entriesPageSizeRaw)
+      : ENTRIES_PAGE_SIZE;
+  const splitViewCfgEdit = doc && doc.splitView && typeof doc.splitView === "object" ? doc.splitView : null;
+  const splitViewEnabled = !!(splitViewCfgEdit && splitViewCfgEdit.enabled);
+  const splitViewOrientation = splitViewCfgEdit && splitViewCfgEdit.orientation === "horizontal" ? "horizontal" : "vertical";
   function sortKeySelect(name, id, selected) {
     const fieldOpts = fieldNames.map((fn) => `<option value="${escapeHtml(fn)}"${selected === fn ? " selected" : ""}>${escapeHtml(fn)}</option>`).join("");
     return `<select id="${id}" name="${name}"><option value="">— None —</option>${fieldOpts}<option value="createdAt"${selected === "createdAt" ? " selected" : ""}>Creation date</option><option value="updatedAt"${selected === "updatedAt" ? " selected" : ""}>Update date</option></select>`;
@@ -9495,6 +9766,22 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     <label for="infoImportButtonTitle" style="margin-top:0.75rem;">Information Import button title</label>
     <p class="sub" style="margin-top:0.25rem;">Text shown on the import button in the database view.</p>
     <input type="text" id="infoImportButtonTitle" name="infoImportButtonTitle" placeholder="e.g. Import from Guardian" value="${escapeHtml(infoImportButtonTitle)}">
+    <label for="entriesPageSize" style="margin-top:0.75rem;">Entries per page</label>
+    <p class="sub" style="margin-top:0.25rem;">Rows shown in the database list pagination. Default is 25.</p>
+    <input type="number" id="entriesPageSize" name="entriesPageSize" min="${ENTRIES_PAGE_SIZE_MIN}" max="${ENTRIES_PAGE_SIZE_MAX}" step="1" value="${escapeHtml(String(entriesPageSize))}">
+    <label style="margin-top:1.5rem;">Split view (database + single entry)</label>
+    <p class="sub" style="margin-top:0.25rem;">Show the database list and selected single-entry view on the same screen. Clicking the first-column link loads the entry in the split pane instead of full-screen navigation.</p>
+    <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.25rem;">
+      <input type="checkbox" id="splitViewEnabled" style="width:auto;" ${splitViewEnabled ? "checked" : ""}>
+      <span>Enable split view</span>
+    </label>
+    <div style="max-width:18rem;margin-top:0.5rem;">
+      <label for="splitViewOrientation" style="margin-top:0;">Split orientation</label>
+      <select id="splitViewOrientation" name="splitViewOrientation">
+        <option value="vertical"${splitViewOrientation === "vertical" ? " selected" : ""}>Vertical (left/right)</option>
+        <option value="horizontal"${splitViewOrientation === "horizontal" ? " selected" : ""}>Horizontal (top/bottom)</option>
+      </select>
+    </div>
     <label style="margin-top:1.5rem;">Visible fields in Mobile entry list (up to 3)</label>
     <p class="sub" style="margin-top:0.25rem;">On narrow screens (mobile), only these columns stay visible in the entries table. If empty, the first fields are used.</p>
     <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:center;margin-top:0.5rem;">
@@ -9810,7 +10097,12 @@ function renderEditProfilePage(doc, forms = [], appUi) {
             ].filter(Boolean),
             sortDirection: document.getElementById('sortDirection').value,
             infoImportFlowId: (document.getElementById('infoImportFlowId') && document.getElementById('infoImportFlowId').value.trim()) || '',
-            infoImportButtonTitle: (document.getElementById('infoImportButtonTitle') && document.getElementById('infoImportButtonTitle').value.trim()) || ''
+            infoImportButtonTitle: (document.getElementById('infoImportButtonTitle') && document.getElementById('infoImportButtonTitle').value.trim()) || '',
+            entriesPageSize: (document.getElementById('entriesPageSize') && document.getElementById('entriesPageSize').value) || '${ENTRIES_PAGE_SIZE}',
+            splitView: {
+              enabled: !!(document.getElementById('splitViewEnabled') && document.getElementById('splitViewEnabled').checked),
+              orientation: (document.getElementById('splitViewOrientation') && document.getElementById('splitViewOrientation').value === 'horizontal') ? 'horizontal' : 'vertical'
+            }
           })
         });
         const data = await r.json();
