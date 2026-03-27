@@ -310,6 +310,31 @@ function normalizeEntryFormDoc(body) {
   const flowTarget = flowTargetRaw === "localDb" ? "localDb" : flowTargetRaw === "api" ? "api" : "log";
   const flowButtonLabel = typeof body.flowButtonLabel === "string" ? body.flowButtonLabel.trim() : "";
   const flowButtonParam = typeof body.flowButtonParam === "string" ? body.flowButtonParam.trim() : "";
+  const linkedQueryRaw = body && typeof body.linkedQuery === "object" && body.linkedQuery ? body.linkedQuery : {};
+  const linkedQueryId =
+    linkedQueryRaw && typeof linkedQueryRaw.id === "string" && linkedQueryRaw.id.trim() ? linkedQueryRaw.id.trim() : "";
+  const linkedQueryWidth =
+    linkedQueryRaw && typeof linkedQueryRaw.width === "string" && linkedQueryRaw.width.trim() ? linkedQueryRaw.width.trim() : "";
+  const linkedQueryButtonLabel =
+    linkedQueryRaw && typeof linkedQueryRaw.buttonLabel === "string" && linkedQueryRaw.buttonLabel.trim()
+      ? linkedQueryRaw.buttonLabel.trim()
+      : "";
+  const linkedQueryX = parseNum(linkedQueryRaw && linkedQueryRaw.x);
+  const linkedQueryY = parseNum(linkedQueryRaw && linkedQueryRaw.y);
+  const linkedQueryHeight = parseNum(linkedQueryRaw && linkedQueryRaw.height);
+  const linkedQueryLoadOnDemand = !!(linkedQueryRaw && (linkedQueryRaw.loadOnDemand === true || linkedQueryRaw.loadOnDemand === "true"));
+  const linkedQuery =
+    linkedQueryId
+      ? {
+          id: linkedQueryId,
+          ...(linkedQueryWidth ? { width: linkedQueryWidth } : {}),
+          ...(linkedQueryLoadOnDemand && linkedQueryButtonLabel ? { buttonLabel: linkedQueryButtonLabel } : {}),
+          ...(linkedQueryX != null ? { x: linkedQueryX } : {}),
+          ...(linkedQueryY != null ? { y: linkedQueryY } : {}),
+          ...(linkedQueryHeight != null ? { height: linkedQueryHeight } : {}),
+          ...(linkedQueryLoadOnDemand ? { loadOnDemand: true } : {}),
+        }
+      : null;
 
   function normalizeFlowConfigItem(item) {
     if (!item || typeof item !== "object") return null;
@@ -350,6 +375,7 @@ function normalizeEntryFormDoc(body) {
     flowButtonLabel: flowConfigs.length > 0 ? flowConfigs[0].label : "Send to Flow",
     flowButtonParam: flowConfigs.length > 0 ? flowConfigs[0].param : "",
     flowConfigs,
+    linkedQuery,
   };
 }
 
@@ -391,6 +417,7 @@ function buildEntryFormDocFromSource(baseForm, name) {
               flowId: "",
             },
           ],
+    linkedQuery: baseForm && baseForm.linkedQuery && typeof baseForm.linkedQuery === "object" ? baseForm.linkedQuery : null,
   };
 }
 
@@ -1039,7 +1066,13 @@ async function getAppUiConfig() {
 
 const CONFIG_EXPORT_VERSION = 1;
 const EXPORTABLE_DB_TYPES = new Set(["elenko_profile", "elenko_entry_form"]);
-const EXPORTABLE_CONFIG_TYPES = new Set(["elenko_app_config", "elenko_flow", "elenko_api", "elenko_js_processing"]);
+const EXPORTABLE_CONFIG_TYPES = new Set([
+  "elenko_app_config",
+  "elenko_flow",
+  "elenko_api",
+  "elenko_js_processing",
+  "elenko_query",
+]);
 
 function stripForExport(doc, type) {
   if (!doc || typeof doc !== "object") return null;
@@ -1050,6 +1083,9 @@ function stripForExport(doc, type) {
   }
   if (type === "elenko_app_config") {
     delete out.couchdbPassword;
+  }
+  if (type === "elenko_query") {
+    // No secret fields yet; keep all properties for now.
   }
   return out;
 }
@@ -2873,14 +2909,19 @@ app.get("/entry-forms/create", requireAdmin, async (req, res) => {
   try {
     const appUi = await getAppUiConfig();
     let flows = [];
+    let queries = [];
     if (configDb) {
       try {
         const result = await configDb.find({ selector: { type: "elenko_flow" }, fields: ["_id", "name"], sort: [{ name: "asc" }], limit: 500 });
         flows = result.docs || [];
       } catch (_) {}
+      try {
+        const result = await configDb.find({ selector: { type: "elenko_query" }, fields: ["_id", "name"], sort: [{ name: "asc" }], limit: 500 });
+        queries = result.docs || [];
+      } catch (_) {}
     }
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderCreateEntryFormPage(null, flows, appUi));
+    res.send(renderCreateEntryFormPage(null, flows, queries, appUi));
   } catch (err) {
     console.error("Error loading create form page:", err);
     res.status(500).send(renderErrorPage(err.message));
@@ -2921,6 +2962,7 @@ app.post("/api/entry-forms", requireAdmin, async (req, res) => {
       flowButtonLabel: normalized.flowButtonLabel,
       flowButtonParam: normalized.flowButtonParam,
       flowConfigs: normalized.flowConfigs,
+      linkedQuery: normalized.linkedQuery,
     };
     const result = await db.insert(doc);
     res.status(201).json({ ok: true, id: result.id, rev: result.rev });
@@ -2937,15 +2979,20 @@ app.get("/entry-forms/:id/edit", requireAdmin, async (req, res) => {
       return res.status(404).send(renderErrorPage("Entry form not found"));
     }
     let flows = [];
+    let queries = [];
     if (configDb) {
       try {
         const result = await configDb.find({ selector: { type: "elenko_flow" }, fields: ["_id", "name"], sort: [{ name: "asc" }], limit: 500 });
         flows = result.docs || [];
       } catch (_) {}
+      try {
+        const result = await configDb.find({ selector: { type: "elenko_query" }, fields: ["_id", "name"], sort: [{ name: "asc" }], limit: 500 });
+        queries = result.docs || [];
+      } catch (_) {}
     }
     const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditEntryFormPage(doc, null, flows, appUi));
+    res.send(renderEditEntryFormPage(doc, null, flows, queries, appUi));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Entry form not found"));
     console.error("Error loading entry form:", err);
@@ -2960,6 +3007,7 @@ app.put("/api/entry-forms/:id", requireAdmin, async (req, res) => {
     if (!doc || doc.type !== "elenko_entry_form") {
       return res.status(404).json({ error: "Entry form not found" });
     }
+    const normalized = normalizeEntryFormDoc(req.body || {});
     const flowConfigsRaw = Array.isArray(req.body.flowConfigs) ? req.body.flowConfigs : [];
     for (let i = 0; i < flowConfigsRaw.length; i++) {
       const c = flowConfigsRaw[i];
@@ -2969,7 +3017,6 @@ app.put("/api/entry-forms/:id", requireAdmin, async (req, res) => {
         return res.status(400).json({ error: "When using Single step, please select a Target (Log file, Send to Local Database, or Call API) for each flow button." });
       }
     }
-    const normalized = normalizeEntryFormDoc(req.body || {});
     if (!normalized.name) {
       return res.status(400).json({ error: "Name is required." });
     }
@@ -2984,6 +3031,7 @@ app.put("/api/entry-forms/:id", requireAdmin, async (req, res) => {
     doc.flowButtonLabel = normalized.flowButtonLabel;
     doc.flowButtonParam = normalized.flowButtonParam;
     doc.flowConfigs = normalized.flowConfigs;
+    doc.linkedQuery = normalized.linkedQuery;
     const result = await db.insert(doc);
     res.json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
@@ -3242,6 +3290,184 @@ app.post("/api/apis/:id/delete", requireAdmin, async (req, res) => {
     if (err?.statusCode === 404) return res.status(404).json({ error: "API not found" });
     if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict" });
     console.error("Error deleting API:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— Linked queries (Elenko Query config) ——
+
+app.get("/api/queries", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const result = await configDb.find({
+      selector: { type: "elenko_query" },
+      fields: ["_id", "_rev", "name", "description", "baseProfileId", "queryProfileId"],
+      sort: [{ name: "asc" }],
+      limit: 500,
+    });
+    res.json({ queries: result.docs || [] });
+  } catch (err) {
+    console.error("Error loading queries:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/queries", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    if (!db) return res.status(503).send(renderErrorPage("Database not available"));
+    const result = await configDb.find({
+      selector: { type: "elenko_query" },
+      sort: [{ name: "asc" }],
+      limit: 500,
+    });
+    const queries = result.docs || [];
+    const profilesResult = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "name"],
+      limit: 1000,
+    });
+    const profiles = profilesResult.docs || [];
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderQueriesListPage(queries, appUi, profiles));
+  } catch (err) {
+    console.error("Error loading queries:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/queries/create", requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.status(503).send(renderErrorPage("Database not available"));
+    const profilesResult = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "name"],
+      sort: [{ name: "asc" }],
+      limit: 1000,
+    });
+    const profiles = profilesResult.docs || [];
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderEditQueryPage(null, null, appUi, profiles));
+  } catch (err) {
+    console.error("Error loading query create page:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/queries/:id/edit", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    if (!db) return res.status(503).send(renderErrorPage("Database not available"));
+    const profilesResult = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "name"],
+      sort: [{ name: "asc" }],
+      limit: 1000,
+    });
+    const profiles = profilesResult.docs || [];
+    const doc = await configDb.get(req.params.id);
+    if (!doc || doc.type !== "elenko_query") {
+      return res.status(404).send(renderErrorPage("Query not found"));
+    }
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderEditQueryPage(doc, null, appUi, profiles));
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Query not found"));
+    console.error("Error loading query:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/queries", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const body = req.body || {};
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return res.status(400).json({ error: "Name is required." });
+    const baseProfileId = typeof body.baseProfileId === "string" ? body.baseProfileId.trim() : "";
+    const baseKeyField = typeof body.baseKeyField === "string" ? body.baseKeyField.trim() : "";
+    const queryProfileId = typeof body.queryProfileId === "string" ? body.queryProfileId.trim() : "";
+    const queryKeyField = typeof body.queryKeyField === "string" ? body.queryKeyField.trim() : "";
+    const sortField = typeof body.sortField === "string" ? body.sortField.trim() : "";
+    const sortDirection = body.sortDirection === "desc" ? "desc" : "asc";
+    const resultFieldsArr = Array.isArray(body.resultFields) ? body.resultFields : [];
+    const resultFields = resultFieldsArr
+      .map((f) => (typeof f === "string" ? f.trim() : ""))
+      .filter((f) => !!f);
+    if (!baseProfileId || !baseKeyField || !queryProfileId || !queryKeyField) {
+      return res.status(400).json({ error: "Base/query profile and key fields are required." });
+    }
+    const doc = {
+      type: "elenko_query",
+      name,
+      description: typeof body.description === "string" ? body.description.trim() : "",
+      baseProfileId,
+      baseKeyField,
+      queryProfileId,
+      queryKeyField,
+      resultFields,
+      sortField,
+      sortDirection,
+    };
+    const saved = await configDb.insert(doc);
+    res.status(201).json({ ok: true, id: saved.id, rev: saved.rev });
+  } catch (err) {
+    console.error("Error creating query:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/queries/:id", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const existing = await configDb.get(id);
+    if (!existing || existing.type !== "elenko_query") {
+      return res.status(404).json({ error: "Query not found" });
+    }
+    const body = req.body || {};
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return res.status(400).json({ error: "Name is required." });
+    existing.name = name;
+    existing.description = typeof body.description === "string" ? body.description.trim() : "";
+    existing.baseProfileId = typeof body.baseProfileId === "string" ? body.baseProfileId.trim() : "";
+    existing.baseKeyField = typeof body.baseKeyField === "string" ? body.baseKeyField.trim() : "";
+    existing.queryProfileId = typeof body.queryProfileId === "string" ? body.queryProfileId.trim() : "";
+    existing.queryKeyField = typeof body.queryKeyField === "string" ? body.queryKeyField.trim() : "";
+    const resultFieldsArr = Array.isArray(body.resultFields) ? body.resultFields : [];
+    existing.resultFields = resultFieldsArr
+      .map((f) => (typeof f === "string" ? f.trim() : ""))
+      .filter((f) => !!f);
+    existing.sortField = typeof body.sortField === "string" ? body.sortField.trim() : "";
+    existing.sortDirection = body.sortDirection === "desc" ? "desc" : "asc";
+    const saved = await configDb.insert(existing);
+    res.json({ ok: true, id: saved.id, rev: saved.rev });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Query not found" });
+    console.error("Error updating query:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/queries/:id/delete", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const body = req.body || {};
+    const rev = typeof body._rev === "string" ? body._rev : "";
+    if (!rev) return res.status(400).json({ error: "Missing revision" });
+    const existing = await configDb.get(id);
+    if (!existing || existing.type !== "elenko_query") {
+      return res.status(404).json({ error: "Query not found" });
+    }
+    await configDb.destroy(id, rev);
+    res.json({ ok: true, redirect: "/queries" });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Query not found" });
+    console.error("Error deleting query:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -4342,11 +4568,55 @@ app.get("/profile/:id/entry/:entryId", async (req, res) => {
     const role = (req.session && req.session.role) || "editor";
     const returnQuery = { q: req.query.q, page: req.query.page };
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderViewEntryPage(doc, record, role, formDoc, returnQuery));
+    res.send(await renderViewEntryPage(doc, record, role, formDoc, returnQuery));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Entry not found"));
     console.error("Error loading entry:", err);
     res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/api/profile/:id/entry/:entryId/linked-query", async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const entryId = req.params.entryId;
+    const doc = await db.get(profileId);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const record = await db.get(entryId);
+    if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
+      return res.status(404).json({ error: "Entry not found" });
+    }
+
+    let formDoc = null;
+    const profileFormIds = getProfileEntryFormIds(doc);
+    let formId = "";
+    const mobileFormIdRaw =
+      typeof doc.mobileSingleEntryFormId === "string" && doc.mobileSingleEntryFormId.trim()
+        ? doc.mobileSingleEntryFormId.trim()
+        : "";
+    const useMobileForm = mobileFormIdRaw && isMobileRequest(req);
+    if (useMobileForm) {
+      formId = mobileFormIdRaw;
+    } else if (record.entryFormId && typeof record.entryFormId === "string" && record.entryFormId.trim()) {
+      formId = record.entryFormId.trim();
+    } else if (profileFormIds.length > 0) {
+      formId = profileFormIds[0];
+    }
+    if (formId) {
+      try {
+        const loaded = await db.get(formId);
+        if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
+      } catch (_) {}
+    }
+    const layout = formDoc && (formDoc.layout === "grid" || formDoc.layout === "stack") ? formDoc.layout : "table";
+    const html = await buildLinkedQueryHtmlForEntry(doc, record, formDoc, layout, { forceLoad: true });
+    return res.json({ ok: true, html: html || "" });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Not found" });
+    console.error("Load linked query error:", err);
+    return res.status(500).json({ error: err.message || "Load failed" });
   }
 });
 
@@ -4935,7 +5205,200 @@ function gridCellStyle(o) {
   return "";
 }
 
-function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
+function linkedQueryBlockStyleForLayout(layout, cfg) {
+  if (!cfg || typeof cfg !== "object") return "";
+  const parts = [];
+  if (layout === "grid") {
+    // In grid layout, always place the linked query block directly after the fields,
+    // spanning all columns. X/Y are ignored here to avoid large vertical gaps.
+    parts.push("grid-column:1 / -1");
+  }
+  if (cfg.width && typeof cfg.width === "string" && cfg.width.trim()) parts.push("width:" + cfg.width.trim());
+  if (layout !== "grid" && cfg.height != null) {
+    parts.push("max-height:" + cfg.height + "em");
+    parts.push("overflow-y:auto");
+  }
+  return parts.join(";");
+}
+
+async function buildLinkedQueryHtmlForEntry(doc, record, formDoc, layout, opts = {}) {
+  const options = opts && typeof opts === "object" ? opts : {};
+  const forceLoad = !!options.forceLoad;
+  const linkedQueryCfg = formDoc && formDoc.linkedQuery && typeof formDoc.linkedQuery === "object" ? formDoc.linkedQuery : null;
+  const lqId = linkedQueryCfg && typeof linkedQueryCfg.id === "string" ? linkedQueryCfg.id.trim() : "";
+  if (!lqId || !configDb || !db) return "";
+  const stackHasPos = !!(
+    layout === "stack" &&
+    linkedQueryCfg &&
+    (linkedQueryCfg.x != null || linkedQueryCfg.y != null || linkedQueryCfg.height != null)
+  );
+  const stackPosStyle =
+    stackHasPos && linkedQueryCfg
+      ? (() => {
+          const parts = ["position:absolute"];
+          if (linkedQueryCfg.x != null) parts.push("left:calc(" + linkedQueryCfg.x + "ch + 4ch)");
+          if (linkedQueryCfg.y != null) parts.push("top:" + linkedQueryCfg.y + "em");
+          if (linkedQueryCfg.height != null) parts.push("min-height:" + linkedQueryCfg.height + "em");
+          return parts.join(";");
+        })()
+      : "";
+  const stackWrapStart = stackHasPos ? `<div class="linked-query-stack-pos"${stackPosStyle ? ' style="' + escapeHtml(stackPosStyle) + '"' : ""}>` : "";
+  const stackWrapEnd = stackHasPos ? `</div>` : "";
+
+  if (linkedQueryCfg && linkedQueryCfg.loadOnDemand && !forceLoad) {
+    let qDoc = null;
+    try {
+      const byId = await configDb.get(lqId);
+      if (byId && byId.type === "elenko_query") qDoc = byId;
+    } catch (e) {
+      if (!e || e.statusCode !== 404) throw e;
+    }
+    if (!qDoc) {
+      const byName = await configDb.find({ selector: { type: "elenko_query", name: lqId }, limit: 1 });
+      const first = byName.docs && byName.docs[0];
+      if (first && first.type === "elenko_query") qDoc = first;
+    }
+    const blockStyle = linkedQueryBlockStyleForLayout(layout, linkedQueryCfg);
+    const styleAttr = blockStyle ? ' style="' + escapeHtml(blockStyle) + '"' : "";
+    const buttonLabelRaw =
+      linkedQueryCfg && typeof linkedQueryCfg.buttonLabel === "string" && linkedQueryCfg.buttonLabel.trim()
+        ? linkedQueryCfg.buttonLabel.trim()
+        : "Load linked data";
+    const titleRaw = qDoc && (qDoc.name || qDoc._id) ? String(qDoc.name || qDoc._id) : "Linked query";
+    const desc = qDoc && typeof qDoc.description === "string" && qDoc.description.trim() ? qDoc.description.trim() : "";
+    const url =
+      "/api/profile/" +
+      encodeURIComponent(doc._id) +
+      "/entry/" +
+      encodeURIComponent(record._id) +
+      "/linked-query";
+    const blockHtml = (
+      `<div class="linked-query-block"${styleAttr}>` +
+      `<div class="linked-query-title">${escapeHtml(titleRaw)}</div>` +
+      (desc ? `<div class="linked-query-desc">${escapeHtml(desc)}</div>` : "") +
+      `<div class="linked-query-actions"><button type="button" class="btn-flow btn-flow-secondary linked-query-load-btn" data-url="${escapeHtml(url)}">${escapeHtml(buttonLabelRaw)}</button></div>` +
+      `<div class="linked-query-content"><div class="empty">Table is empty. Click "${escapeHtml(buttonLabelRaw)}".</div></div>` +
+      `</div>`
+    );
+    return stackWrapStart + blockHtml + stackWrapEnd;
+  }
+
+  const normalizeSortDirection = (raw) => (raw === "desc" ? "desc" : "asc");
+  const resolveProfileDocByIdOrName = async (ref) => {
+    const tid = (ref != null ? String(ref) : "").trim();
+    if (!tid || !db) return null;
+    try {
+      const d = await db.get(tid);
+      if (d && d.type === "elenko_profile") return d;
+    } catch (e) {
+      if (e && e.statusCode !== 404) throw e;
+    }
+    const byName = await db.find({ selector: { type: "elenko_profile", name: tid }, limit: 1 });
+    const d2 = byName.docs && byName.docs[0];
+    if (d2 && d2.type === "elenko_profile") return d2;
+    return null;
+  };
+  const resolveConfigDocByIdOrName = async (ref, type) => {
+    const tid = (ref != null ? String(ref) : "").trim();
+    if (!tid || !configDb) return null;
+    try {
+      const d = await configDb.get(tid);
+      if (d && d.type === type) return d;
+    } catch (e) {
+      if (e && e.statusCode !== 404) throw e;
+    }
+    const byName = await configDb.find({ selector: { type, name: tid }, limit: 1 });
+    const d2 = byName.docs && byName.docs[0];
+    if (d2 && d2.type === type) return d2;
+    return null;
+  };
+
+  try {
+    const qDoc = await resolveConfigDocByIdOrName(lqId, "elenko_query");
+    if (!qDoc) return "";
+    const baseKeyField = typeof qDoc.baseKeyField === "string" ? qDoc.baseKeyField.trim() : "";
+    const queryKeyField = typeof qDoc.queryKeyField === "string" ? qDoc.queryKeyField.trim() : "";
+    const baseKeyVal = baseKeyField ? record[baseKeyField] : "";
+    const baseKeyStr = baseKeyVal != null ? String(baseKeyVal).trim() : "";
+    if (!baseKeyField || !queryKeyField || !baseKeyStr) return "";
+
+    const queryProfileDoc = await resolveProfileDocByIdOrName(qDoc.queryProfileId);
+    const queryProfileId = queryProfileDoc && queryProfileDoc._id;
+    const resultFieldsRaw = Array.isArray(qDoc.resultFields) ? qDoc.resultFields : [];
+    const resultFields = resultFieldsRaw.map((f) => (typeof f === "string" ? f.trim() : "")).filter((f) => !!f);
+    const fieldsToShow =
+      resultFields.length > 0
+        ? resultFields
+        : queryProfileDoc && Array.isArray(queryProfileDoc.fieldNames) && queryProfileDoc.fieldNames.length > 0
+        ? queryProfileDoc.fieldNames
+        : [];
+    if (!queryProfileId || fieldsToShow.length === 0) return "";
+
+    const selector = { type: "elenko_record", profileId: queryProfileId, [queryKeyField]: baseKeyStr };
+    const findRes = await db.find({
+      selector,
+      fields: ["_id", ...fieldsToShow],
+      limit: 5000,
+    });
+    let rows = findRes.docs || [];
+    const sortField = typeof qDoc.sortField === "string" ? qDoc.sortField.trim() : "";
+    const sortDirection = normalizeSortDirection(qDoc.sortDirection);
+    if (sortField) {
+      rows = rows.slice().sort((a, b) => {
+        const avRaw = a && a[sortField] != null ? String(a[sortField]) : "";
+        const bvRaw = b && b[sortField] != null ? String(b[sortField]) : "";
+        const an = Number(avRaw);
+        const bn = Number(bvRaw);
+        let c = 0;
+        if (Number.isFinite(an) && Number.isFinite(bn)) c = an - bn;
+        else c = avRaw.localeCompare(bvRaw, undefined, { sensitivity: "base", numeric: true });
+        return sortDirection === "desc" ? -c : c;
+      });
+    }
+    const headerCells = fieldsToShow.map((f) => `<th>${escapeHtml(f)}</th>`).join("");
+    const bodyRows =
+      rows.length > 0
+        ? rows
+            .map((r) => {
+              const rowId = r && r._id ? String(r._id) : "";
+              const tds = fieldsToShow
+                .map((f) => {
+                  const v = r && r[f] != null ? String(r[f]) : "";
+                  if (f === fieldsToShow[0] && rowId) {
+                    const href = "/profile/" + encodeURIComponent(queryProfileId) + "/entry/" + encodeURIComponent(rowId);
+                    return `<td><a class="linked-query-firstcol" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(v)}</a></td>`;
+                  }
+                  return `<td>${escapeHtml(v)}</td>`;
+                })
+                .join("");
+              return `<tr>${tds}</tr>`;
+            })
+            .join("")
+        : `<tr><td colspan="${fieldsToShow.length}" class="empty">No results.</td></tr>`;
+
+    const blockStyle = linkedQueryBlockStyleForLayout(layout, linkedQueryCfg);
+    const styleAttr =
+      blockStyle
+        ? ' style="' + escapeHtml(blockStyle) + '"'
+        : linkedQueryCfg && linkedQueryCfg.height != null
+        ? ' style="max-height:' + escapeHtml(String(linkedQueryCfg.height)) + 'em;overflow-y:auto;"'
+        : "";
+    const desc = typeof qDoc.description === "string" && qDoc.description.trim() ? qDoc.description.trim() : "";
+    const blockHtml = (
+      `<div class="linked-query-block"${styleAttr}>` +
+      `<div class="linked-query-title">${escapeHtml(qDoc.name || "Linked query")}</div>` +
+      (desc ? `<div class="linked-query-desc">${escapeHtml(desc)}</div>` : "") +
+      `<div class="linked-query-content"><table class="linked-query-table"><thead><tr>${headerCells}</tr></thead><tbody>${bodyRows}</tbody></table></div>` +
+      `</div>`
+    );
+    return stackWrapStart + blockHtml + stackWrapEnd;
+  } catch (e) {
+    const errorHtml = `<div class="linked-query-block"><div class="linked-query-title">Linked query</div><div class="linked-query-content"><div class="empty">Query failed: ${escapeHtml(e && e.message ? e.message : String(e))}</div></div></div>`;
+    return stackWrapStart + errorHtml + stackWrapEnd;
+  }
+}
+
+async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   const canEdit = role === "admin" || role === "editor" || role === "user";
   const title = escapeHtml(doc.name || "Elenko database");
   const profileFieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
@@ -4983,7 +5446,15 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     }`;
 
   const hasPositioning = orderedItems.some((o) => o.x != null || o.y != null || o.height != null);
-  const containerPositionStyle = layout === "grid" ? "" : (hasPositioning ? "position:relative;min-height:40em;" : "");
+  const linkedQueryCfg = formDoc && formDoc.linkedQuery && typeof formDoc.linkedQuery === "object" ? formDoc.linkedQuery : null;
+  const linkedQueryHasPos = !!(linkedQueryCfg && (linkedQueryCfg.x != null || linkedQueryCfg.y != null || linkedQueryCfg.height != null));
+  const containerPositionStyle =
+    layout === "grid"
+      ? "" // let the grid flow naturally; no large min-height that could push the linked table far down
+      : hasPositioning || linkedQueryHasPos
+      ? "position:relative;min-height:40em;"
+      : "";
+  const linkedQueryHtml = await buildLinkedQueryHtmlForEntry(doc, record, formDoc, layout, { forceLoad: false });
 
   function itemLabel(o) {
     return o.type === "label" ? o.text : o.fieldName;
@@ -5060,6 +5531,7 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         })
         .join("") +
       "</div>";
+    if (linkedQueryHtml) contentHtml += linkedQueryHtml;
   } else if (layout === "grid") {
     const widths = orderedItems.map((o) => o.width || "1fr").join(" ");
     contentHtml =
@@ -5092,6 +5564,7 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         </div>`;
         })
         .join("") +
+      (linkedQueryHtml ? linkedQueryHtml : "") +
       "</div>";
   } else {
     const rows =
@@ -5122,6 +5595,7 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         })
         .join("");
     contentHtml = `<table><tbody>${rows}</tbody></table>`;
+    if (linkedQueryHtml) contentHtml += linkedQueryHtml;
   }
 
   return `<!DOCTYPE html>
@@ -5173,6 +5647,18 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .entry-value-url a { color: var(--entry-link, #58a6ff); word-break: break-all; }
     .entry-grid-cell.entry-label-only .label { white-space: nowrap; }
     .entry-label-row .label { white-space: nowrap; }
+    .linked-query-block { margin-top: 1rem; background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 8px; padding: 0.75rem; }
+    .linked-query-stack-pos > .linked-query-block { margin-top: 0; }
+    .linked-query-title { color: var(--entry-label, #8b949e); font-weight: 600; margin-bottom: 0.5rem; }
+    .linked-query-desc { color: var(--entry-label, #8b949e); margin: -0.25rem 0 0.75rem 0; font-size: 0.9rem; }
+    .linked-query-actions { margin-bottom: 0.5rem; }
+    .linked-query-content { min-height: 1.5rem; }
+    .linked-query-table { width: 100%; border-collapse: collapse; }
+    .linked-query-table th { color: var(--entry-label, #8b949e); font-weight: 600; background: transparent; border-bottom: 1px solid var(--entry-field-border, #21262d); padding: 0.5rem 0.5rem; }
+    .linked-query-table td { border-bottom: 1px solid rgba(48, 54, 61, 0.6); padding: 0.5rem 0.5rem; vertical-align: top; }
+    .linked-query-table tr:last-child td { border-bottom: none; }
+    .linked-query-firstcol { color: var(--entry-link, #58a6ff); text-decoration: none; }
+    .linked-query-firstcol:hover { text-decoration: underline; }
   </style>
   ${formCustomCss ? `<style>${formCustomCss}</style>` : ""}
 </head>
@@ -5187,6 +5673,42 @@ function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   ${formLabel ? `<p class="sub">Form: ${escapeHtml(formLabel)}</p>` : ""}
   ${contentHtml}
   ${hasFlowButtons ? "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; background: #238636; color: #fff; }.btn-flow:hover { background: #2ea043; }.btn-flow:disabled { opacity: 0.6; cursor: not-allowed; }.btn-flow-secondary { background: #21262d; }.btn-flow-secondary:hover { background: #30363d; }.flow-msg { margin-top: 0.5rem; font-size: 0.875rem; }.flow-msg.ok { color: #3fb950; }.flow-msg.err { color: #f85149; }</style>\n  <script>\n    (function() {\n      var msgEl = document.getElementById(\"flow-msg\");\n      document.querySelectorAll(\".entry-flow-actions .btn-flow[data-entry-id]\").forEach(function(btn) {\n        if (btn.id === \"refresh-entry-btn\") return;\n        btn.onclick = function() {\n          var pid = btn.getAttribute(\"data-profile-id\");\n          var eid = btn.getAttribute(\"data-entry-id\");\n          if (!pid || !eid) return;\n          btn.disabled = true;\n          if (msgEl) { msgEl.textContent = \"\"; msgEl.className = \"flow-msg\"; }\n          var body = {};\n          var idx = btn.getAttribute(\"data-flow-index\");\n          if (idx !== null && idx !== \"\") body.flowIndex = parseInt(idx, 10);\n          var url = \"/api/profile/\" + encodeURIComponent(pid) + \"/entry/\" + encodeURIComponent(eid) + \"/send-to-flow\";\n          fetch(url, { method: \"POST\", headers: { \"Content-Type\": \"application/json\" }, body: JSON.stringify(body) })\n            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })\n            .then(function(o) {\n              if (o.ok && msgEl) { msgEl.textContent = \"Sent to Flow.\"; msgEl.className = \"flow-msg ok\"; }\n              else if (msgEl) { msgEl.textContent = o.data.error || \"Failed\"; msgEl.className = \"flow-msg err\"; }\n              btn.disabled = false;\n            })\n            .catch(function(e) { if (msgEl) { msgEl.textContent = e.message || \"Request failed\"; msgEl.className = \"flow-msg err\"; } btn.disabled = false; });\n        };\n      });\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>" : "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }.btn-flow-secondary { background: #21262d; color: #e6edf3; }.btn-flow-secondary:hover { background: #30363d; }</style>\n  <script>\n    (function() {\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>"}
+  <script>
+    (function() {
+      document.querySelectorAll('.linked-query-load-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var block = btn.closest('.linked-query-block');
+          var stackWrap = btn.closest('.linked-query-stack-pos');
+          var content = block ? block.querySelector('.linked-query-content') : null;
+          var url = btn.getAttribute('data-url');
+          if (!content || !url) return;
+          btn.disabled = true;
+          content.innerHTML = '<div class="empty">Loading…</div>';
+          fetch(url, { method: 'GET', headers: { 'Content-Type': 'application/json' } })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (!o.ok || !o.data || !o.data.ok) {
+                content.innerHTML = '<div class="empty">' + ((o.data && o.data.error) ? String(o.data.error) : 'Load failed') + '</div>';
+                return;
+              }
+              if (o.data.html) {
+                // Keep Stack layout positioning stable by replacing the positioned wrapper
+                // when present; otherwise replace the regular linked query block.
+                if (stackWrap) stackWrap.outerHTML = o.data.html;
+                else if (block) block.outerHTML = o.data.html;
+              } else {
+                content.innerHTML = '<div class="empty">No linked query content.</div>';
+              }
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              content.innerHTML = '<div class="empty">' + (e && e.message ? String(e.message) : 'Load failed') + '</div>';
+            });
+        });
+      });
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -7016,6 +7538,356 @@ function renderApisListPage(apis, appUi) {
 </html>`;
 }
 
+function renderQueriesListPage(queries, appUi, profiles) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
+  const profilesArr = Array.isArray(profiles) ? profiles : [];
+  const profileNameById = new Map(
+    profilesArr
+      .filter((p) => p && p._id)
+      .map((p) => {
+        const id = String(p._id);
+        const name = typeof p.name === "string" && p.name.trim() ? p.name.trim() : id;
+        return [id, name];
+      })
+  );
+  const displayProfile = (idOrName) => {
+    const s = idOrName != null ? String(idOrName).trim() : "";
+    if (!s) return "";
+    return profileNameById.get(s) || s;
+  };
+  const rows =
+    queries.length > 0
+      ? queries
+          .map(
+            (q) => `
+        <tr>
+          <td><a href="/queries/${encodeURIComponent(q._id)}/edit">${escapeHtml(q.name || q._id)}</a></td>
+          <td>${escapeHtml(truncate(q.description || "", 60))}</td>
+          <td>${escapeHtml(displayProfile(q.baseProfileId || ""))}</td>
+          <td>${escapeHtml(displayProfile(q.queryProfileId || ""))}</td>
+          <td class="row-actions"><a href="/queries/${encodeURIComponent(q._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="delete-btn icon-action delete-query-btn" data-id="${escapeHtml(q._id)}" data-rev="${escapeHtml(q._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
+        </tr>`
+          )
+          .join("")
+      : `
+        <tr>
+          <td colspan="5" class="empty">No linked queries yet. Create one to show related records from another Elenko database on the single-entry view.</td>
+        </tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Linked queries</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 56rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
+    .actions a:hover { text-decoration: underline; }
+    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
+    .btn:hover { background: #2ea043; text-decoration: none; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    .row-actions { white-space: nowrap; }
+    .row-actions .icon-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 2rem;
+      min-height: 2rem;
+      margin: 0 0.15rem;
+      padding: 0.2rem 0.35rem;
+      font-size: 1.15rem;
+      line-height: 1;
+      vertical-align: middle;
+      text-decoration: none;
+      border-radius: 4px;
+    }
+    .row-actions .icon-action:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    .edit-link { color: var(--app-link, #58a6ff); }
+    .edit-link:hover { background: rgba(88, 166, 255, 0.12); }
+    .delete-btn {
+      border: none;
+      background: none;
+      color: #f85149;
+      font: inherit;
+      cursor: pointer;
+      padding: 0.2rem 0.35rem;
+    }
+    .delete-btn:hover { color: #ff7b72; background: rgba(248, 81, 73, 0.12); }
+    .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
+    #query-list-msg { margin-top: 0.75rem; font-size: 0.875rem; }
+  </style>
+</head>
+<body>
+  <div class="actions"><a href="/">← Start</a><a href="/queries/create" class="btn">Create linked query</a></div>
+  <h1>Linked queries</h1>
+  <p class="sub">Configure lookups from one Elenko database (base) into another (query) to show related rows in the single-entry view.</p>
+  <table>
+    <thead><tr><th>Name</th><th>Description</th><th>Base profile</th><th>Query profile</th><th>Actions</th></tr></thead>
+    <tbody>${rows}
+    </tbody>
+  </table>
+  <div id="query-list-msg" style="display:none;"></div>
+  <script>
+    (function() {
+      var msgEl = document.getElementById('query-list-msg');
+      function showErr(t) {
+        if (!msgEl) return;
+        msgEl.style.display = 'block';
+        msgEl.style.color = '#f85149';
+        msgEl.textContent = t || 'Request failed';
+      }
+      document.querySelectorAll('.delete-query-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          var rev = btn.getAttribute('data-rev');
+          if (!id || !rev) { showErr('Missing revision; refresh the page.'); return; }
+          if (!confirm('Delete this linked query? Single Entry forms that reference it may need to be updated.')) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/queries/' + encodeURIComponent(id) + '/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ _rev: rev })
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok) {
+                window.location.href = o.data.redirect || '/queries';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Delete failed');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Delete failed');
+            });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderEditQueryPage(doc, err, appUi, profiles) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const isEdit = !!(doc && doc._id);
+  const id = doc && doc._id;
+  const rev = doc && doc._rev;
+  const nameVal = doc && typeof doc.name === "string" ? escapeHtml(doc.name) : "";
+  const descVal = doc && typeof doc.description === "string" ? escapeHtml(doc.description) : "";
+  const baseProfileVal = doc && typeof doc.baseProfileId === "string" ? doc.baseProfileId : "";
+  const baseKeyFieldVal = doc && typeof doc.baseKeyField === "string" ? escapeHtml(doc.baseKeyField) : "";
+  const queryProfileVal = doc && typeof doc.queryProfileId === "string" ? doc.queryProfileId : "";
+  const queryKeyFieldVal = doc && typeof doc.queryKeyField === "string" ? escapeHtml(doc.queryKeyField) : "";
+  const sortFieldVal = doc && typeof doc.sortField === "string" ? escapeHtml(doc.sortField) : "";
+  const sortDirectionVal = doc && doc.sortDirection === "desc" ? "desc" : "asc";
+  const resultFieldsArr = doc && Array.isArray(doc.resultFields) ? doc.resultFields : [];
+  const resultFieldsVal = resultFieldsArr.join(", ");
+  const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+  const title = isEdit ? "Edit linked query" : "Create linked query";
+  const submitLabel = isEdit ? "Save" : "Create";
+  const revInput = rev ? `<input type="hidden" id="rev" value="${escapeHtml(rev)}">` : "";
+
+  const profileOptions =
+    Array.isArray(profiles) && profiles.length
+      ? '<option value="">— Select profile —</option>' +
+        profiles
+          .map((p) => {
+            const idVal = String(p._id || "").trim();
+            const nameVal2 = typeof p.name === "string" && p.name.trim() ? p.name.trim() : idVal;
+            return `<option value="${escapeHtml(idVal)}"${idVal === baseProfileVal ? " data-role=\"base\" selected" : ""}>${escapeHtml(nameVal2)}</option>`;
+          })
+          .join("")
+      : '<option value="">No profiles</option>';
+
+  const queryProfileOptions =
+    Array.isArray(profiles) && profiles.length
+      ? '<option value="">— Select profile —</option>' +
+        profiles
+          .map((p) => {
+            const idVal = String(p._id || "").trim();
+            const nameVal2 = typeof p.name === "string" && p.name.trim() ? p.name.trim() : idVal;
+            return `<option value="${escapeHtml(idVal)}"${idVal === queryProfileVal ? " data-role=\"query\" selected" : ""}>${escapeHtml(nameVal2)}</option>`;
+          })
+          .join("")
+      : '<option value="">No profiles</option>';
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – ${title}</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 46rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .actions { margin-bottom: 1rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .actions a:hover { text-decoration: underline; }
+    label { display: block; margin-top: 0.75rem; color: var(--app-label, #8b949e); }
+    input, select, textarea { width: 100%; max-width: 32rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
+    textarea { min-height: 4rem; resize: vertical; }
+    .btn { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; border: none; }
+    .btn-primary { background: #238636; color: #fff; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; display: inline-block; margin-left: 0.5rem; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    .msg { margin-top: 1rem; }
+    .msg.err { color: #f85149; }
+    .msg.ok { color: #3fb950; }
+    .sub { color: var(--app-label, #8b949e); font-size: 0.9rem; margin-top: 0.25rem; max-width: 36rem; }
+  </style>
+</head>
+<body>
+  <div class="actions">
+    <a href="/queries">← Linked queries</a>
+    <button type="submit" form="query-form" class="btn btn-primary" style="margin-left:1rem;">${submitLabel}</button>
+    <a href="/queries" class="btn btn-secondary">Cancel</a>
+  </div>
+  <h1>${title}</h1>
+  <p class="sub">Link a base Elenko database (e.g. media) to a query database (e.g. songs) by matching a key field. The query results can be shown in the Single Entry view.</p>
+  ${errHtml}
+  <form id="query-form">
+    ${revInput}
+    <label for="name">Name</label>
+    <input type="text" id="name" name="name" required placeholder="e.g. Songs on medium" value="${nameVal}">
+    <label for="description">Description</label>
+    <textarea id="description" name="description" placeholder="Optional description">${descVal}</textarea>
+
+    <label for="baseProfileId">Base profile</label>
+    <select id="baseProfileId" name="baseProfileId" required>${profileOptions}</select>
+    <p class="sub">The Elenko database whose Single Entry form will use this query (e.g. media).</p>
+
+    <label for="baseKeyField">Base key field</label>
+    <input type="text" id="baseKeyField" name="baseKeyField" required placeholder="Field name on base profile (e.g. mediumId)" value="${baseKeyFieldVal}">
+    <p class="sub">Field on the base profile whose value will be used as the lookup key (e.g. mediumId on the media entry).</p>
+
+    <label for="queryProfileId">Query profile</label>
+    <select id="queryProfileId" name="queryProfileId" required>${queryProfileOptions}</select>
+    <p class="sub">The Elenko database that will be queried for matching rows (e.g. songs).</p>
+
+    <label for="queryKeyField">Query key field</label>
+    <input type="text" id="queryKeyField" name="queryKeyField" required placeholder="Field name on query profile (e.g. mediumId)" value="${queryKeyFieldVal}">
+    <p class="sub">Field on the query profile that must equal the base key field value (1:1 field mapping for now).</p>
+
+    <label for="resultFields">Result fields (comma-separated)</label>
+    <input type="text" id="resultFields" name="resultFields" placeholder="e.g. trackNo, title, duration" value="${resultFieldsVal}">
+    <p class="sub">Fields from the query profile to include in the result list (order defines display order). Leave empty to use all profile fields.</p>
+
+    <label for="sortField">Sort field (optional)</label>
+    <input type="text" id="sortField" name="sortField" placeholder="e.g. trackNo" value="${sortFieldVal}">
+    <p class="sub">Field on the query profile used to sort matching rows (e.g. track number). If empty, query results will not be explicitly sorted.</p>
+
+    <label for="sortDirection">Sort direction</label>
+    <select id="sortDirection" name="sortDirection">
+      <option value="asc"${sortDirectionVal === "asc" ? " selected" : ""}>Ascending</option>
+      <option value="desc"${sortDirectionVal === "desc" ? " selected" : ""}>Descending</option>
+    </select>
+  </form>
+  <div id="msg"></div>
+  <script>
+    (function() {
+      var form = document.getElementById('query-form');
+      var msgEl = document.getElementById('msg');
+      if (!form) return;
+      form.addEventListener('submit', function(ev) {
+        ev.preventDefault();
+        if (!msgEl) return;
+        msgEl.style.display = 'none';
+        msgEl.textContent = '';
+        msgEl.className = 'msg';
+
+        var name = (document.getElementById('name') || {}).value || '';
+        var baseProfileId = (document.getElementById('baseProfileId') || {}).value || '';
+        var baseKeyField = (document.getElementById('baseKeyField') || {}).value || '';
+        var queryProfileId = (document.getElementById('queryProfileId') || {}).value || '';
+        var queryKeyField = (document.getElementById('queryKeyField') || {}).value || '';
+        if (!name.trim() || !baseProfileId.trim() || !baseKeyField.trim() || !queryProfileId.trim() || !queryKeyField.trim()) {
+          msgEl.textContent = 'Name, base/query profile and key fields are required.';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+          return;
+        }
+
+        var resultFieldsRaw = (document.getElementById('resultFields') || {}).value || '';
+        var resultFields = resultFieldsRaw
+          .split(',')
+          .map(function(f) { return f.trim(); })
+          .filter(function(f) { return !!f; });
+
+        var payload = {
+          name: name,
+          description: (document.getElementById('description') || {}).value || '',
+          baseProfileId: baseProfileId,
+          baseKeyField: baseKeyField,
+          queryProfileId: queryProfileId,
+          queryKeyField: queryKeyField,
+          resultFields: resultFields,
+          sortField: (document.getElementById('sortField') || {}).value || '',
+          sortDirection: (document.getElementById('sortDirection') || {}).value === 'desc' ? 'desc' : 'asc'
+        };
+
+        var id = ${isEdit ? JSON.stringify(id || "") : "''"};
+        var revInput = document.getElementById('rev');
+        if (revInput && revInput.value) payload._rev = revInput.value;
+
+        var url = id ? '/api/queries/' + encodeURIComponent(id) : '/api/queries';
+        var method = id ? 'PUT' : 'POST';
+
+        fetch(url, {
+          method: method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+          .then(function(o) {
+            if (o.ok) {
+              msgEl.textContent = 'Saved.';
+              msgEl.className = 'msg ok';
+              msgEl.style.display = 'block';
+              if (!id && o.data && o.data.id) {
+                window.location.href = '/queries/' + encodeURIComponent(o.data.id) + '/edit';
+              }
+            } else {
+              msgEl.textContent = (o.data && o.data.error) ? o.data.error : 'Save failed';
+              msgEl.className = 'msg err';
+              msgEl.style.display = 'block';
+            }
+          })
+          .catch(function(e) {
+            msgEl.textContent = e.message || 'Save failed';
+            msgEl.className = 'msg err';
+            msgEl.style.display = 'block';
+          });
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
@@ -7316,12 +8188,12 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
 </html>`;
 }
 
-function renderCreateEntryFormPage(err, flows, appUi) {
-  return renderEntryFormPage(null, null, err, flows, appUi);
+function renderCreateEntryFormPage(err, flows, queries, appUi) {
+  return renderEntryFormPage(null, null, err, flows, queries, appUi);
 }
 
-function renderEditEntryFormPage(doc, err, flows, appUi) {
-  return renderEntryFormPage(doc, doc._rev, err, flows, appUi);
+function renderEditEntryFormPage(doc, err, flows, queries, appUi) {
+  return renderEntryFormPage(doc, doc._rev, err, flows, queries, appUi);
 }
 
 function renderEntryFormCssHelpPage(appUi) {
@@ -7409,10 +8281,11 @@ function renderEntryFormCssHelpPage(appUi) {
 </html>`;
 }
 
-function renderEntryFormPage(doc, rev, err, flows, appUi) {
+function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
   const appTheme = normalizeAppTheme(appUi && appUi.theme);
   const appThemeVars = getAppThemeVars(appTheme);
   const flowsList = Array.isArray(flows) ? flows : [];
+  const queriesList = Array.isArray(queries) ? queries : [];
   const isEdit = !!doc;
   const name = doc ? escapeHtml(doc.name || "") : "";
   const theme = doc && doc.theme ? doc.theme : DEFAULT_ENTRY_VIEW_THEME;
@@ -7440,6 +8313,14 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
   const initialFlowConfigsJson = JSON.stringify(flowConfigs);
   const labelsArr = (doc && Array.isArray(doc.labels) ? doc.labels : []);
   const fieldLayout = (doc && Array.isArray(doc.fieldLayout) ? doc.fieldLayout : []);
+  const linkedQueryCfg = doc && doc.linkedQuery && typeof doc.linkedQuery === "object" ? doc.linkedQuery : null;
+  const linkedQueryIdVal = linkedQueryCfg && typeof linkedQueryCfg.id === "string" ? linkedQueryCfg.id : "";
+  const linkedQueryWidthVal = linkedQueryCfg && typeof linkedQueryCfg.width === "string" ? linkedQueryCfg.width : "";
+  const linkedQueryButtonLabelVal = linkedQueryCfg && typeof linkedQueryCfg.buttonLabel === "string" ? linkedQueryCfg.buttonLabel : "";
+  const linkedQueryXVal = linkedQueryCfg && linkedQueryCfg.x != null ? String(linkedQueryCfg.x) : "";
+  const linkedQueryYVal = linkedQueryCfg && linkedQueryCfg.y != null ? String(linkedQueryCfg.y) : "";
+  const linkedQueryHeightVal = linkedQueryCfg && linkedQueryCfg.height != null ? String(linkedQueryCfg.height) : "";
+  const linkedQueryLoadOnDemandVal = !!(linkedQueryCfg && linkedQueryCfg.loadOnDemand);
   const revInput = rev ? `<input type="hidden" id="rev" value="${escapeHtml(rev)}">` : "";
   const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
   const title = isEdit ? "Single Entry form configuration" : "Create Single Entry form configuration";
@@ -7486,6 +8367,19 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
         )
         .join("")
     : "";
+
+  const linkedQueryOptions =
+    queriesList.length > 0
+      ? '<option value="">— None —</option>' +
+        queriesList
+          .map((q) => {
+            const id = q && q._id ? String(q._id) : "";
+            const label = q && (q.name || q._id) ? String(q.name || q._id) : id;
+            const sel = id && linkedQueryIdVal && id === linkedQueryIdVal ? " selected" : "";
+            return `<option value="${escapeHtml(id)}"${sel}>${escapeHtml(label)}</option>`;
+          })
+          .join("")
+      : '<option value="">No linked queries</option>';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -7591,6 +8485,41 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
       </tbody>
     </table>
     <button type="button" class="btn btn-secondary" id="add-field-layout" style="margin-top:0.5rem;">+ Add row</button>
+
+    <label style="margin-top:1.5rem;">Linked query (single-entry view)</label>
+    <p class="sub" style="margin-top:0;">Optional: show a related-records table from another Elenko database on the single-entry view.</p>
+    <label for="linkedQueryId" style="margin-top:0.5rem;">Linked Query</label>
+    <select id="linkedQueryId" name="linkedQueryId">${linkedQueryOptions}</select>
+    <p class="sub" style="margin-top:0.25rem;">Select one linked query (configured under Special → Linked queries).</p>
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0.75rem;max-width:40rem;">
+      <div>
+        <label for="linkedQueryWidth" style="margin-top:0;">Width</label>
+        <input type="text" id="linkedQueryWidth" placeholder="e.g. 100%, 24rem" value="${escapeHtml(linkedQueryWidthVal)}">
+      </div>
+      <div>
+        <label for="linkedQueryX" style="margin-top:0;">X (ch)</label>
+        <input type="number" id="linkedQueryX" step="any" placeholder="—" value="${escapeHtml(linkedQueryXVal)}">
+      </div>
+      <div>
+        <label for="linkedQueryY" style="margin-top:0;">Y (em)</label>
+        <input type="number" id="linkedQueryY" step="any" placeholder="—" value="${escapeHtml(linkedQueryYVal)}">
+      </div>
+      <div>
+        <label for="linkedQueryHeight" style="margin-top:0;">Height (em)</label>
+        <input type="number" id="linkedQueryHeight" step="any" min="0" placeholder="—" value="${escapeHtml(linkedQueryHeightVal)}">
+      </div>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.75rem 1rem;margin-top:0.75rem;">
+      <label style="display:flex;align-items:center;gap:0.5rem;margin:0;">
+        <input type="checkbox" id="linkedQueryLoadOnDemand" ${linkedQueryLoadOnDemandVal ? "checked" : ""} style="width:auto;">
+        <span style="color:var(--app-text,#e6edf3);">Load on demand (start empty; show button to load linked query table)</span>
+      </label>
+      <span id="linkedQueryButtonLabelWrap" style="display:flex;align-items:center;gap:0.5rem;flex:1 1 14rem;min-width:min(100%,12rem);">
+        <label for="linkedQueryButtonLabel" style="margin:0;white-space:nowrap;">Button label</label>
+        <input type="text" id="linkedQueryButtonLabel" placeholder="Load linked data" value="${escapeHtml(linkedQueryButtonLabelVal)}" style="flex:1;min-width:8rem;">
+      </span>
+    </div>
+    <p class="sub" style="margin-top:0.5rem;">Grid layout: X/Y/Height position the table. Other layouts: table is placed below entry data. Height adds a vertical scrollbar when needed.</p>
     <label style="margin-top:1.5rem;">Flow buttons (single-entry view)</label>
     <p class="sub" style="margin-top:0;">Each row adds a button on the single-entry view that sends the entry dataset to the Flow facility. First column enables the button.</p>
     <table class="flow-config-table" style="margin-top:0.5rem;">
@@ -7625,6 +8554,7 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
     const addFlowConfigBtn = document.getElementById('add-flow-config');
     const initialFlowConfigs = ${initialFlowConfigsJson};
     const flowsList = ${JSON.stringify(flowsList)};
+    const queriesList = ${JSON.stringify(queriesList)};
     function addFlowConfigRow(cfg) {
       const tr = document.createElement('tr');
       tr.className = 'flow-config-row';
@@ -7720,6 +8650,15 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
       }
     });
 
+    const linkedQueryLoadOnDemandEl = document.getElementById('linkedQueryLoadOnDemand');
+    const linkedQueryButtonLabelWrap = document.getElementById('linkedQueryButtonLabelWrap');
+    function syncLinkedQueryButtonLabelRow() {
+      if (!linkedQueryButtonLabelWrap) return;
+      linkedQueryButtonLabelWrap.style.display = (linkedQueryLoadOnDemandEl && linkedQueryLoadOnDemandEl.checked) ? '' : 'none';
+    }
+    if (linkedQueryLoadOnDemandEl) linkedQueryLoadOnDemandEl.addEventListener('change', syncLinkedQueryButtonLabelRow);
+    syncLinkedQueryButtonLabelRow();
+
     form.onsubmit = async (e) => {
       e.preventDefault();
       msgEl.textContent = '';
@@ -7784,7 +8723,23 @@ function renderEntryFormPage(doc, rev, err, flows, appUi) {
       }
       const url = formId ? '/api/entry-forms/' + encodeURIComponent(formId) : '/api/entry-forms';
       const method = formId ? 'PUT' : 'POST';
+      const linkedQueryId = (document.getElementById('linkedQueryId') && document.getElementById('linkedQueryId').value) || '';
+      const linkedQueryWidth = (document.getElementById('linkedQueryWidth') && document.getElementById('linkedQueryWidth').value.trim()) || '';
+      const linkedQueryButtonLabel = (document.getElementById('linkedQueryButtonLabel') && document.getElementById('linkedQueryButtonLabel').value.trim()) || '';
+      const linkedQueryX = parseNumInput(document.getElementById('linkedQueryX'));
+      const linkedQueryY = parseNumInput(document.getElementById('linkedQueryY'));
+      const linkedQueryH = parseNumInput(document.getElementById('linkedQueryHeight'));
+      const linkedQueryLoadOnDemand = !!(document.getElementById('linkedQueryLoadOnDemand') && document.getElementById('linkedQueryLoadOnDemand').checked);
       const body = { name, labels, theme, layout, fieldLayout, customCss, flowConfigs };
+      if (linkedQueryId && linkedQueryId.trim()) {
+        body.linkedQuery = { id: linkedQueryId.trim() };
+        if (linkedQueryWidth) body.linkedQuery.width = linkedQueryWidth;
+        if (linkedQueryLoadOnDemand && linkedQueryButtonLabel) body.linkedQuery.buttonLabel = linkedQueryButtonLabel;
+        if (linkedQueryX != null) body.linkedQuery.x = linkedQueryX;
+        if (linkedQueryY != null) body.linkedQuery.y = linkedQueryY;
+        if (linkedQueryH != null) body.linkedQuery.height = linkedQueryH;
+        if (linkedQueryLoadOnDemand) body.linkedQuery.loadOnDemand = true;
+      }
       if (formId) body._rev = document.getElementById('rev').value;
       try {
         const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -8055,7 +9010,7 @@ function renderStartPage(profiles, role, appUi) {
     const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
   const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
   const thead = '<tr><th>Name</th><th>Description</th><th class="col-mobile-hidden">Creation date</th></tr>';
 
@@ -9707,7 +10662,7 @@ function renderConfigExportImportPage(profiles, appUi) {
       var msgEl = document.getElementById('msg');
 
       function summarizeExportCounts(payload) {
-        var summary = { profiles: 0, entryForms: 0, flows: 0, apis: 0, jsProcessing: 0, appConfig: 0 };
+        var summary = { profiles: 0, entryForms: 0, flows: 0, apis: 0, jsProcessing: 0, appConfig: 0, queries: 0 };
         var docs = payload && payload.documents ? payload.documents : {};
         var dbDocs = Array.isArray(docs.db) ? docs.db : [];
         var cfgDocs = Array.isArray(docs.configDb) ? docs.configDb : [];
@@ -9722,6 +10677,7 @@ function renderConfigExportImportPage(profiles, appUi) {
           if (doc.type === 'elenko_api') summary.apis += 1;
           if (doc.type === 'elenko_js_processing') summary.jsProcessing += 1;
           if (doc.type === 'elenko_app_config') summary.appConfig += 1;
+          if (doc.type === 'elenko_query') summary.queries += 1;
         });
         return summary;
       }
