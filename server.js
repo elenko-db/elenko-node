@@ -8,6 +8,8 @@ const session = require("express-session");
 const iconv = require("iconv-lite");
 const marked = require("marked");
 const nano = require("nano");
+const multer = require("multer");
+const sharp = require("sharp");
 
 const originalConsoleError = console.error.bind(console);
 
@@ -70,6 +72,18 @@ const DB_CODE_LEN = 8;
 const PRIMARY_KEY_SEGMENT_LEN_MIN = 1;
 const PRIMARY_KEY_SEGMENT_LEN_MAX = 512;
 const DEFAULT_VALUE_SOURCES = ["", "createdAt", "updatedAt", "currentUser"];
+
+/** Inline entry images: CouchDB attachments (see POST/GET .../attachments). */
+const MAX_ENTRY_IMAGE_BYTES = Number(process.env.MAX_ENTRY_IMAGE_BYTES) || 2 * 1024 * 1024;
+const MAX_IMAGE_DISPLAY_EDGE = Number(process.env.MAX_IMAGE_DISPLAY_EDGE) || 1600;
+/** Upper bound for layout-derived upload resize (px); avoids huge server work from a typo like 99999px width. */
+const MAX_IMAGE_UPLOAD_EDGE_CAP = Number(process.env.MAX_IMAGE_UPLOAD_EDGE_CAP) || 8192;
+const ALLOWED_ENTRY_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+
+const entryImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_ENTRY_IMAGE_BYTES },
+});
 
 /** PNG names must match files in public/ (see README-favicon.txt). Order: sized PNGs first, then .ico fallback — works reliably in Firefox + Chrome. */
 const FAVICON_LINKS =
@@ -188,6 +202,68 @@ function resolveDefaultValue(source, req) {
   return "";
 }
 
+/** Set on records created via "Create entry" until the first successful save; allows cancel to delete the draft server-side. */
+const ELENKO_DISCARD_ON_CANCEL = "elenko_discard_on_cancel";
+
+/**
+ * Same as POST /api/profiles/:id/entries: builds and inserts a new elenko_record.
+ * @param {object} values - field values from JSON body; use {} for an empty draft (e.g. "new entry" redirect).
+ * @param {{ discardOnCancel?: boolean }} [options]
+ * @returns {{ ok: true, id: string, rev: string } | { ok: false, error: string, status: number }}
+ */
+async function insertNewEntryDocument(db, profileDoc, req, values, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const profileId = profileDoc._id;
+  const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const record = { type: "elenko_record", profileId };
+  for (const fn of fieldNames) {
+    record[fn] = values[fn] != null ? String(values[fn]).trim() : "";
+  }
+  const now = new Date().toISOString();
+  record.createdAt = now;
+  record.updatedAt = now;
+  const sources = Array.isArray(profileDoc.fieldDefaultSources) ? profileDoc.fieldDefaultSources : [];
+  for (let i = 0; i < fieldNames.length; i++) {
+    const src = sources[i];
+    if (src === "createdAt" || src === "updatedAt" || src === "currentUser") {
+      record[fieldNames[i]] = resolveDefaultValue(src, req);
+    }
+  }
+  let pdoc = profileDoc;
+  pdoc = await ensureProfileDbCode8(db, pdoc);
+  const sortKeyFields = Array.isArray(pdoc.sortKeyFields) ? pdoc.sortKeyFields : [];
+  record.sortKey = buildSortKey(record, sortKeyFields);
+  const requestedEntryFormId = typeof values.entryFormId === "string" ? values.entryFormId.trim() : "";
+  const profileFormIds = getProfileEntryFormIds(pdoc);
+  if (requestedEntryFormId && profileFormIds.includes(requestedEntryFormId)) {
+    record.entryFormId = requestedEntryFormId;
+  } else if (profileFormIds.length > 0) {
+    record.entryFormId = profileFormIds[0];
+  }
+  try {
+    applyPrimaryKeyToRecord(record, pdoc);
+  } catch (e) {
+    return { ok: false, error: e.message || "Primary key could not be computed.", status: 400 };
+  }
+  if (record.primaryKey) {
+    const conflict = await findPrimaryKeyConflict(db, record.primaryKey, "");
+    if (conflict) {
+      return {
+        ok: false,
+        error: "Duplicate primary key: another entry already uses this composite key.",
+        status: 409,
+      };
+    }
+  }
+  if (opts.discardOnCancel) {
+    record[ELENKO_DISCARD_ON_CANCEL] = true;
+  }
+  const result = await db.insert(record);
+  clearProfileListCache(profileId);
+  sendFlowMessage("entry.created", { id: result.id, profileId, fields: fieldNames });
+  return { ok: true, id: result.id, rev: result.rev };
+}
+
 const DEFAULT_ENTRY_VIEW_THEME = {
   background: "#0f1419",
   text: "#e6edf3",
@@ -254,6 +330,89 @@ function getAppThemeVars(theme) {
     }`;
 }
 
+function normalizeEntryFieldType(raw) {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (s === "markdown") return "markdown";
+  if (s === "url") return "url";
+  if (s === "image") return "image";
+  return "text";
+}
+
+/** Safe attachment name for CouchDB (basename, no path segments). */
+function normalizeEntryAttachmentFilename(original) {
+  let s = path.basename(String(original || "").trim().replace(/\\/g, "/"));
+  if (!s || s === "." || s === "..") return "";
+  s = s.replace(/\s+/g, "_").replace(/[^a-zA-Z0-9._-]/g, "");
+  if (s.length > 200) s = s.slice(0, 200);
+  return s;
+}
+
+function entryImageMimeToExt(mime) {
+  if (mime === "image/jpeg") return ".jpg";
+  if (mime === "image/png") return ".png";
+  if (mime === "image/webp") return ".webp";
+  if (mime === "image/gif") return ".gif";
+  return "";
+}
+
+function getImageFieldNamesFromFormLayout(formDoc) {
+  const out = new Set();
+  if (!formDoc || !Array.isArray(formDoc.fieldLayout)) return out;
+  for (const item of formDoc.fieldLayout) {
+    if (
+      item &&
+      typeof item.fieldName === "string" &&
+      item.fieldName.trim() &&
+      normalizeEntryFieldType(item.fieldType) === "image"
+    ) {
+      out.add(item.fieldName.trim());
+    }
+  }
+  return out;
+}
+
+function getFieldLayoutItemForFieldName(formDoc, fieldName) {
+  if (!formDoc || !Array.isArray(formDoc.fieldLayout) || !fieldName) return null;
+  const fn = String(fieldName).trim();
+  for (const item of formDoc.fieldLayout) {
+    if (item && typeof item.fieldName === "string" && item.fieldName.trim() === fn) return item;
+  }
+  return null;
+}
+
+/**
+ * Maps Single Entry form field "width" (CSS-like) to a max edge in pixels for upload-time resize.
+ * Unknown units fall back to MAX_IMAGE_DISPLAY_EDGE.
+ */
+function uploadMaxEdgeFromFieldLayoutWidth(widthRaw) {
+  const fallback = MAX_IMAGE_DISPLAY_EDGE;
+  const cap = Math.max(MAX_IMAGE_UPLOAD_EDGE_CAP, fallback);
+  const clamp = (n) => {
+    const x = Math.floor(Number(n));
+    if (!Number.isFinite(x)) return fallback;
+    return Math.min(Math.max(x, 1), cap);
+  };
+  if (widthRaw == null) return clamp(fallback);
+  const w = String(widthRaw).trim();
+  if (!w) return clamp(fallback);
+  let m = /^(\d+(?:\.\d+)?)px$/i.exec(w);
+  if (m) return clamp(m[1]);
+  m = /^(\d+(?:\.\d+)?)%$/i.exec(w);
+  if (m) {
+    const p = Number(m[1]);
+    if (Number.isFinite(p) && p > 0) return clamp((fallback * p) / 100);
+  }
+  m = /^(\d+(?:\.\d+)?)ch$/i.exec(w);
+  if (m) return clamp(Number(m[1]) * 9);
+  m = /^(\d+(?:\.\d+)?)rem$/i.exec(w);
+  if (m) return clamp(Number(m[1]) * 16);
+  m = /^(\d+(?:\.\d+)?)em$/i.exec(w);
+  if (m) return clamp(Number(m[1]) * 16);
+  m = /^(\d+(?:\.\d+)?)$/.exec(w);
+  if (m) return clamp(m[1]);
+  return clamp(fallback);
+}
+
 function normalizeProfileTheme(theme) {
   if (!theme || typeof theme !== "object") return { ...DEFAULT_PROFILE_THEME };
   const get = (key) => {
@@ -306,7 +465,7 @@ function normalizeEntryFormDoc(body) {
         ...(height != null && { height }),
       };
       if (typeof item.fieldName === "string" && item.fieldName.trim()) {
-        const fieldType = item.fieldType === "markdown" ? "markdown" : item.fieldType === "url" ? "url" : "text";
+        const fieldType = normalizeEntryFieldType(item.fieldType);
         return { ...base, fieldName: item.fieldName.trim(), fieldType };
       }
       return { ...base, labelId: item.labelId.trim() };
@@ -4722,20 +4881,17 @@ app.get("/profile/:id/entry/new", requireEditor, async (req, res) => {
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).send(renderErrorPage("Profile not found"));
     }
-    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
-    const sources = Array.isArray(doc.fieldDefaultSources) ? doc.fieldDefaultSources : [];
-    const now = new Date().toISOString();
-    const currentUser = req.session && req.session.user ? String(req.session.user) : "";
-    const initialValues = {};
-    for (let i = 0; i < fieldNames.length; i++) {
-      const src = sources[i];
-      initialValues[fieldNames[i]] = resolveDefaultValue(src, req);
+    const out = await insertNewEntryDocument(db, doc, req, {}, { discardOnCancel: true });
+    if (!out.ok) {
+      return res.status(out.status).send(renderErrorPage(out.error));
     }
-    res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderCreateEntryPage(doc, initialValues));
+    res.redirect(
+      302,
+      "/profile/" + encodeURIComponent(doc._id) + "/entry/" + encodeURIComponent(out.id) + "/edit"
+    );
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Profile not found"));
-    console.error("Error loading profile:", err);
+    console.error("Error creating draft entry:", err);
     res.status(500).send(renderErrorPage(err.message));
   }
 });
@@ -4747,48 +4903,11 @@ app.post("/api/profiles/:id/entries", requireEditor, async (req, res) => {
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).json({ error: "Profile not found" });
     }
-    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
-    const values = req.body || {};
-    const record = { type: "elenko_record", profileId };
-    for (const fn of fieldNames) {
-      record[fn] = values[fn] != null ? String(values[fn]).trim() : "";
+    const out = await insertNewEntryDocument(db, doc, req, req.body || {});
+    if (!out.ok) {
+      return res.status(out.status).json({ error: out.error });
     }
-    const now = new Date().toISOString();
-    record.createdAt = now;
-    record.updatedAt = now;
-    const sources = Array.isArray(doc.fieldDefaultSources) ? doc.fieldDefaultSources : [];
-    for (let i = 0; i < fieldNames.length; i++) {
-      const src = sources[i];
-      if (src === "createdAt" || src === "updatedAt" || src === "currentUser") {
-        record[fieldNames[i]] = resolveDefaultValue(src, req);
-      }
-    }
-    let profileDoc = doc;
-    profileDoc = await ensureProfileDbCode8(db, profileDoc);
-    const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
-    record.sortKey = buildSortKey(record, sortKeyFields);
-    const requestedEntryFormId = typeof values.entryFormId === "string" ? values.entryFormId.trim() : "";
-    const profileFormIds = getProfileEntryFormIds(profileDoc);
-    if (requestedEntryFormId && profileFormIds.includes(requestedEntryFormId)) {
-      record.entryFormId = requestedEntryFormId;
-    } else if (profileFormIds.length > 0) {
-      record.entryFormId = profileFormIds[0];
-    }
-    try {
-      applyPrimaryKeyToRecord(record, profileDoc);
-    } catch (e) {
-      return res.status(400).json({ error: e.message || "Primary key could not be computed." });
-    }
-    if (record.primaryKey) {
-      const conflict = await findPrimaryKeyConflict(db, record.primaryKey, "");
-      if (conflict) {
-        return res.status(409).json({ error: "Duplicate primary key: another entry already uses this composite key." });
-      }
-    }
-    const result = await db.insert(record);
-    clearProfileListCache(profileId);
-     sendFlowMessage("entry.created", { id: result.id, profileId, fields: fieldNames });
-    res.status(201).json({ ok: true, id: result.id, rev: result.rev });
+    res.status(201).json({ ok: true, id: out.id, rev: out.rev });
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
     console.error("Error creating entry:", err);
@@ -5050,6 +5169,19 @@ app.get("/profile/:id/entry/:entryId/edit", requireEditor, async (req, res) => {
         // ignore
       }
     }
+    if (!formDoc && profileFormIds.length > 0) {
+      for (const fid of profileFormIds) {
+        const t = typeof fid === "string" ? fid.trim() : "";
+        if (!t) continue;
+        try {
+          const loaded = await db.get(t);
+          if (loaded && loaded.type === "elenko_entry_form") {
+            formDoc = loaded;
+            break;
+          }
+        } catch (_) {}
+      }
+    }
     const formChoices = [];
     const seenIds = new Set();
     if (currentFormId && formDoc) {
@@ -5088,7 +5220,7 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).json({ error: "Profile not found" });
     }
-    const record = await db.get(entryId);
+    let record = await db.get(entryId);
     if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
       return res.status(404).json({ error: "Entry not found" });
     }
@@ -5107,6 +5239,20 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
         const loaded = await db.get(formId);
         if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
       } catch (_) {}
+    }
+    const imageFields = getImageFieldNamesFromFormLayout(formDoc);
+    for (const fn of imageFields) {
+      const newVal = values[fn] != null ? String(values[fn]).trim() : "";
+      const oldVal = record[fn] != null ? String(record[fn]).trim() : "";
+      if (newVal === "" && oldVal && record._attachments && record._attachments[oldVal]) {
+        try {
+          await db.attachment.destroy(entryId, oldVal, { rev: record._rev });
+          record = await db.get(entryId);
+        } catch (e) {
+          if (e.statusCode !== 404) throw e;
+          record = await db.get(entryId);
+        }
+      }
     }
     const formFieldNames = getFieldNamesFromFormLayout(formDoc);
     const fieldNames = [...new Set([...profileFieldNames, ...formFieldNames])];
@@ -5136,6 +5282,9 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
         return res.status(409).json({ error: "Duplicate primary key: another entry already uses this composite key." });
       }
     }
+    if (Object.prototype.hasOwnProperty.call(record, ELENKO_DISCARD_ON_CANCEL)) {
+      delete record[ELENKO_DISCARD_ON_CANCEL];
+    }
     const result = await db.insert(record);
     clearProfileListCache(profileId);
     res.json({ ok: true, id: result.id, rev: result.rev });
@@ -5144,6 +5293,254 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict; refresh and try again" });
     console.error("Error updating entry:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/profiles/:id/entries/:entryId/abandon-draft", requireEditor, async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const entryId = req.params.entryId;
+    const doc = await db.get(profileId);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const record = await db.get(entryId);
+    if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
+      return res.status(404).json({ error: "Entry not found" });
+    }
+    if (!record[ELENKO_DISCARD_ON_CANCEL]) {
+      return res.status(400).json({ error: "This entry is not a disposable new draft." });
+    }
+    await db.destroy(entryId, record._rev);
+    clearProfileListCache(profileId);
+    const returnParts = [];
+    if (req.query.page) returnParts.push("page=" + encodeURIComponent(String(req.query.page)));
+    if (req.query.q) returnParts.push("q=" + encodeURIComponent(String(req.query.q)));
+    const returnQueryStr = returnParts.length > 0 ? "?" + returnParts.join("&") : "";
+    const redirect = "/profile/" + encodeURIComponent(profileId) + returnQueryStr;
+    res.json({ ok: true, redirect });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Entry not found" });
+    console.error("Error abandoning draft entry:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post(
+  "/api/profiles/:profileId/entries/:entryId/attachments",
+  requireEditor,
+  entryImageUpload.single("file"),
+  async (req, res) => {
+    try {
+      const profileId = req.params.profileId;
+      const entryId = req.params.entryId;
+      const fieldName =
+        req.body && typeof req.body.fieldName === "string" ? req.body.fieldName.trim() : "";
+      if (!fieldName) return res.status(400).json({ error: "fieldName is required." });
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ error: "file is required (multipart field name: file)." });
+      }
+
+      const profileDoc = await db.get(profileId);
+      if (!profileDoc || profileDoc.type !== "elenko_profile") {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+      const profileFieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+      if (!profileFieldNames.includes(fieldName)) {
+        return res.status(400).json({ error: "Unknown profile field: " + fieldName });
+      }
+
+      let record = await db.get(entryId);
+      if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
+        return res.status(404).json({ error: "Entry not found" });
+      }
+
+      let formDoc = null;
+      const profileFormIds = getProfileEntryFormIds(profileDoc);
+      const formId =
+        record.entryFormId && typeof record.entryFormId === "string" && record.entryFormId.trim()
+          ? record.entryFormId.trim()
+          : profileFormIds[0] || "";
+      if (formId) {
+        try {
+          const loaded = await db.get(formId);
+          if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
+        } catch (_) {}
+      }
+      const imageFields = getImageFieldNamesFromFormLayout(formDoc);
+      if (!imageFields.has(fieldName)) {
+        return res.status(400).json({
+          error: "Field is not configured as Image type on this entry form.",
+        });
+      }
+
+      let mime =
+        req.file.mimetype && String(req.file.mimetype).split(";")[0]
+          ? String(req.file.mimetype).split(";")[0].trim().toLowerCase()
+          : "";
+      if (!ALLOWED_ENTRY_IMAGE_MIMES.has(mime)) {
+        return res.status(400).json({ error: "Unsupported image type. Use JPEG, PNG, WebP, or GIF." });
+      }
+
+      let meta;
+      try {
+        meta = await sharp(req.file.buffer, { failOn: "truncated" }).metadata();
+        if (!meta.width || !meta.height) {
+          return res.status(400).json({ error: "Invalid image file." });
+        }
+      } catch (_) {
+        return res.status(400).json({ error: "Invalid image file." });
+      }
+
+      const layoutItem = getFieldLayoutItemForFieldName(formDoc, fieldName);
+      const layoutWidthStr =
+        layoutItem && typeof layoutItem.width === "string" && layoutItem.width.trim()
+          ? layoutItem.width.trim()
+          : "";
+      const uploadMaxEdge = uploadMaxEdgeFromFieldLayoutWidth(layoutWidthStr || undefined);
+      const exceedsLayout = meta.width > uploadMaxEdge || meta.height > uploadMaxEdge;
+
+      let outBuffer = req.file.buffer;
+      let outMime = mime;
+      if (exceedsLayout) {
+        try {
+          outBuffer = await sharp(req.file.buffer)
+            .rotate()
+            .resize(uploadMaxEdge, uploadMaxEdge, { fit: "inside", withoutEnlargement: true })
+            .jpeg({ quality: 85, mozjpeg: true })
+            .toBuffer();
+          outMime = "image/jpeg";
+        } catch (e) {
+          console.warn("Entry image upload resize failed:", e && e.message);
+          return res.status(400).json({ error: "Could not process image." });
+        }
+      }
+
+      let baseName = normalizeEntryAttachmentFilename(req.file.originalname);
+      if (!baseName) baseName = "image";
+      if (exceedsLayout) {
+        const stem = baseName.includes(".") ? baseName.slice(0, baseName.lastIndexOf(".")) : baseName;
+        baseName = stem + ".jpg";
+      } else {
+        const extFromOrig = entryImageMimeToExt(mime);
+        if (extFromOrig && !baseName.toLowerCase().endsWith(extFromOrig)) {
+          baseName += extFromOrig;
+        }
+      }
+
+      const storedExt = entryImageMimeToExt(outMime);
+      let safeName = baseName;
+      let counter = 1;
+      while (record._attachments && record._attachments[safeName]) {
+        const curField = record[fieldName] != null ? String(record[fieldName]).trim() : "";
+        if (curField === safeName) break;
+        const stem = baseName.includes(".") ? baseName.slice(0, baseName.lastIndexOf(".")) : baseName;
+        const extPart = baseName.includes(".") ? baseName.slice(baseName.lastIndexOf(".")) : storedExt || "";
+        safeName = stem + "_" + counter + extPart;
+        counter++;
+        if (counter > 500) return res.status(400).json({ error: "Could not allocate attachment name." });
+      }
+
+      const oldName = record[fieldName] != null ? String(record[fieldName]).trim() : "";
+      if (oldName && oldName !== safeName && record._attachments && record._attachments[oldName]) {
+        try {
+          await db.attachment.destroy(entryId, oldName, { rev: record._rev });
+          record = await db.get(entryId);
+        } catch (e) {
+          if (e.statusCode !== 404) throw e;
+          record = await db.get(entryId);
+        }
+      }
+
+      await db.attachment.insert(entryId, safeName, outBuffer, outMime, { rev: record._rev });
+      record = await db.get(entryId);
+      record[fieldName] = safeName;
+      record.updatedAt = new Date().toISOString();
+      let pdoc = profileDoc;
+      pdoc = await ensureProfileDbCode8(db, pdoc);
+      const sortKeyFields = Array.isArray(pdoc.sortKeyFields) ? pdoc.sortKeyFields : [];
+      record.sortKey = buildSortKey(record, sortKeyFields);
+      try {
+        applyPrimaryKeyToRecord(record, pdoc);
+      } catch (e) {
+        return res.status(400).json({ error: e.message || "Primary key could not be computed." });
+      }
+      if (record.primaryKey) {
+        const conflict = await findPrimaryKeyConflict(db, record.primaryKey, entryId);
+        if (conflict) {
+          return res.status(409).json({ error: "Duplicate primary key after upload." });
+        }
+      }
+      const ins = await db.insert(record);
+      clearProfileListCache(profileId);
+      res.json({ ok: true, filename: safeName, rev: ins.rev });
+    } catch (err) {
+      if (err?.statusCode === 404) return res.status(404).json({ error: "Not found" });
+      if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict; refresh and try again" });
+      console.error("Entry image upload error:", err);
+      res.status(500).json({ error: err.message || "Upload failed" });
+    }
+  }
+);
+
+app.get("/api/profiles/:profileId/entries/:entryId/attachments/:filename", requireAuth, async (req, res) => {
+  try {
+    const profileId = req.params.profileId;
+    const entryId = req.params.entryId;
+    let filename = req.params.filename != null ? String(req.params.filename) : "";
+    try {
+      filename = decodeURIComponent(filename);
+    } catch (_) {}
+    filename = normalizeEntryAttachmentFilename(filename);
+    if (!filename) return res.status(400).end();
+
+    const profileDoc = await db.get(profileId);
+    if (!profileDoc || profileDoc.type !== "elenko_profile") return res.status(404).end();
+    const record = await db.get(entryId);
+    if (!record || record.type !== "elenko_record" || record.profileId !== profileId) return res.status(404).end();
+
+    let referenced = false;
+    for (const fn of Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : []) {
+      if (String(record[fn] != null ? record[fn] : "").trim() === filename) {
+        referenced = true;
+        break;
+      }
+    }
+    if (!referenced) return res.status(404).end();
+    if (!record._attachments || !record._attachments[filename]) return res.status(404).end();
+
+    const stub = record._attachments[filename];
+    const contentType = stub.content_type || "application/octet-stream";
+    const maxRaw = Number(req.query.max);
+    const wantMax = Number.isFinite(maxRaw) && maxRaw > 0;
+    const maxEdge = wantMax ? Math.min(Math.floor(maxRaw), MAX_IMAGE_DISPLAY_EDGE) : 0;
+
+    const buf = await db.attachment.get(entryId, filename);
+
+    if (maxEdge > 0) {
+      try {
+        const out = await sharp(buf)
+          .rotate()
+          .resize(maxEdge, maxEdge, { fit: "inside", withoutEnlargement: true })
+          .jpeg({ quality: 85, mozjpeg: true })
+          .toBuffer();
+        res.set("Cache-Control", "private, max-age=3600");
+        res.type("image/jpeg");
+        res.send(out);
+        return;
+      } catch (e) {
+        console.warn("Entry image resize failed, sending original:", e && e.message);
+      }
+    }
+    /** @type {string} */
+    const ct = contentType;
+    res.set("Cache-Control", "private, max-age=86400");
+    res.type(ct);
+    res.send(buf);
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).end();
+    console.error("Entry attachment get error:", err);
+    res.status(500).end();
   }
 });
 
@@ -5438,113 +5835,6 @@ app.get("/profile/:id", async (req, res) => {
   }
 });
 
-function renderCreateEntryPage(doc, initialValues = {}) {
-  const title = escapeHtml(doc.name || "Elenko database");
-  const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
-  const profileId = doc._id;
-  const backUrl = "/profile/" + encodeURIComponent(profileId);
-  const customCss = doc.customCss || "";
-
-  const rows =
-    fieldNames.length > 0
-      ? fieldNames
-          .map(
-            (fn) => {
-              const val = initialValues[fn] != null ? String(initialValues[fn]) : "";
-              return `
-        <tr>
-          <td class="label">${escapeHtml(fn)}</td>
-          <td><input type="text" class="entry-field" name="${escapeHtml(fn)}" placeholder="${escapeHtml(fn)}" value="${escapeHtml(val)}"></td>
-        </tr>`;
-            }
-          )
-          .join("")
-      : `<tr><td colspan="2" class="empty">No fields defined. Edit the profile to add field names.</td></tr>`;
-
-  const fieldNamesJson = JSON.stringify(fieldNames);
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  ${FAVICON_LINKS}
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Elenko – New entry</title>
-  <style>
-    * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 36rem; }
-    h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1.5rem; }
-    .actions { margin-bottom: 1.5rem; }
-    .actions a { color: #58a6ff; text-decoration: none; margin-right: 1rem; }
-    .actions a:hover { text-decoration: underline; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #21262d; }
-    .label { color: #8b949e; width: 40%; }
-    tr:last-child td { border-bottom: none; }
-    input[type="text"] { width: 100%; padding: 0.5rem; background: #0f1419; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    input:focus { outline: none; border-color: #58a6ff; }
-    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; margin-top: 1rem; }
-    .btn:hover { background: #2ea043; }
-    .btn-secondary { background: #21262d; color: #e6edf3; text-decoration: none; }
-    .btn-secondary:hover { background: #30363d; }
-    .empty { color: #8b949e; font-style: italic; }
-    .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
-    .msg.err { background: #3d1f1f; color: #f85149; }
-    .msg.ok { background: #1a2f1a; color: #3fb950; }
-  </style>
-  ${customCss ? `<style>${customCss}</style>` : ""}
-</head>
-<body>
-  <div class="actions"><a href="${escapeHtml(backUrl)}">← Back to database</a></div>
-  <h1>${title}</h1>
-  <p class="sub">New entry</p>
-  <form id="entry-form">
-    <table>
-      <tbody>${rows}
-      </tbody>
-    </table>
-    <div>
-      <button type="submit" class="btn">Create entry</button>
-      <a href="${escapeHtml(backUrl)}" class="btn btn-secondary" style="margin-left: 0.5rem;">Cancel</a>
-    </div>
-  </form>
-  <div id="msg"></div>
-  <script>
-    const profileId = ${JSON.stringify(profileId)};
-    const fieldNames = ${fieldNamesJson};
-    const form = document.getElementById('entry-form');
-    const msgEl = document.getElementById('msg');
-
-    form.onsubmit = async (e) => {
-      e.preventDefault();
-      msgEl.textContent = '';
-      msgEl.className = 'msg';
-      const inputs = form.querySelectorAll('.entry-field');
-      const data = {};
-      fieldNames.forEach((fn, i) => { data[fn] = (inputs[i] && inputs[i].value) ? String(inputs[i].value).trim() : ''; });
-      try {
-        const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/entries', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data)
-        });
-        const result = await r.json();
-        if (!r.ok) { msgEl.textContent = result.error || 'Failed'; msgEl.className = 'msg err'; return; }
-        msgEl.textContent = 'Entry created.';
-        msgEl.className = 'msg ok';
-        const entryViewUrl = '/profile/' + encodeURIComponent(profileId) + '/entry/' + encodeURIComponent(result.id);
-        setTimeout(() => { window.location.href = entryViewUrl; }, 800);
-      } catch (err) {
-        msgEl.textContent = err.message || 'Request failed';
-        msgEl.className = 'msg err';
-      }
-    };
-  </script>
-</body>
-</html>`;
-}
-
 function getFieldNamesFromFormLayout(formDoc) {
   if (!formDoc || !Array.isArray(formDoc.fieldLayout)) return [];
   return formDoc.fieldLayout
@@ -5577,16 +5867,17 @@ function buildOrderedItems(profileFieldNames, formDoc) {
     .sort((a, b) => (a.order != null ? Number(a.order) : 0) - (b.order != null ? Number(b.order) : 0));
 
   for (const item of sorted) {
-    if (item.fieldName && !seenFields.has(item.fieldName)) {
-      seenFields.add(item.fieldName);
+    const fn = item && typeof item.fieldName === "string" ? item.fieldName.trim() : "";
+    if (fn && !seenFields.has(fn)) {
+      seenFields.add(fn);
       ordered.push({
         type: "field",
-        fieldName: item.fieldName,
+        fieldName: fn,
         width: item.width || "100%",
         x: item.x,
         y: item.y,
         height: item.height,
-        fieldType: item.fieldType === "markdown" ? "markdown" : item.fieldType === "url" ? "url" : "text",
+        fieldType: normalizeEntryFieldType(item.fieldType),
       });
     } else if (item.labelId && labelsById[item.labelId] !== undefined && !seenLabels.has(item.labelId)) {
       seenLabels.add(item.labelId);
@@ -5889,21 +6180,14 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   function labelClass(o) {
     return o.type === "label" ? "label static-label" : "label field-label";
   }
-  function editControlHtml(o, value) {
-    const escapedName = escapeHtml(o.fieldName);
-    const escapedValue = escapeHtml(value);
-    if (o.fieldType === "url") {
-      return `<input type="url" class="entry-field" name="${escapedName}" placeholder="${escapedName}" value="${escapedValue}">`;
-    }
-    return `<textarea class="entry-field entry-field-textarea" name="${escapedName}" placeholder="${escapedName}" rows="3">${escapedValue}</textarea>`;
-  }
   function itemValue(o) {
     if (o.type === "label") return "";
     const val = record[o.fieldName];
     return val != null ? String(val) : "";
   }
-  function formatValueHtml(o, value) {
+  function formatValueHtml(o, value, attachmentEntryId) {
     if (o.type === "label") return "";
+    const attEntry = attachmentEntryId != null ? String(attachmentEntryId) : entryId;
     if (o.fieldType === "markdown" && value) {
       try {
         const withNewlines = String(value).replace(/\\n/g, "\n").replace(/\\r/g, "\r");
@@ -5919,6 +6203,20 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       const hrefRaw = /^(https?:\/\/|mailto:|tel:)/i.test(raw) ? raw : "https://" + raw;
       const escapedHref = escapeHtml(hrefRaw);
       return `<a href="${escapedHref}" target="_blank" rel="noopener noreferrer">${escapedText}</a>`;
+    }
+    if (o.fieldType === "image" && value) {
+      const raw = String(value).trim();
+      if (!raw) return "";
+      const src =
+        "/api/profiles/" +
+        encodeURIComponent(profileId) +
+        "/entries/" +
+        encodeURIComponent(attEntry) +
+        "/attachments/" +
+        encodeURIComponent(raw) +
+        "?max=" +
+        MAX_IMAGE_DISPLAY_EDGE;
+      return `<img class="entry-inline-image" src="${escapeHtml(src)}" alt="${escapeHtml(o.fieldName || "Image")}" loading="lazy">`;
     }
     return escapeHtml(value);
   }
@@ -5973,7 +6271,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
               .map((fn) => {
                 const rawVal = resp && resp[fn] != null ? String(resp[fn]) : "";
                 const fieldType = responseFieldTypeByName.get(fn) || "text";
-                const valueHtml = formatValueHtml({ type: "field", fieldType, fieldName: fn }, rawVal);
+                const valueHtml = formatValueHtml({ type: "field", fieldType, fieldName: fn }, rawVal, resp._id);
                 return `<tr><td class="label">${escapeHtml(fn)}</td><td class="value">${valueHtml}</td></tr>`;
               })
               .join("");
@@ -6014,6 +6312,8 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
               ? " value entry-value-markdown"
               : o.fieldType === "url"
               ? " value entry-value-url"
+              : o.fieldType === "image"
+              ? " value entry-value-image"
               : " value";
           return `
         <div class="entry-field-block"${styleAttr}>
@@ -6048,6 +6348,8 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
               ? " value entry-value-markdown"
               : o.fieldType === "url"
               ? " value entry-value-url"
+              : o.fieldType === "image"
+              ? " value entry-value-image"
               : " value";
           return `
         <div class="entry-grid-cell"${styleAttr}>
@@ -6078,6 +6380,8 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
               ? " value entry-value-markdown"
               : o.fieldType === "url"
               ? " value entry-value-url"
+              : o.fieldType === "image"
+              ? " value entry-value-image"
               : " value";
           return `
         <tr>
@@ -6142,6 +6446,8 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .entry-value-markdown h3 { font-size: 1rem; }
     .entry-value-markdown a { color: var(--entry-link, #58a6ff); }
     .entry-value-url a { color: var(--entry-link, #58a6ff); word-break: break-all; }
+    .entry-value-image { min-height: 0; }
+    .entry-inline-image { max-width: 100%; height: auto; max-height: 24rem; display: block; border-radius: 6px; }
     .entry-grid-cell.entry-label-only .label { white-space: nowrap; }
     .entry-label-row .label { white-space: nowrap; }
     .linked-query-block { margin-top: 1rem; background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 8px; padding: 0.75rem; }
@@ -6232,6 +6538,8 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   const returnQueryStr = returnParts.length > 0 ? "?" + returnParts.join("&") : "";
   const backUrl = "/profile/" + encodeURIComponent(profileId) + returnQueryStr;
   const viewUrl = "/profile/" + encodeURIComponent(profileId) + "/entry/" + encodeURIComponent(entryId) + returnQueryStr;
+  const discardOnCancel = record[ELENKO_DISCARD_ON_CANCEL] === true;
+  const cancelHref = discardOnCancel ? backUrl : viewUrl;
   const formCustomCss = formDoc && formDoc.customCss ? formDoc.customCss : "";
 
   const theme = formDoc && formDoc.theme ? formDoc.theme : DEFAULT_ENTRY_VIEW_THEME;
@@ -6265,9 +6573,56 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   function labelClass(o) {
     return o.type === "label" ? "label static-label" : "label field-label";
   }
+  function entryFieldIsImage(o) {
+    if (!o || o.type !== "field") return false;
+    if (normalizeEntryFieldType(o.fieldType) === "image") return true;
+    const item = getFieldLayoutItemForFieldName(formDoc, o.fieldName);
+    return !!(item && normalizeEntryFieldType(item.fieldType) === "image");
+  }
+  function editFieldLabelHtml(o) {
+    const lc = labelClass(o);
+    const text = escapeHtml(itemLabel(o));
+    if (!entryFieldIsImage(o)) {
+      if (layout === "table") return text;
+      return `<span class="${lc}">${text}</span>`;
+    }
+    if (layout === "table") {
+      return `<button type="button" class="entry-image-import-btn" title="Attach image file">${text}</button>`;
+    }
+    return `<button type="button" class="${lc} entry-image-import-btn" title="Attach image file">${text}</button>`;
+  }
   function editControlHtml(o, value) {
     const escapedName = escapeHtml(o.fieldName);
     const escapedValue = escapeHtml(value);
+    if (entryFieldIsImage(o)) {
+      const v = value != null ? String(value).trim() : "";
+      const previewUrl = v
+        ? "/api/profiles/" +
+          encodeURIComponent(profileId) +
+          "/entries/" +
+          encodeURIComponent(entryId) +
+          "/attachments/" +
+          encodeURIComponent(v) +
+          "?max=" +
+          MAX_IMAGE_DISPLAY_EDGE
+        : "";
+      const imgTag = v
+        ? `<img class="entry-image-preview" src="${escapeHtml(previewUrl)}" alt="" loading="lazy">`
+        : `<img class="entry-image-preview" alt="" loading="lazy" style="display:none">`;
+      const noneVis = v ? ' style="display:none"' : "";
+      return (
+        `<div class="entry-image-edit-wrap">` +
+        imgTag +
+        `<span class="entry-image-none"${noneVis}>No image</span>` +
+        `<input type="hidden" class="entry-field entry-image-filename" name="${escapedName}" value="${escapedValue}">` +
+        `<div class="entry-image-actions">` +
+        `<input type="file" class="entry-image-file" accept="image/*" aria-label="Upload image for ${escapedName}" tabindex="-1">` +
+        `<button type="button" class="btn btn-secondary entry-image-clear">Clear</button>` +
+        `</div>` +
+        `<span class="entry-image-upload-status" aria-live="polite"></span>` +
+        `</div>`
+      );
+    }
     if (o.fieldType === "url") {
       return `<input type="url" class="entry-field" name="${escapedName}" placeholder="${escapedName}" value="${escapedValue}">`;
     }
@@ -6296,7 +6651,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
           const value = record[o.fieldName] != null ? String(record[o.fieldName]) : "";
           return `
         <div class="entry-field-block"${styleAttr}>
-          <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
+          ${editFieldLabelHtml(o)}
           <div class="value">${editControlHtml(o, value)}</div>
         </div>`;
         })
@@ -6322,7 +6677,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
           const value = record[o.fieldName] != null ? String(record[o.fieldName]) : "";
           return `
         <div class="entry-grid-cell"${styleAttr}>
-          <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
+          ${editFieldLabelHtml(o)}
           <div class="value">${editControlHtml(o, value)}</div>
         </div>`;
         })
@@ -6344,7 +6699,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
         const valueCellWidth = o.width && typeof o.width === "string" && o.width.trim() ? ' style="width:' + escapeHtml(o.width.trim()) + '"' : "";
         return `
         <tr>
-          <td class="${lc}">${escapeHtml(itemLabel(o))}</td>
+          <td class="${lc}">${editFieldLabelHtml(o)}</td>
           <td class="value"${valueCellWidth}>${editControlHtml(o, value)}</td>
         </tr>`;
       })
@@ -6417,6 +6772,70 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     .entry-grid-cell.entry-label-only .label { white-space: nowrap; }
     .entry-label-row .label { white-space: nowrap; }
     td.value { min-width: 0; overflow: hidden; }
+    /* Image preview: avoid flex stretch + overflow clipping that distorts aspect ratio (view page does not use this flex wrapper). */
+    .entry-image-edit-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      min-width: 0;
+      width: 100%;
+      align-items: flex-start;
+      box-sizing: border-box;
+    }
+    .entry-image-preview {
+      max-width: 100%;
+      width: auto;
+      height: auto;
+      max-height: 24rem;
+      object-fit: contain;
+      object-position: left top;
+      border-radius: 6px;
+      display: block;
+      flex-shrink: 0;
+    }
+    .entry-view-stack .entry-field-block .value:has(.entry-image-edit-wrap),
+    .entry-grid-cell .value:has(.entry-image-edit-wrap),
+    td.value:has(.entry-image-edit-wrap) {
+      overflow: visible;
+    }
+    .entry-image-none { color: var(--entry-label, #8b949e); font-size: 0.875rem; }
+    .entry-image-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+    .entry-image-file {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    /* Scoped + !important so entry form customCss cannot strip button chrome */
+    form#entry-form button.entry-image-import-btn {
+      appearance: auto;
+      -webkit-appearance: button;
+      font: inherit;
+      display: inline-block;
+      max-width: 100%;
+      text-align: inherit;
+      padding: 0.35rem 0.5rem;
+      margin: 0;
+      background: var(--entry-field-bg-edit, #161b22) !important;
+      color: var(--entry-link, #58a6ff) !important;
+      border: 1px solid #30363d !important;
+      border-radius: 4px;
+      cursor: pointer;
+      box-sizing: border-box;
+    }
+    form#entry-form button.entry-image-import-btn:hover {
+      border-color: var(--entry-link, #58a6ff) !important;
+    }
+    form#entry-form .entry-view-stack button.entry-image-import-btn,
+    form#entry-form .entry-view-grid button.entry-image-import-btn {
+      width: 100%;
+    }
+    .entry-image-upload-status { font-size: 0.8rem; color: var(--entry-label, #8b949e); min-height: 1em; }
     input.entry-field, textarea.entry-field { width: 100%; min-width: 0; max-width: 100%; padding: 0.35rem 0.45rem; background: var(--entry-field-bg-edit, #161b22); color: var(--entry-text-edit, #e6edf3); border: 1px solid transparent; border-radius: 4px; font-size: 0.95rem; box-sizing: border-box; }
     input.entry-field:focus, textarea.entry-field:focus { outline: none; border-color: var(--entry-link, #58a6ff); }
     textarea.entry-field-textarea { resize: vertical; min-height: 1.75rem; line-height: 1.25; white-space: pre-wrap; overflow-wrap: break-word; }
@@ -6446,7 +6865,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     <div class="topbar-actions">
       <button type="submit" form="entry-form" class="btn">Save</button>
       <button type="button" class="btn btn-delete" id="delete-entry-btn">Delete</button>
-      <a href="${escapeHtml(viewUrl)}" class="btn btn-secondary">Cancel</a>
+      <a href="${escapeHtml(cancelHref)}" class="btn btn-secondary" id="edit-cancel-btn"${discardOnCancel ? " data-abandon-draft=\"1\"" : ""}>Cancel</a>
     </div>
   </div>
   <form id="entry-form">
@@ -6456,10 +6875,101 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   <script>
     const profileId = ${JSON.stringify(profileId)};
     const entryId = ${JSON.stringify(entryId)};
+    const abandonDraftQs = ${JSON.stringify(returnQueryStr)};
+    const maxImageEdge = ${MAX_IMAGE_DISPLAY_EDGE};
     const orderedFieldNames = ${orderedFieldNamesJson};
     const entryFormSelect = document.getElementById('entryFormSelect');
     const form = document.getElementById('entry-form');
     const msgEl = document.getElementById('msg');
+    function syncEntryImagePreview(wrap) {
+      if (!wrap) return;
+      const hidden = wrap.querySelector('.entry-image-filename');
+      const img = wrap.querySelector('.entry-image-preview');
+      const none = wrap.querySelector('.entry-image-none');
+      const v = hidden && hidden.value ? String(hidden.value).trim() : '';
+      if (v && img) {
+        img.src = '/api/profiles/' + encodeURIComponent(profileId) + '/entries/' + encodeURIComponent(entryId) + '/attachments/' + encodeURIComponent(v) + '?max=' + maxImageEdge + '&t=' + Date.now();
+        img.style.display = '';
+        if (none) none.style.display = 'none';
+      } else {
+        if (img) { img.removeAttribute('src'); img.style.display = 'none'; }
+        if (none) none.style.display = '';
+      }
+    }
+    form.querySelectorAll('.entry-image-edit-wrap').forEach((w) => syncEntryImagePreview(w));
+    form.querySelectorAll('.entry-image-import-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const row = btn.closest('tr, .entry-field-block, .entry-grid-cell');
+        const file = row && row.querySelector('.entry-image-file');
+        if (file) file.click();
+      });
+    });
+    form.querySelectorAll('.entry-image-file').forEach((fileEl) => {
+      fileEl.addEventListener('change', async () => {
+        const f = fileEl.files && fileEl.files[0];
+        const wrap = fileEl.closest('.entry-image-edit-wrap');
+        const hidden = wrap && wrap.querySelector('.entry-image-filename');
+        const status = wrap && wrap.querySelector('.entry-image-upload-status');
+        if (!wrap || !hidden || !hidden.name) { if (fileEl) fileEl.value = ''; return; }
+        if (!f) return;
+        if (status) { status.textContent = 'Uploading…'; status.style.color = ''; }
+        const fd = new FormData();
+        fd.append('file', f);
+        fd.append('fieldName', hidden.name);
+        try {
+          const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/entries/' + encodeURIComponent(entryId) + '/attachments', {
+            method: 'POST',
+            body: fd,
+            credentials: 'same-origin',
+          });
+          const ct = (r.headers.get('content-type') || '').toLowerCase();
+          let result = {};
+          if (ct.includes('application/json')) {
+            try {
+              result = await r.json();
+            } catch (parseErr) {
+              if (status) { status.textContent = 'Invalid JSON response (HTTP ' + r.status + ')'; status.style.color = '#f85149'; }
+              fileEl.value = '';
+              return;
+            }
+          } else {
+            const text = await r.text();
+            if (status) {
+              status.textContent = !r.ok
+                ? ('HTTP ' + r.status + ': ' + (text.slice(0, 120) || 'non-JSON response'))
+                : text.slice(0, 120);
+              status.style.color = '#f85149';
+            }
+            fileEl.value = '';
+            return;
+          }
+          if (!r.ok) {
+            if (status) { status.textContent = result.error || 'Upload failed'; status.style.color = '#f85149'; }
+            fileEl.value = '';
+            return;
+          }
+          if (result.filename) hidden.value = result.filename;
+          if (result.rev) document.getElementById('rev').value = result.rev;
+          syncEntryImagePreview(wrap);
+          if (status) { status.textContent = 'Uploaded.'; status.style.color = '#3fb950'; }
+        } catch (e) {
+          if (status) { status.textContent = e.message || 'Upload failed'; status.style.color = '#f85149'; }
+        }
+        fileEl.value = '';
+      });
+    });
+    form.querySelectorAll('.entry-image-clear').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const wrap = btn.closest('.entry-image-edit-wrap');
+        const hidden = wrap && wrap.querySelector('.entry-image-filename');
+        const fileEl = wrap && wrap.querySelector('.entry-image-file');
+        const status = wrap && wrap.querySelector('.entry-image-upload-status');
+        if (hidden) hidden.value = '';
+        if (fileEl) fileEl.value = '';
+        syncEntryImagePreview(wrap);
+        if (status) { status.textContent = ''; status.style.color = ''; }
+      });
+    });
     function autoResizeTextarea(el) {
       if (!el) return;
       el.style.height = 'auto';
@@ -6475,12 +6985,15 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       e.preventDefault();
       msgEl.textContent = '';
       msgEl.className = 'msg';
-      const inputs = form.querySelectorAll('.entry-field');
       const data = { _rev: document.getElementById('rev').value };
       if (entryFormSelect) {
         data.entryFormId = entryFormSelect.value;
       }
-      orderedFieldNames.forEach((fn, i) => { data[fn] = (inputs[i] && inputs[i].value) ? String(inputs[i].value).trim() : ''; });
+      orderedFieldNames.forEach((fn) => {
+        const el = form.elements.namedItem(fn);
+        const raw = el && typeof el.value === 'string' ? el.value : (el && el.value != null ? String(el.value) : '');
+        data[fn] = raw.trim();
+      });
       try {
         const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/entries/' + encodeURIComponent(entryId), {
           method: 'PUT',
@@ -6515,6 +7028,44 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
           deleteBtn.disabled = false;
         }
       };
+    }
+
+    const cancelBtn = document.getElementById('edit-cancel-btn');
+    if (cancelBtn && cancelBtn.getAttribute('data-abandon-draft') === '1') {
+      cancelBtn.addEventListener('click', async function (e) {
+        e.preventDefault();
+        try {
+          const u =
+            '/api/profiles/' +
+            encodeURIComponent(profileId) +
+            '/entries/' +
+            encodeURIComponent(entryId) +
+            '/abandon-draft' +
+            (abandonDraftQs || '');
+          const r = await fetch(u, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: '{}',
+          });
+          const result = await r.json().catch(function () {
+            return {};
+          });
+          if (r.ok && result.redirect) {
+            window.location.href = result.redirect;
+            return;
+          }
+          if (r.status === 400) {
+            window.location.href = ${JSON.stringify(backUrl)};
+            return;
+          }
+          msgEl.textContent = result.error || 'Could not discard draft';
+          msgEl.className = 'msg err';
+        } catch (err) {
+          msgEl.textContent = err.message || 'Request failed';
+          msgEl.className = 'msg err';
+        }
+      });
     }
   </script>
 </body>
@@ -9090,9 +9641,16 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
             const xVal = item.x != null ? String(item.x) : "";
             const yVal = item.y != null ? String(item.y) : "";
             const hVal = item.height != null ? String(item.height) : "";
-            const fieldTypeVal = item.fieldType === "markdown" ? "markdown" : item.fieldType === "url" ? "url" : "text";
+            const fieldTypeVal =
+              item.fieldType === "markdown"
+                ? "markdown"
+                : item.fieldType === "url"
+                ? "url"
+                : item.fieldType === "image"
+                ? "image"
+                : "text";
             const typeSelect = item.fieldName
-              ? `<select class="fl-type"><option value="text"${fieldTypeVal === "text" ? " selected" : ""}>Text</option><option value="markdown"${fieldTypeVal === "markdown" ? " selected" : ""}>Markdown</option><option value="url"${fieldTypeVal === "url" ? " selected" : ""}>URL</option></select>`
+              ? `<select class="fl-type"><option value="text"${fieldTypeVal === "text" ? " selected" : ""}>Text</option><option value="markdown"${fieldTypeVal === "markdown" ? " selected" : ""}>Markdown</option><option value="url"${fieldTypeVal === "url" ? " selected" : ""}>URL</option><option value="image"${fieldTypeVal === "image" ? " selected" : ""}>Image</option></select>`
               : "<span class=\"sub\">—</span>";
             return `
         <tr class="field-layout-row">
@@ -9220,7 +9778,7 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
     </table>
     <button type="button" class="btn btn-secondary" id="add-label" style="margin-top:0.5rem;">+ Add label</button>
     <label class="field-list-label" style="margin-top:1.5rem;">Field layout (optional: field name or label id, order, type, width, position)</label>
-    <p class="sub" style="margin-top:0;">Use a profile field name or a label id from above. Type: Text (plain), Markdown (rendered in view mode), or URL (clickable link text in view mode). Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning; Grid uses width as column size only.</p>
+    <p class="sub" style="margin-top:0;">Use a profile field name or a label id from above. Type: Text (plain), Markdown (rendered in view mode), URL (clickable link in view mode), or Image (single image per field; value is the attachment filename). On edit entry, the field name is the button that opens the file picker. Each upload is limited to ${Math.round(MAX_ENTRY_IMAGE_BYTES / 1024)} KiB before processing (an app policy to keep memory and attachments bounded; not a CouchDB hard limit). Administrators can raise or lower it with the environment variable <code>MAX_ENTRY_IMAGE_BYTES</code> (bytes). For Image fields, the layout Width column also sets the maximum long edge in pixels when scaling on upload (e.g. <code>400px</code>, <code>32ch</code>, or <code>50%</code> of the default screen cap). Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning; Grid uses width as column size only.</p>
     <table class="field-layout-table">
       <thead><tr><th>Field name or label id</th><th>Order</th><th>Type</th><th>Width</th><th>X (ch)</th><th>Y (em)</th><th>Height (em)</th><th></th></tr></thead>
       <tbody id="field-layout-tbody">${fieldLayoutRows}
@@ -9352,8 +9910,8 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
       const xv = (x != null && x !== '') ? String(x) : '';
       const yv = (y != null && y !== '') ? String(y) : '';
       const hv = (height != null && height !== '') ? String(height) : '';
-      const typeVal = (fieldType === 'markdown') ? 'markdown' : (fieldType === 'url' ? 'url' : 'text');
-      tr.innerHTML = '<td><input type="text" class="fl-field" placeholder="Field name or label id" value="' + (fieldName || '').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-order" min="0" value="' + (order != null ? order : n) + '"></td><td><select class="fl-type"><option value="text"' + (typeVal === 'text' ? ' selected' : '') + '>Text</option><option value="markdown"' + (typeVal === 'markdown' ? ' selected' : '') + '>Markdown</option><option value="url"' + (typeVal === 'url' ? ' selected' : '') + '>URL</option></select></td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' + (width || '100%').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-x" step="any" placeholder="—"></td><td><input type="number" class="fl-y" step="any" placeholder="—"></td><td><input type="number" class="fl-height" step="any" placeholder="—" min="0"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
+      const typeVal = (fieldType === 'markdown') ? 'markdown' : (fieldType === 'url' ? 'url' : (fieldType === 'image' ? 'image' : 'text'));
+      tr.innerHTML = '<td><input type="text" class="fl-field" placeholder="Field name or label id" value="' + (fieldName || '').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-order" min="0" value="' + (order != null ? order : n) + '"></td><td><select class="fl-type"><option value="text"' + (typeVal === 'text' ? ' selected' : '') + '>Text</option><option value="markdown"' + (typeVal === 'markdown' ? ' selected' : '') + '>Markdown</option><option value="url"' + (typeVal === 'url' ? ' selected' : '') + '>URL</option><option value="image"' + (typeVal === 'image' ? ' selected' : '') + '>Image</option></select></td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' + (width || '100%').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-x" step="any" placeholder="—"></td><td><input type="number" class="fl-y" step="any" placeholder="—"></td><td><input type="number" class="fl-height" step="any" placeholder="—" min="0"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
       tr.querySelector('.fl-x').value = xv;
       tr.querySelector('.fl-y').value = yv;
       tr.querySelector('.fl-height').value = hv;
@@ -9443,7 +10001,7 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
         if (labelIds.has(firstCol)) item.labelId = firstCol; else {
           item.fieldName = firstCol;
           const typeEl = tr.querySelector('.fl-type');
-          item.fieldType = (typeEl && (typeEl.value === 'markdown' || typeEl.value === 'url')) ? typeEl.value : 'text';
+          item.fieldType = (typeEl && (typeEl.value === 'markdown' || typeEl.value === 'url' || typeEl.value === 'image')) ? typeEl.value : 'text';
         }
         return item;
       }).filter(Boolean);
@@ -12070,6 +12628,24 @@ app.use((err, req, res, next) => {
     }
   }
   next(err);
+});
+
+/** Multer and other unhandled errors: return JSON for /api/* so fetch().json() never receives HTML. */
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (!wantsJsonApiResponse(req)) return next(err);
+  console.error("[api] error", req.method, req.path, err && err.message);
+  if (err && err.name === "MulterError") {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({
+        error: "File too large (max " + Math.round(MAX_ENTRY_IMAGE_BYTES / 1024) + " KiB).",
+      });
+    }
+    return res.status(400).json({ error: err.message || "Upload failed" });
+  }
+  const code = err && (err.status || err.statusCode);
+  const status = typeof code === "number" && code >= 400 && code < 600 ? code : 500;
+  return res.status(status).json({ error: (err && err.message) || "Server error" });
 });
 
 async function main() {
