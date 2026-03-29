@@ -7,15 +7,24 @@ services:
       COUCHDB_PASSWORD: admin
     ports:
       - "5984:5984"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mkdir -p /opt/couchdb/etc/local.d
+        printf '%s\n' '[couchdb]' 'single_node = true' > /opt/couchdb/etc/local.d/10-single-node.ini
+        exec tini -- /docker-entrypoint.sh /opt/couchdb/bin/couchdb
     volumes:
       - couchdb_data:/opt/couchdb/data
-      - ./couchdb/local.d/10-single-node.ini:/opt/couchdb/etc/local.d/10-single-node.ini
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5984/"]
+      # Default / amd64: use curl. Raspberry armv7 uses docker-compose.armv7.yml, which overrides
+      # this with an Erlang probe (that image has `erl` on PATH but no curl).
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5984/ >/dev/null"]
       interval: 10s
-      timeout: 5s
+      timeout: 15s
       retries: 5
-      start_period: 30s
+      start_period: 60s
 
   app:
     build: .

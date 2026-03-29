@@ -1,0 +1,24 @@
+# Host CouchDB (e.g. Raspberry Pi 32-bit / ARMv7): the official couchdb image
+# does not publish linux/arm/v7. Install CouchDB on the OS, expose port 5984
+# to the Docker bridge (bind_address), then run:
+#   docker compose -f docker-compose.host-couchdb.yml -f docker-compose.caddy.yml up -d --build
+#
+# Do not combine with docker-compose.yml in the same command (that would still
+# pull the bundled CouchDB image). Adjust COUCHDB_URL credentials if needed.
+
+services:
+  app:
+    build: .
+    container_name: elenko-app
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      NODE_ENV: development
+      COUCHDB_URL: http://admin:admin@host.docker.internal:5984
+      COUCHDB_DB: elenko
+      PORT: 3000
+      FLOW_LOG_FILE: /app/logs/elenko.log
+    volumes:
+      - ./logs:/app/logs

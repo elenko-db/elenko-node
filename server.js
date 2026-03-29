@@ -65,6 +65,10 @@ const ENTRIES_PAGE_SIZE_MIN = 5;
 const ENTRIES_PAGE_SIZE_MAX = 200;
 const SORT_KEY_SPECIAL = ["createdAt", "updatedAt"];
 const SORT_KEY_FIELDS_MAX = 3;
+const PRIMARY_KEY_FIELDS_MAX = 3;
+const DB_CODE_LEN = 8;
+const PRIMARY_KEY_SEGMENT_LEN_MIN = 1;
+const PRIMARY_KEY_SEGMENT_LEN_MAX = 512;
 const DEFAULT_VALUE_SOURCES = ["", "createdAt", "updatedAt", "currentUser"];
 
 /** PNG names must match files in public/ (see README-favicon.txt). Order: sized PNGs first, then .ico fallback — works reliably in Firefox + Chrome. */
@@ -507,6 +511,7 @@ function buildProfileDocFromSource(baseProfile, name) {
   const raw = JSON.parse(JSON.stringify(baseProfile));
   delete raw._id;
   delete raw._rev;
+  delete raw.dbCode8;
   raw.type = "elenko_profile";
   raw.name = name;
   raw.createdAt = new Date().toISOString();
@@ -639,6 +644,171 @@ function buildSortKey(record, sortKeyFields) {
   return out;
 }
 
+﻿function normalizeProfileNameForDbCode(name) {
+  return String(name || "")
+    .replace(/\s+/g, "")
+    .toUpperCase();
+}
+
+async function loadUsedDbCodes(dbInstance, excludeProfileId) {
+  const used = new Set();
+  try {
+    const result = await dbInstance.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "dbCode8"],
+      limit: 10000,
+    });
+    for (const d of result.docs || []) {
+      if (!d || d._id === excludeProfileId) continue;
+      if (typeof d.dbCode8 === "string" && d.dbCode8.length === DB_CODE_LEN) used.add(d.dbCode8);
+    }
+  } catch (_) {}
+  return used;
+}
+
+async function assignDbCode8(dbInstance, profileName, excludeProfileId) {
+  const normalized = normalizeProfileNameForDbCode(profileName);
+  if (!normalized) {
+    const used = await loadUsedDbCodes(dbInstance, excludeProfileId);
+    for (let n = 1; n <= 99; n++) {
+      const candidate = "ELENKO" + String(n).padStart(2, "0");
+      if (!used.has(candidate)) return candidate;
+    }
+    throw new Error("Could not allocate unique database code (dbCode8).");
+  }
+  const used = await loadUsedDbCodes(dbInstance, excludeProfileId);
+  const firstEight =
+    normalized.length >= DB_CODE_LEN
+      ? normalized.slice(0, DB_CODE_LEN)
+      : normalized + " ".repeat(DB_CODE_LEN - normalized.length);
+  if (!used.has(firstEight)) return firstEight;
+  const prefix6 = (normalized + "      ").slice(0, 6);
+  for (let n = 1; n <= 99; n++) {
+    const candidate = prefix6 + String(n).padStart(2, "0");
+    if (candidate.length === DB_CODE_LEN && !used.has(candidate)) return candidate;
+  }
+  throw new Error(
+    "Could not allocate unique database code (dbCode8); too many profiles with similar names."
+  );
+}
+
+function normalizePrimaryKeyFieldsFromBody(fieldNames, rawFields, rawLengths) {
+  const names = Array.isArray(fieldNames) ? fieldNames : [];
+  const fields = Array.isArray(rawFields)
+    ? rawFields
+        .filter((f) => typeof f === "string" && f.trim())
+        .slice(0, PRIMARY_KEY_FIELDS_MAX)
+        .map((f) => f.trim())
+        .filter((f) => names.includes(f))
+    : [];
+  const lengths = Array.isArray(rawLengths) ? rawLengths : [];
+  const primaryKeySegmentLengths = [];
+  for (let i = 0; i < fields.length; i++) {
+    const n = Number(lengths[i]);
+    if (Number.isFinite(n)) {
+      const len = Math.floor(n);
+      primaryKeySegmentLengths.push(
+        len >= PRIMARY_KEY_SEGMENT_LEN_MIN && len <= PRIMARY_KEY_SEGMENT_LEN_MAX
+          ? len
+          : Math.min(Math.max(len, PRIMARY_KEY_SEGMENT_LEN_MIN), PRIMARY_KEY_SEGMENT_LEN_MAX)
+      );
+    } else {
+      primaryKeySegmentLengths.push(32);
+    }
+  }
+  return { primaryKeyFields: fields, primaryKeySegmentLengths };
+}
+
+function computePrimaryKeyForRecord(record, profileDoc) {
+  const fields = Array.isArray(profileDoc.primaryKeyFields) ? profileDoc.primaryKeyFields : [];
+  if (fields.length === 0) return { value: null };
+  const lengths = Array.isArray(profileDoc.primaryKeySegmentLengths) ? profileDoc.primaryKeySegmentLengths : [];
+  const dbCode8 =
+    typeof profileDoc.dbCode8 === "string" && profileDoc.dbCode8.length === DB_CODE_LEN
+      ? profileDoc.dbCode8.slice(0, DB_CODE_LEN)
+      : null;
+  if (!dbCode8) {
+    return { error: "Profile is missing dbCode8; save the profile again to assign a database code." };
+  }
+  let str = dbCode8;
+  for (let i = 0; i < fields.length; i++) {
+    const fn = fields[i];
+    const maxLen =
+      lengths[i] != null && Number.isFinite(Number(lengths[i]))
+        ? Math.floor(Number(lengths[i]))
+        : 32;
+    const segLen =
+      maxLen >= PRIMARY_KEY_SEGMENT_LEN_MIN && maxLen <= PRIMARY_KEY_SEGMENT_LEN_MAX
+        ? maxLen
+        : 32;
+    const raw = record[fn] != null ? String(record[fn]) : "";
+    if (raw.length > segLen) {
+      return { error: "Field \"" + fn + "\" exceeds primary key segment length (" + segLen + ")." };
+    }
+    str += raw + " ".repeat(segLen - raw.length);
+  }
+  return { value: str };
+}
+
+function applyPrimaryKeyToRecord(record, profileDoc) {
+  const result = computePrimaryKeyForRecord(record, profileDoc);
+  if (result.error) throw new Error(result.error);
+  if (result.value == null) {
+    delete record.primaryKey;
+  } else {
+    record.primaryKey = result.value;
+  }
+}
+
+async function findPrimaryKeyConflict(dbInstance, primaryKey, excludeDocId) {
+  if (primaryKey == null || primaryKey === "") return null;
+  try {
+    const res = await dbInstance.find({
+      selector: { type: "elenko_record", primaryKey },
+      limit: 5,
+    });
+    for (const d of res.docs || []) {
+      if (d._id !== excludeDocId) return d;
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function ensureProfileDbCode8(dbInstance, profileDoc) {
+  if (
+    typeof profileDoc.dbCode8 === "string" &&
+    profileDoc.dbCode8.length === DB_CODE_LEN &&
+    profileDoc.name
+  ) {
+    return profileDoc;
+  }
+  const name = typeof profileDoc.name === "string" ? profileDoc.name.trim() : "";
+  if (!name) return profileDoc;
+  profileDoc.dbCode8 = await assignDbCode8(dbInstance, name, profileDoc._id);
+  const ins = await dbInstance.insert(profileDoc);
+  profileDoc._rev = ins.rev;
+  return profileDoc;
+}
+
+async function recomputePrimaryKeysForProfileRecords(dbInstance, profileDoc) {
+  const profileId = profileDoc._id;
+  const result = await dbInstance.find({
+    selector: { type: "elenko_record", profileId },
+    limit: 50000,
+  });
+  const docs = result.docs || [];
+  const now = new Date().toISOString();
+  for (const rec of docs) {
+    try {
+      applyPrimaryKeyToRecord(rec, profileDoc);
+    } catch (_) {
+      delete rec.primaryKey;
+    }
+    rec.updatedAt = now;
+    await dbInstance.insert(rec);
+  }
+}
+
 function getProfileEntryFormIds(profileDoc) {
   if (!profileDoc || typeof profileDoc !== "object") return [];
   const fromArray = Array.isArray(profileDoc.entryFormIds) ? profileDoc.entryFormIds : [];
@@ -709,11 +879,23 @@ async function createEntryInProfileFromContext(dbInstance, context, targetProfil
   const now = new Date().toISOString();
   record.createdAt = now;
   record.updatedAt = now;
+  targetProfile = await ensureProfileDbCode8(dbInstance, targetProfile);
   const sortKeyFields = Array.isArray(targetProfile.sortKeyFields) ? targetProfile.sortKeyFields : [];
   record.sortKey = buildSortKey(record, sortKeyFields);
   const profileFormIds = getProfileEntryFormIds(targetProfile);
   if (profileFormIds.length > 0) {
     record.entryFormId = profileFormIds[0];
+  }
+  try {
+    applyPrimaryKeyToRecord(record, targetProfile);
+  } catch (e) {
+    throw new Error(e && e.message ? e.message : "Primary key could not be computed.");
+  }
+  if (record.primaryKey) {
+    const conflict = await findPrimaryKeyConflict(dbInstance, record.primaryKey, "");
+    if (conflict) {
+      throw new Error("Duplicate primary key: another entry already uses this key.");
+    }
   }
   const result = await dbInstance.insert(record);
   clearProfileListCache(resolvedProfileId);
@@ -2014,6 +2196,16 @@ async function initCouch(options) {
   } catch (e) {
     // Index may already exist
   }
+  // Index for business primaryKey (global uniqueness / lookup)
+  try {
+    await db.createIndex({
+      index: { fields: ["type", "primaryKey"] },
+      name: "records-by-primarykey",
+    });
+  } catch (e) {
+    // Index may already exist
+  }
+
 
   // View to count entries per profile (for pagination "Page x of N")
   try {
@@ -2086,12 +2278,14 @@ async function initCouch(options) {
       limit: 1,
     });
     if (!existing.docs || existing.docs.length === 0) {
-      await db.insert({
+      const ins = await db.insert({
         type: "elenko_profile",
         name: "Example profile",
         description: "Sample Elenko database profile (CouchDB documents). Edit or delete in CouchDB.",
         createdAt: new Date().toISOString(),
       });
+      let seedProf = await db.get(ins.id);
+      seedProf = await ensureProfileDbCode8(db, seedProf);
       console.log("Seeded one sample Elenko profile.");
     }
   } catch (e) {
@@ -2621,11 +2815,16 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
       return res.status(400).json({ error: `Too many data rows (max ${MAX_CSV_IMPORT_ROWS}).` });
     }
 
+    profileDoc = await ensureProfileDbCode8(db, profileDoc);
     const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
     const profileFormIds = getProfileEntryFormIds(profileDoc);
     const defaultFormId = profileFormIds.length > 0 ? profileFormIds[0] : "";
+    const importPolicy =
+      typeof profileDoc.primaryKeyImportPolicy === "string" ? profileDoc.primaryKeyImportPolicy.trim() : "";
     const now = new Date().toISOString();
     let imported = 0;
+    let overwritten = 0;
+    let skippedDuplicates = 0;
     const errors = [];
 
     for (let r = 0; r < dataRows.length; r++) {
@@ -2651,6 +2850,51 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
         record.createdAt = now;
         record.updatedAt = now;
         record.sortKey = buildSortKey(record, sortKeyFields);
+        try {
+          applyPrimaryKeyToRecord(record, profileDoc);
+        } catch (ePk) {
+          const msg = ePk && ePk.message ? String(ePk.message) : String(ePk);
+          if (errors.length < 50) {
+            errors.push({ row: lineNo, message: msg });
+          }
+          continue;
+        }
+        if (record.primaryKey) {
+          const conflict = await findPrimaryKeyConflict(db, record.primaryKey, "");
+          if (conflict) {
+            if (importPolicy === "overwrite") {
+              if (conflict.profileId !== profileId) {
+                if (errors.length < 50) {
+                  errors.push({
+                    row: lineNo,
+                    message: "Primary key matches an entry in another profile; not overwritten.",
+                  });
+                }
+                continue;
+              }
+              const updated = { ...conflict };
+              for (const fn of fieldNames) {
+                updated[fn] = record[fn];
+              }
+              updated.updatedAt = now;
+              updated.sortKey = buildSortKey(updated, sortKeyFields);
+              try {
+                applyPrimaryKeyToRecord(updated, profileDoc);
+              } catch (e2) {
+                const msg = e2 && e2.message ? String(e2.message) : String(e2);
+                if (errors.length < 50) {
+                  errors.push({ row: lineNo, message: msg });
+                }
+                continue;
+              }
+              await db.insert(updated);
+              overwritten++;
+            } else {
+              skippedDuplicates++;
+            }
+            continue;
+          }
+        }
         await db.insert(record);
         imported++;
       } catch (e) {
@@ -2665,12 +2909,16 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
     console.log("[import-data] success", {
       profileId,
       imported,
+      overwritten,
+      skippedDuplicates,
       failed: errors.length,
       rowErrorSample: errors.slice(0, 3),
     });
     res.json({
       ok: true,
       imported,
+      overwritten,
+      skippedDuplicates,
       failed: errors.length,
       rowErrors: errors.slice(0, 50),
     });
@@ -4007,6 +4255,7 @@ app.post("/api/profiles", requireAdmin, async (req, res) => {
       entriesPageSize: pageSize,
       createdAt: new Date().toISOString(),
     };
+    doc.dbCode8 = await assignDbCode8(db, doc.name, null);
     const result = await db.insert(doc);
     sendFlowMessage("profile.created", { id: result.id, name: doc.name });
     res.status(201).json({ ok: true, id: result.id, rev: result.rev });
@@ -4202,6 +4451,9 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       guardianFlowId,
       sortKeyFields: rawSortKeyFields,
       sortDirection,
+      primaryKeyFields: rawPrimaryKeyFields,
+      primaryKeySegmentLengths: rawPrimaryKeySegmentLengths,
+      primaryKeyImportPolicy: rawPrimaryKeyImportPolicy,
     } = req.body || {};
     if (!_rev || !name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name and _rev are required" });
@@ -4210,6 +4462,10 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
     if (doc.type !== "elenko_profile") {
       return res.status(404).json({ error: "Profile not found" });
     }
+    const prevDbCode8 = doc.dbCode8;
+    const prevPk = JSON.stringify(doc.primaryKeyFields || []);
+    const prevPkLen = JSON.stringify(doc.primaryKeySegmentLengths || []);
+    const previousName = doc.name;
     const fields = Array.isArray(fieldNames)
       ? fieldNames.filter((f) => typeof f === "string" && f.trim()).map((f) => f.trim())
       : (Array.isArray(doc.fieldNames) ? doc.fieldNames : []);
@@ -4296,7 +4552,29 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       : [];
     doc.sortKeyFields = sortKeyFields;
     doc.sortDirection = sortDirection === "desc" ? "desc" : "asc";
+    const pkNorm = normalizePrimaryKeyFieldsFromBody(fields, rawPrimaryKeyFields, rawPrimaryKeySegmentLengths);
+    doc.primaryKeyFields = pkNorm.primaryKeyFields;
+    doc.primaryKeySegmentLengths = pkNorm.primaryKeySegmentLengths;
+    const pip =
+      typeof rawPrimaryKeyImportPolicy === "string" && rawPrimaryKeyImportPolicy.trim()
+        ? rawPrimaryKeyImportPolicy.trim()
+        : "";
+    doc.primaryKeyImportPolicy = pip;
+    const nameNormChanged =
+      normalizeProfileNameForDbCode(previousName) !== normalizeProfileNameForDbCode(doc.name);
+    if (!doc.dbCode8 || nameNormChanged) {
+      doc.dbCode8 = await assignDbCode8(db, doc.name, doc._id);
+    }
     const result = await db.insert(doc);
+    // primaryKeyImportPolicy affects CSV import only; it does not change how keys are computed on entries.
+    const pkChanged =
+      prevDbCode8 !== doc.dbCode8 ||
+      prevPk !== JSON.stringify(doc.primaryKeyFields || []) ||
+      prevPkLen !== JSON.stringify(doc.primaryKeySegmentLengths || []);
+    if (pkChanged) {
+      const latest = await db.get(id);
+      await recomputePrimaryKeysForProfileRecords(db, latest);
+    }
     clearProfileListCache(id);
     res.json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
@@ -4377,6 +4655,11 @@ app.post("/api/profiles/:id/rebuild-sort-keys", requireAdmin, async (req, res) =
       if (!rec.createdAt) rec.createdAt = now;
       rec.updatedAt = now;
       rec.sortKey = buildSortKey(rec, sortKeyFields);
+      try {
+        applyPrimaryKeyToRecord(rec, doc);
+      } catch (_) {
+        delete rec.primaryKey;
+      }
       await db.insert(rec);
       updated++;
     }
@@ -4416,6 +4699,11 @@ app.post("/api/profiles/:id/reassign-entries", requireAdmin, async (req, res) =>
       if (!rec.createdAt) rec.createdAt = now;
       rec.updatedAt = now;
       rec.sortKey = buildSortKey(rec, sortKeyFields);
+      try {
+        applyPrimaryKeyToRecord(rec, doc);
+      } catch (_) {
+        delete rec.primaryKey;
+      }
       await db.insert(rec);
       reassigned++;
     }
@@ -4475,14 +4763,27 @@ app.post("/api/profiles/:id/entries", requireEditor, async (req, res) => {
         record[fieldNames[i]] = resolveDefaultValue(src, req);
       }
     }
-    const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
+    let profileDoc = doc;
+    profileDoc = await ensureProfileDbCode8(db, profileDoc);
+    const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
     record.sortKey = buildSortKey(record, sortKeyFields);
     const requestedEntryFormId = typeof values.entryFormId === "string" ? values.entryFormId.trim() : "";
-    const profileFormIds = getProfileEntryFormIds(doc);
+    const profileFormIds = getProfileEntryFormIds(profileDoc);
     if (requestedEntryFormId && profileFormIds.includes(requestedEntryFormId)) {
       record.entryFormId = requestedEntryFormId;
     } else if (profileFormIds.length > 0) {
       record.entryFormId = profileFormIds[0];
+    }
+    try {
+      applyPrimaryKeyToRecord(record, profileDoc);
+    } catch (e) {
+      return res.status(400).json({ error: e.message || "Primary key could not be computed." });
+    }
+    if (record.primaryKey) {
+      const conflict = await findPrimaryKeyConflict(db, record.primaryKey, "");
+      if (conflict) {
+        return res.status(409).json({ error: "Duplicate primary key: another entry already uses this composite key." });
+      }
     }
     const result = await db.insert(record);
     clearProfileListCache(profileId);
@@ -4820,8 +5121,21 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     const now = new Date().toISOString();
     record.updatedAt = now;
     if (!record.createdAt) record.createdAt = now;
-    const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
+    let profileDoc = doc;
+    profileDoc = await ensureProfileDbCode8(db, profileDoc);
+    const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
     record.sortKey = buildSortKey(record, sortKeyFields);
+    try {
+      applyPrimaryKeyToRecord(record, profileDoc);
+    } catch (e) {
+      return res.status(400).json({ error: e.message || "Primary key could not be computed." });
+    }
+    if (record.primaryKey) {
+      const conflict = await findPrimaryKeyConflict(db, record.primaryKey, entryId);
+      if (conflict) {
+        return res.status(409).json({ error: "Duplicate primary key: another entry already uses this composite key." });
+      }
+    }
     const result = await db.insert(record);
     clearProfileListCache(profileId);
     res.json({ ok: true, id: result.id, rev: result.rev });
@@ -4940,7 +5254,9 @@ app.post("/api/profiles/:id/copy", requireAdmin, async (req, res) => {
     const newName = makeUniqueProfileCopyName(baseDoc.name, existing);
     const newDoc = buildProfileDocFromSource(baseDoc, newName);
     const result = await db.insert(newDoc);
-    res.status(201).json({ ok: true, id: result.id, rev: result.rev, name: newName });
+    let created = await db.get(result.id);
+    created = await ensureProfileDbCode8(db, created);
+    res.status(201).json({ ok: true, id: result.id, rev: created._rev, name: newName });
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
     console.error("Error copying profile:", err);
@@ -9569,6 +9885,31 @@ function renderEditProfilePage(doc, forms = [], appUi) {
           : []);
   const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
   const sortDirectionValue = doc.sortDirection === "desc" ? "desc" : "asc";
+  const primaryKeyFieldsCfg = Array.isArray(doc.primaryKeyFields) ? doc.primaryKeyFields : [];
+  const primaryKeySegmentLengthsCfg = Array.isArray(doc.primaryKeySegmentLengths) ? doc.primaryKeySegmentLengths : [];
+  const dbCode8Display =
+    typeof doc.dbCode8 === "string" && doc.dbCode8.length === DB_CODE_LEN
+      ? doc.dbCode8
+      : "(not assigned yet; save profile)";
+  const primaryKeyImportPolicyVal =
+    typeof doc.primaryKeyImportPolicy === "string" && doc.primaryKeyImportPolicy.trim()
+      ? doc.primaryKeyImportPolicy.trim()
+      : "";
+  const pkLen0 = String(
+    primaryKeySegmentLengthsCfg[0] != null && Number.isFinite(Number(primaryKeySegmentLengthsCfg[0]))
+      ? Math.floor(Number(primaryKeySegmentLengthsCfg[0]))
+      : 32
+  );
+  const pkLen1 = String(
+    primaryKeySegmentLengthsCfg[1] != null && Number.isFinite(Number(primaryKeySegmentLengthsCfg[1]))
+      ? Math.floor(Number(primaryKeySegmentLengthsCfg[1]))
+      : 32
+  );
+  const pkLen2 = String(
+    primaryKeySegmentLengthsCfg[2] != null && Number.isFinite(Number(primaryKeySegmentLengthsCfg[2]))
+      ? Math.floor(Number(primaryKeySegmentLengthsCfg[2]))
+      : 32
+  );
   const mobileSingleEntryFormId =
     typeof doc.mobileSingleEntryFormId === "string" && doc.mobileSingleEntryFormId.trim()
       ? doc.mobileSingleEntryFormId.trim()
@@ -9607,6 +9948,15 @@ function renderEditProfilePage(doc, forms = [], appUi) {
   const listFieldSelect1 = listFieldSelect("listField1", "listField1", listFields[0]);
   const listFieldSelect2 = listFieldSelect("listField2", "listField2", listFields[1]);
   const listFieldSelect3 = listFieldSelect("listField3", "listField3", listFields[2]);
+  function primaryKeyFieldSelect(id, selected) {
+    const fieldOpts = fieldNames
+      .map((fn) => `<option value="${escapeHtml(fn)}"${selected === fn ? " selected" : ""}>${escapeHtml(fn)}</option>`)
+      .join("");
+    return `<select id="${id}" name="${id}"><option value="">— None —</option>${fieldOpts}</select>`;
+  }
+  const pkSelect1 = primaryKeyFieldSelect("primaryKeyField1", primaryKeyFieldsCfg[0]);
+  const pkSelect2 = primaryKeyFieldSelect("primaryKeyField2", primaryKeyFieldsCfg[1]);
+  const pkSelect3 = primaryKeyFieldSelect("primaryKeyField3", primaryKeyFieldsCfg[2]);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9789,6 +10139,23 @@ function renderEditProfilePage(doc, forms = [], appUi) {
       <div><label for="listField2" style="margin:0;font-size:0.875rem;">2</label><br>${listFieldSelect2}</div>
       <div><label for="listField3" style="margin:0;font-size:0.875rem;">3</label><br>${listFieldSelect3}</div>
     </div>
+    <p class="sub" style="margin-top:1.5rem;margin-bottom:0.25rem;"><strong>Database code (8 characters):</strong> <code id="dbCode8-display">${escapeHtml(dbCode8Display)}</code></p>
+    <p class="sub" style="margin-top:0;">First segment of the business primary key. Saving assigns a code; renaming the profile may allocate a new code and recompute keys on entries.</p>
+    <label style="margin-top:1rem;">Primary key segments (up to 3 profile fields)</label>
+    <p class="sub" style="margin-top:0.25rem;">Optional. Full key = database code plus space-padded field values (per segment length). Uniqueness is enforced when saving entries.</p>
+    <p class="sub" style="margin-top:0.35rem;">When you save, if the database code or primary key settings changed, the server writes the computed <code>primaryKey</code> on <strong>every existing entry</strong> in this profile. Enabling or changing the primary key can make that save noticeably slower when there are many entries.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:flex-end;margin-top:0.5rem;">
+      <div><label for="primaryKeyField1" style="margin:0;font-size:0.875rem;">1</label><br>${pkSelect1}<label for="primaryKeyLen1" style="display:block;margin-top:0.35rem;font-size:0.8rem;">Length</label><input type="number" id="primaryKeyLen1" min="${PRIMARY_KEY_SEGMENT_LEN_MIN}" max="${PRIMARY_KEY_SEGMENT_LEN_MAX}" step="1" value="${escapeHtml(pkLen0)}" style="max-width:6rem;padding:0.35rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);"></div>
+      <div><label for="primaryKeyField2" style="margin:0;font-size:0.875rem;">2</label><br>${pkSelect2}<label for="primaryKeyLen2" style="display:block;margin-top:0.35rem;font-size:0.8rem;">Length</label><input type="number" id="primaryKeyLen2" min="${PRIMARY_KEY_SEGMENT_LEN_MIN}" max="${PRIMARY_KEY_SEGMENT_LEN_MAX}" step="1" value="${escapeHtml(pkLen1)}" style="max-width:6rem;padding:0.35rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);"></div>
+      <div><label for="primaryKeyField3" style="margin:0;font-size:0.875rem;">3</label><br>${pkSelect3}<label for="primaryKeyLen3" style="display:block;margin-top:0.35rem;font-size:0.8rem;">Length</label><input type="number" id="primaryKeyLen3" min="${PRIMARY_KEY_SEGMENT_LEN_MIN}" max="${PRIMARY_KEY_SEGMENT_LEN_MAX}" step="1" value="${escapeHtml(pkLen2)}" style="max-width:6rem;padding:0.35rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);"></div>
+    </div>
+    <label for="primaryKeyImportPolicy" style="margin-top:0.75rem;">Bulk import policy (reserved)</label>
+    <p class="sub" style="margin-top:0.25rem;">For future CSV / import behaviour when a primary key collides. Not used yet.</p>
+    <select id="primaryKeyImportPolicy" name="primaryKeyImportPolicy">
+      <option value=""${!primaryKeyImportPolicyVal ? " selected" : ""}>— Default —</option>
+      <option value="skip"${primaryKeyImportPolicyVal === "skip" ? " selected" : ""}>Skip duplicate</option>
+      <option value="overwrite"${primaryKeyImportPolicyVal === "overwrite" ? " selected" : ""}>Overwrite existing</option>
+    </select>
     <label style="margin-top:1.5rem;">Sort key fields (up to 3)</label>
     <p class="sub" style="margin-top:0.25rem;">Entry list is sorted by these fields in order (CouchDB index). Use profile fields or Creation/Update date.</p>
     <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:center;margin-top:0.5rem;">
@@ -9801,7 +10168,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
       <option value="asc"${sortDirectionValue === "asc" ? " selected" : ""}>Ascending</option>
       <option value="desc"${sortDirectionValue === "desc" ? " selected" : ""}>Descending</option>
     </select>
-    <p style="margin-top:0.5rem;"><button type="button" class="btn btn-secondary" id="rebuild-sort-keys-btn">Rebuild sort keys for existing entries</button> <span id="rebuild-msg"></span></p>
+    <p style="margin-top:0.5rem;"><button type="button" class="btn btn-secondary" id="rebuild-sort-keys-btn">Rebuild sort keys and primary keys for existing entries</button> <span id="rebuild-msg"></span></p>
     <label style="margin-top:1.5rem;">Recover entries</label>
     <p class="sub" style="margin-top:0.25rem;">If entries show in All documents but not on this profile, they may have a different profile ID (e.g. after a restore). In <a href="/documents">All documents</a>, open an entry row and copy the ID in parentheses from the Summary column. Paste it below and click Reassign to attach those entries to this profile.</p>
     <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;flex-wrap:wrap;">
@@ -10102,7 +10469,38 @@ function renderEditProfilePage(doc, forms = [], appUi) {
             splitView: {
               enabled: !!(document.getElementById('splitViewEnabled') && document.getElementById('splitViewEnabled').checked),
               orientation: (document.getElementById('splitViewOrientation') && document.getElementById('splitViewOrientation').value === 'horizontal') ? 'horizontal' : 'vertical'
-            }
+            },
+            primaryKeyFields: (function() {
+              var ids = ['primaryKeyField1','primaryKeyField2','primaryKeyField3'];
+              var lens = ['primaryKeyLen1','primaryKeyLen2','primaryKeyLen3'];
+              var fields = [];
+              var lengths = [];
+              for (var i = 0; i < ids.length; i++) {
+                var sel = document.getElementById(ids[i]);
+                var v = sel && sel.value ? sel.value.trim() : '';
+                if (!v) continue;
+                fields.push(v);
+                var lenEl = document.getElementById(lens[i]);
+                var n = lenEl ? parseInt(lenEl.value, 10) : 32;
+                lengths.push(Number.isFinite(n) ? n : 32);
+              }
+              return fields;
+            })(),
+            primaryKeySegmentLengths: (function() {
+              var ids = ['primaryKeyField1','primaryKeyField2','primaryKeyField3'];
+              var lens = ['primaryKeyLen1','primaryKeyLen2','primaryKeyLen3'];
+              var lengths = [];
+              for (var i = 0; i < ids.length; i++) {
+                var sel = document.getElementById(ids[i]);
+                var v = sel && sel.value ? sel.value.trim() : '';
+                if (!v) continue;
+                var lenEl = document.getElementById(lens[i]);
+                var n = lenEl ? parseInt(lenEl.value, 10) : 32;
+                lengths.push(Number.isFinite(n) ? n : 32);
+              }
+              return lengths;
+            })(),
+            primaryKeyImportPolicy: (document.getElementById('primaryKeyImportPolicy') && document.getElementById('primaryKeyImportPolicy').value) || ''
           })
         });
         const data = await r.json();
@@ -10957,7 +11355,13 @@ function renderDataExportImportPage(profiles, appUi) {
                   msgEl.style.display = 'block';
                   if (o.ok && o.data && o.data.ok) {
                     msgEl.style.color = '#7ee787';
-                    var lines = ['Imported ' + (o.data.imported || 0) + ' row(s).'];
+                    var lines = ['Imported ' + (o.data.imported || 0) + ' new row(s).'];
+                    if (o.data.overwritten) {
+                      lines.push('Updated ' + o.data.overwritten + ' existing row(s) (same primary key).');
+                    }
+                    if (o.data.skippedDuplicates) {
+                      lines.push('Skipped ' + o.data.skippedDuplicates + ' row(s) (duplicate primary key).');
+                    }
                     if (o.data.failed) lines.push('Failed: ' + o.data.failed + ' row(s).');
                     if (o.data.rowErrors && o.data.rowErrors.length) {
                       lines.push('');

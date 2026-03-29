@@ -1,0 +1,43 @@
+# 32-bit ARM (linux/arm/v7), e.g. Raspberry Pi 3: the official couchdb image has no
+# armv7 manifest. This override swaps in a community multi-arch image (based on the
+# official Dockerfiles; not maintained by the ASF). Pin the tag you trust.
+#
+# karasevm/couchdb does not ship /opt/couchdb/etc/local.ini (unlike the Debian
+# package in the official image). Single-node settings are written here too so we
+# do not bind-mount .ini files from the host (Docker creates a directory if the
+# source path is missing → CouchDB eisdir crash).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.armv7.yml -f docker-compose.caddy.yml up -d --build
+#
+# Healthcheck: only this override file replaces the base `curl` probe with an Erlang
+# TCP check — karasevm/couchdb has no curl. Do not merge these healthchecks into the
+# default docker-compose.yml (official couchdb has curl but not `erl` on PATH).
+#
+# If an old mistaken directory exists on the host, you can remove it:
+#   rm -rf couchdb/local.ini couchdb/local.d/10-single-node.ini
+
+services:
+  couchdb:
+    image: karasevm/couchdb:3.3.3
+    # This image has `erl` on PATH but no curl; keep the TCP probe (base compose uses curl).
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "erl +B -noinput -noshell -eval 'case gen_tcp:connect({127,0,0,1},5984,[{active,false}],5000) of {ok,S} -> gen_tcp:close(S), erlang:halt(0); _ -> erlang:halt(1) end.'",
+        ]
+      interval: 10s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mkdir -p /opt/couchdb/etc/local.d
+        if [ ! -f /opt/couchdb/etc/local.ini ]; then
+          printf ';\n' > /opt/couchdb/etc/local.ini
+        fi
+        printf '%s\n' '[couchdb]' 'single_node = true' > /opt/couchdb/etc/local.d/10-single-node.ini
+        exec tini -- /usr/local/bin/docker-entrypoint.sh /opt/couchdb/bin/couchdb
