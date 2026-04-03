@@ -130,6 +130,41 @@ function normalizeFieldDisplay(fieldNames, raw) {
   return result;
 }
 
+/** Stored parallel to fieldNames: "text" (default) or "file" (attachment + filename on entries). */
+function normalizeFieldKinds(fieldNames, raw) {
+  const len = Array.isArray(fieldNames) ? fieldNames.length : 0;
+  const arr = Array.isArray(raw) ? raw : [];
+  const result = [];
+  for (let i = 0; i < len; i++) {
+    const v = arr[i];
+    const s = typeof v === "string" ? v.trim().toLowerCase() : "";
+    result.push(s === "file" ? "file" : "text");
+  }
+  return result;
+}
+
+function isProfileFileField(profileDoc, fieldName) {
+  if (!profileDoc || !fieldName || typeof fieldName !== "string") return false;
+  const fn = fieldName.trim();
+  if (!fn) return false;
+  const names = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const idx = names.indexOf(fn);
+  if (idx < 0) return false;
+  const kinds = normalizeFieldKinds(names, profileDoc.fieldKinds);
+  return kinds[idx] === "file";
+}
+
+/** Profile file fields plus Single Entry form Image fields — both use CouchDB attachments on the entry. */
+function getAttachmentBackedFieldNames(profileDoc, formDoc) {
+  const set = getImageFieldNamesFromFormLayout(formDoc);
+  const names = Array.isArray(profileDoc && profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const kinds = normalizeFieldKinds(names, profileDoc && profileDoc.fieldKinds);
+  for (let i = 0; i < names.length; i++) {
+    if (kinds[i] === "file") set.add(names[i]);
+  }
+  return set;
+}
+
 /**
  * Desktop Elenko list table: Hide hides column on wide view only; %-columns are scaled so their widths sum to 100%.
  * Auto columns share remaining width (table-layout: fixed).
@@ -355,6 +390,17 @@ function entryImageMimeToExt(mime) {
   return "";
 }
 
+/** Non-image MIME types allowed for profile-level "file" fields (extend as needed). */
+const ALLOWED_PROFILE_FILE_ATTACHMENT_MIMES = new Set(["application/pdf", "text/plain"]);
+
+function attachmentMimeToExt(mime) {
+  const img = entryImageMimeToExt(mime);
+  if (img) return img;
+  if (mime === "application/pdf") return ".pdf";
+  if (mime === "text/plain") return ".txt";
+  return "";
+}
+
 function getImageFieldNamesFromFormLayout(formDoc) {
   const out = new Set();
   if (!formDoc || !Array.isArray(formDoc.fieldLayout)) return out;
@@ -411,6 +457,76 @@ function uploadMaxEdgeFromFieldLayoutWidth(widthRaw) {
   m = /^(\d+(?:\.\d+)?)$/.exec(w);
   if (m) return clamp(m[1]);
   return clamp(fallback);
+}
+
+/** Max files per request for Export/Import data → picture import (admin). */
+const MAX_PICTURE_IMPORT_FILES = 500;
+
+/**
+ * Resize / name an image like POST .../attachments (image path). Used for bulk picture import.
+ * @returns {{ ok: true, outBuffer: Buffer, outMime: string, safeName: string } | { ok: false, error: string }}
+ */
+async function prepareImageAttachmentPayloadForProfileField(profileDoc, formDoc, fieldName, buffer, originalname, mime) {
+  const fn = fieldName && typeof fieldName === "string" ? fieldName.trim() : "";
+  if (!fn) return { ok: false, error: "Missing field name." };
+  const formImageField = getImageFieldNamesFromFormLayout(formDoc).has(fn);
+  const profileFileField = isProfileFileField(profileDoc, fn);
+  if (!formImageField && !profileFileField) {
+    return { ok: false, error: "Field is not a profile file field or a Single Entry image field." };
+  }
+  let normMime =
+    mime && String(mime).split(";")[0] ? String(mime).split(";")[0].trim().toLowerCase() : "";
+  if (!ALLOWED_ENTRY_IMAGE_MIMES.has(normMime)) {
+    return { ok: false, error: "Only JPEG, PNG, WebP, and GIF are supported for picture import." };
+  }
+  const treatAsImage = formImageField || (profileFileField && ALLOWED_ENTRY_IMAGE_MIMES.has(normMime));
+  if (!treatAsImage) {
+    return { ok: false, error: "Picture import applies to images only for this field." };
+  }
+  let meta;
+  try {
+    meta = await sharp(buffer, { failOn: "truncated" }).metadata();
+    if (!meta.width || !meta.height) {
+      return { ok: false, error: "Invalid image file." };
+    }
+  } catch (_) {
+    return { ok: false, error: "Invalid image file." };
+  }
+  const layoutItem = getFieldLayoutItemForFieldName(formDoc, fn);
+  const layoutWidthStr =
+    layoutItem && typeof layoutItem.width === "string" && layoutItem.width.trim()
+      ? layoutItem.width.trim()
+      : "";
+  const uploadMaxEdge = uploadMaxEdgeFromFieldLayoutWidth(layoutWidthStr || undefined);
+  const exceedsLayout = meta.width > uploadMaxEdge || meta.height > uploadMaxEdge;
+  let outBuffer = buffer;
+  let outMime = normMime;
+  if (exceedsLayout) {
+    try {
+      outBuffer = await sharp(buffer)
+        .rotate()
+        .resize(uploadMaxEdge, uploadMaxEdge, { fit: "inside", withoutEnlargement: true })
+        .jpeg({ quality: 85, mozjpeg: true })
+        .toBuffer();
+      outMime = "image/jpeg";
+    } catch (e) {
+      console.warn("Picture import resize failed:", e && e.message);
+      return { ok: false, error: "Could not process image." };
+    }
+  }
+  let baseName = normalizeEntryAttachmentFilename(originalname);
+  if (!baseName) baseName = "image";
+  if (exceedsLayout) {
+    const stem = baseName.includes(".") ? baseName.slice(0, baseName.lastIndexOf(".")) : baseName;
+    baseName = stem + ".jpg";
+  } else {
+    const extFromOrig = entryImageMimeToExt(normMime);
+    if (extFromOrig && !baseName.toLowerCase().endsWith(extFromOrig)) {
+      baseName += extFromOrig;
+    }
+  }
+  const safeName = baseName;
+  return { ok: true, outBuffer, outMime, safeName };
 }
 
 function normalizeProfileTheme(theme) {
@@ -522,6 +638,10 @@ function normalizeEntryFormDoc(body) {
     flowConfigs = [{ enabled: flowButtonEnabled, target: flowTarget, label: flowButtonLabel || "Send to Flow", param: flowButtonParam }];
   }
 
+  const entryNavForwardBackEnabled = !!(
+    body.entryNavForwardBackEnabled === true || body.entryNavForwardBackEnabled === "true"
+  );
+
   return {
     name,
     labels,
@@ -544,6 +664,7 @@ function normalizeEntryFormDoc(body) {
     flowButtonParam: flowConfigs.length > 0 ? flowConfigs[0].param : "",
     flowConfigs,
     linkedQuery,
+    entryNavForwardBackEnabled,
   };
 }
 
@@ -586,6 +707,9 @@ function buildEntryFormDocFromSource(baseForm, name) {
             },
           ],
     linkedQuery: baseForm && baseForm.linkedQuery && typeof baseForm.linkedQuery === "object" ? baseForm.linkedQuery : null,
+    entryNavForwardBackEnabled: !!(
+      baseForm.entryNavForwardBackEnabled === true || baseForm.entryNavForwardBackEnabled === "true"
+    ),
   };
 }
 
@@ -803,7 +927,56 @@ function buildSortKey(record, sortKeyFields) {
   return out;
 }
 
-﻿function normalizeProfileNameForDbCode(name) {
+/** Same ordering as the profile entry list (sortKey tiers + profile sort direction; tie-break _id). */
+function compareRecordsByProfileSort(a, b, sortDirection) {
+  const sa = Array.isArray(a.sortKey) ? a.sortKey : [];
+  const sb = Array.isArray(b.sortKey) ? b.sortKey : [];
+  for (let i = 0; i < Math.max(sa.length, sb.length); i++) {
+    const va = sa[i] != null ? String(sa[i]) : "";
+    const vb = sb[i] != null ? String(sb[i]) : "";
+    const c = va.localeCompare(vb, undefined, { sensitivity: "base" });
+    if (c !== 0) return sortDirection === "desc" ? -c : c;
+  }
+  const ida = a && a._id != null ? String(a._id) : "";
+  const idb = b && b._id != null ? String(b._id) : "";
+  return ida.localeCompare(idb, undefined, { sensitivity: "base" });
+}
+
+const ADJACENT_ENTRY_FETCH_LIMIT = 50000;
+
+/**
+ * Previous / next entry _id in the same profile, using the profile’s sort key and direction (same as list view).
+ */
+async function getAdjacentEntryIdsForProfile(dbInstance, profileDoc, currentEntryId) {
+  const profileId = profileDoc && profileDoc._id;
+  const cur = currentEntryId != null ? String(currentEntryId) : "";
+  if (!profileId || !cur) return { prevId: null, nextId: null };
+  const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
+  const sortDirection = profileDoc.sortDirection === "desc" ? "desc" : "asc";
+  try {
+    const sortResult = await dbInstance.find({
+      selector: { type: "elenko_record", profileId },
+      fields: ["_id", "sortKey"],
+      limit: ADJACENT_ENTRY_FETCH_LIMIT,
+    });
+    let docs = sortResult.docs || [];
+    if (sortKeyFields.length > 0) {
+      docs.sort((a, b) => compareRecordsByProfileSort(a, b, sortDirection));
+    } else {
+      docs.sort((a, b) => String(a._id).localeCompare(String(b._id)));
+    }
+    const idx = docs.findIndex((d) => d && d._id === cur);
+    if (idx < 0) return { prevId: null, nextId: null };
+    return {
+      prevId: idx > 0 && docs[idx - 1] ? docs[idx - 1]._id : null,
+      nextId: idx < docs.length - 1 && docs[idx + 1] ? docs[idx + 1]._id : null,
+    };
+  } catch (_) {
+    return { prevId: null, nextId: null };
+  }
+}
+
+function normalizeProfileNameForDbCode(name) {
   return String(name || "")
     .replace(/\s+/g, "")
     .toUpperCase();
@@ -982,6 +1155,49 @@ function getProfileEntryFormIds(profileDoc) {
 function getProfileDefaultEntryFormId(profileDoc) {
   const ids = getProfileEntryFormIds(profileDoc);
   return ids.length > 0 ? ids[0] : "";
+}
+
+async function loadDefaultEntryFormForProfile(dbInstance, profileDoc) {
+  const formId = getProfileDefaultEntryFormId(profileDoc);
+  if (!formId) return null;
+  try {
+    const loaded = await dbInstance.get(formId);
+    if (loaded && loaded.type === "elenko_entry_form") return loaded;
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * New entry row for bulk picture import: defaults from profile, then attachment filename on the target field.
+ */
+async function buildInitialRecordForPictureImport(dbInstance, profileDoc, req, fieldName, safeName) {
+  const profileId = profileDoc._id;
+  const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const record = { type: "elenko_record", profileId };
+  for (const f of fieldNames) {
+    record[f] = "";
+  }
+  const now = new Date().toISOString();
+  record.createdAt = now;
+  record.updatedAt = now;
+  const sources = Array.isArray(profileDoc.fieldDefaultSources) ? profileDoc.fieldDefaultSources : [];
+  for (let i = 0; i < fieldNames.length; i++) {
+    const src = sources[i];
+    if (src === "createdAt" || src === "updatedAt" || src === "currentUser") {
+      record[fieldNames[i]] = resolveDefaultValue(src, req);
+    }
+  }
+  record[fieldName] = safeName;
+  let pdoc = profileDoc;
+  pdoc = await ensureProfileDbCode8(dbInstance, pdoc);
+  const sortKeyFields = Array.isArray(pdoc.sortKeyFields) ? pdoc.sortKeyFields : [];
+  const profileFormIds = getProfileEntryFormIds(pdoc);
+  if (profileFormIds.length > 0) {
+    record.entryFormId = profileFormIds[0];
+  }
+  record.sortKey = buildSortKey(record, sortKeyFields);
+  applyPrimaryKeyToRecord(record, pdoc);
+  return { record, pdoc };
 }
 
 function isMobileRequest(req) {
@@ -1613,6 +1829,32 @@ async function buildConfigExport(scope, profileId) {
         const formDoc = await db.get(fid);
         if (formDoc && formDoc.type === "elenko_entry_form") formDocs.push(formDoc);
       } catch (_) {}
+    }
+
+    // Linked queries referenced from Single Entry forms.
+    if (configDb) {
+      const linkedQueryRefs = new Set();
+      for (const form of formDocs) {
+        const linkedQuery =
+          form && form.linkedQuery && typeof form.linkedQuery === "object" ? form.linkedQuery : null;
+        const linkedQueryId =
+          linkedQuery && typeof linkedQuery.id === "string" ? linkedQuery.id.trim() : "";
+        if (linkedQueryId) linkedQueryRefs.add(linkedQueryId);
+      }
+      if (linkedQueryRefs.size > 0) {
+        const resolvedQueryIds = await resolveConfigDocIds(
+          configDb,
+          [...linkedQueryRefs],
+          "elenko_query",
+          "name"
+        );
+        for (const qid of resolvedQueryIds) {
+          try {
+            const queryDoc = await configDb.get(qid);
+            if (queryDoc && queryDoc.type === "elenko_query") addConfig(queryDoc);
+          } catch (_) {}
+        }
+      }
     }
 
     // Flows referenced from entry forms (flow buttons)
@@ -3096,6 +3338,179 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/api/profiles/:id/data-import-meta", requireAdmin, async (req, res) => {
+  const profileId = req.params.id;
+  try {
+    let profileDoc;
+    try {
+      profileDoc = await db.get(profileId);
+    } catch (e) {
+      if (e.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
+      throw e;
+    }
+    if (!profileDoc || profileDoc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+    const kinds = normalizeFieldKinds(fieldNames, profileDoc.fieldKinds);
+    const fileFields = fieldNames.filter((_, i) => kinds[i] === "file");
+    const pkSet = new Set(
+      (Array.isArray(profileDoc.primaryKeyFields) ? profileDoc.primaryKeyFields : [])
+        .filter((f) => typeof f === "string" && f.trim())
+        .map((f) => f.trim())
+    );
+    const fileFieldsInPrimaryKey = fileFields.filter((f) => pkSet.has(f));
+    const primaryKeyImportPolicy =
+      typeof profileDoc.primaryKeyImportPolicy === "string" ? profileDoc.primaryKeyImportPolicy.trim() : "";
+    res.json({ fileFields, fileFieldsInPrimaryKey, primaryKeyImportPolicy });
+  } catch (err) {
+    console.error("[data-import-meta] error", { profileId, message: err && err.message });
+    res.status(500).json({ error: err.message || "Failed to load import metadata" });
+  }
+});
+
+app.post(
+  "/api/profiles/:id/import-pictures",
+  requireAdmin,
+  entryImageUpload.array("files", MAX_PICTURE_IMPORT_FILES),
+  async (req, res) => {
+    const profileId = req.params.id;
+    try {
+      const fieldName =
+        req.body && typeof req.body.fieldName === "string" ? req.body.fieldName.trim() : "";
+      const files = Array.isArray(req.files) ? req.files : [];
+      if (!fieldName) {
+        return res.status(400).json({ error: "fieldName is required (profile file field)." });
+      }
+      if (files.length === 0) {
+        return res.status(400).json({ error: "Select at least one image file." });
+      }
+      let profileDoc;
+      try {
+        profileDoc = await db.get(profileId);
+      } catch (e) {
+        if (e.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
+        throw e;
+      }
+      if (!profileDoc || profileDoc.type !== "elenko_profile") {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+      if (!isProfileFileField(profileDoc, fieldName)) {
+        return res.status(400).json({ error: "Choose a profile field whose type is File." });
+      }
+      profileDoc = await ensureProfileDbCode8(db, profileDoc);
+      const formDoc = await loadDefaultEntryFormForProfile(db, profileDoc);
+      const importPolicy =
+        typeof profileDoc.primaryKeyImportPolicy === "string" ? profileDoc.primaryKeyImportPolicy.trim() : "";
+      const now = new Date().toISOString();
+      let imported = 0;
+      let overwritten = 0;
+      let skippedDuplicates = 0;
+      const rowErrors = [];
+
+      for (let fi = 0; fi < files.length; fi++) {
+        const file = files[fi];
+        const rowLabel = file.originalname != null ? String(file.originalname) : "file " + (fi + 1);
+        try {
+          const prep = await prepareImageAttachmentPayloadForProfileField(
+            profileDoc,
+            formDoc,
+            fieldName,
+            file.buffer,
+            file.originalname,
+            file.mimetype
+          );
+          if (!prep.ok) {
+            if (rowErrors.length < 50) rowErrors.push({ row: rowLabel, message: prep.error });
+            continue;
+          }
+          const { outBuffer, outMime, safeName } = prep;
+          let record;
+          let pdoc;
+          try {
+            const built = await buildInitialRecordForPictureImport(db, profileDoc, req, fieldName, safeName);
+            record = built.record;
+            pdoc = built.pdoc;
+            profileDoc = pdoc;
+          } catch (ePk) {
+            if (rowErrors.length < 50) {
+              rowErrors.push({ row: rowLabel, message: ePk.message || String(ePk) });
+            }
+            continue;
+          }
+          if (record.primaryKey) {
+            const conflict = await findPrimaryKeyConflict(db, record.primaryKey, "");
+            if (conflict) {
+              if (importPolicy === "overwrite" && conflict.profileId === profileId) {
+                try {
+                  let updated = await db.get(conflict._id);
+                  const oldFile = updated[fieldName] != null ? String(updated[fieldName]).trim() : "";
+                  if (oldFile && updated._attachments && updated._attachments[oldFile]) {
+                    await db.attachment.destroy(conflict._id, oldFile, { rev: updated._rev });
+                    updated = await db.get(conflict._id);
+                  }
+                  await db.attachment.insert(conflict._id, safeName, outBuffer, outMime, {
+                    rev: updated._rev,
+                  });
+                  updated = await db.get(conflict._id);
+                  updated[fieldName] = safeName;
+                  updated.updatedAt = now;
+                  updated.sortKey = buildSortKey(
+                    updated,
+                    Array.isArray(pdoc.sortKeyFields) ? pdoc.sortKeyFields : []
+                  );
+                  applyPrimaryKeyToRecord(updated, pdoc);
+                  if (updated.primaryKey) {
+                    const other = await findPrimaryKeyConflict(db, updated.primaryKey, updated._id);
+                    if (other) {
+                      if (rowErrors.length < 50) {
+                        rowErrors.push({
+                          row: rowLabel,
+                          message: "After overwrite, primary key would duplicate another entry.",
+                        });
+                      }
+                      continue;
+                    }
+                  }
+                  await db.insert(updated);
+                  overwritten++;
+                } catch (eOw) {
+                  if (rowErrors.length < 50) {
+                    rowErrors.push({ row: rowLabel, message: eOw.message || String(eOw) });
+                  }
+                }
+              } else {
+                skippedDuplicates++;
+              }
+              continue;
+            }
+          }
+          const ins = await db.insert(record);
+          await db.attachment.insert(ins.id, safeName, outBuffer, outMime, { rev: ins.rev });
+          imported++;
+        } catch (e) {
+          if (rowErrors.length < 50) {
+            rowErrors.push({ row: rowLabel, message: e.message || String(e) });
+          }
+        }
+      }
+
+      clearProfileListCache(profileId);
+      res.json({
+        ok: true,
+        imported,
+        overwritten,
+        skippedDuplicates,
+        failed: rowErrors.length,
+        rowErrors,
+      });
+    } catch (err) {
+      console.error("[import-pictures] error", { profileId, message: err && err.message });
+      res.status(500).json({ error: err.message || "Import failed" });
+    }
+  }
+);
+
 app.post("/api/config-export", requireAdmin, async (req, res) => {
   try {
     const body = req.body || {};
@@ -3453,6 +3868,7 @@ app.post("/api/entry-forms", requireAdmin, async (req, res) => {
       flowButtonParam: normalized.flowButtonParam,
       flowConfigs: normalized.flowConfigs,
       linkedQuery: normalized.linkedQuery,
+      entryNavForwardBackEnabled: normalized.entryNavForwardBackEnabled,
     };
     const result = await db.insert(doc);
     res.status(201).json({ ok: true, id: result.id, rev: result.rev });
@@ -3522,6 +3938,7 @@ app.put("/api/entry-forms/:id", requireAdmin, async (req, res) => {
     doc.flowButtonParam = normalized.flowButtonParam;
     doc.flowConfigs = normalized.flowConfigs;
     doc.linkedQuery = normalized.linkedQuery;
+    doc.entryNavForwardBackEnabled = normalized.entryNavForwardBackEnabled;
     const result = await db.insert(doc);
     res.json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
@@ -4382,7 +4799,7 @@ app.get("/profile/create", requireAdmin, async (req, res) => {
 
 app.post("/api/profiles", requireAdmin, async (req, res) => {
   try {
-    const { name, description, fieldNames, fieldDefaultSources, fieldDisplay, customCss, listFields: rawListFields, entriesPageSize } = req.body || {};
+    const { name, description, fieldNames, fieldDefaultSources, fieldDisplay, fieldKinds, customCss, listFields: rawListFields, entriesPageSize } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name is required" });
     }
@@ -4410,6 +4827,7 @@ app.post("/api/profiles", requireAdmin, async (req, res) => {
       fieldNames: fields,
       fieldDefaultSources: normalizeFieldDefaultSources(fields, fieldDefaultSources),
       fieldDisplay: normalizeFieldDisplay(fields, fieldDisplay),
+      fieldKinds: normalizeFieldKinds(fields, fieldKinds),
       listFields,
       entriesPageSize: pageSize,
       createdAt: new Date().toISOString(),
@@ -4634,6 +5052,7 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
     doc.fieldNames = fields;
     doc.fieldDefaultSources = normalizeFieldDefaultSources(fields, req.body.fieldDefaultSources);
     doc.fieldDisplay = normalizeFieldDisplay(fields, req.body.fieldDisplay);
+    doc.fieldKinds = normalizeFieldKinds(fields, req.body.fieldKinds);
     let updatedEntryFormIds;
     if (Array.isArray(entryFormIds)) {
       updatedEntryFormIds = entryFormIds
@@ -4725,7 +5144,7 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       doc.dbCode8 = await assignDbCode8(db, doc.name, doc._id);
     }
     const result = await db.insert(doc);
-    // primaryKeyImportPolicy affects CSV import only; it does not change how keys are computed on entries.
+    // primaryKeyImportPolicy affects CSV and picture bulk import; it does not change how keys are computed on entries.
     const pkChanged =
       prevDbCode8 !== doc.dbCode8 ||
       prevPk !== JSON.stringify(doc.primaryKeyFields || []) ||
@@ -5240,8 +5659,8 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
         if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
       } catch (_) {}
     }
-    const imageFields = getImageFieldNamesFromFormLayout(formDoc);
-    for (const fn of imageFields) {
+    const attachmentBackedFields = getAttachmentBackedFieldNames(doc, formDoc);
+    for (const fn of attachmentBackedFields) {
       const newVal = values[fn] != null ? String(values[fn]).trim() : "";
       const oldVal = record[fn] != null ? String(record[fn]).trim() : "";
       if (newVal === "" && oldVal && record._attachments && record._attachments[oldVal]) {
@@ -5367,10 +5786,12 @@ app.post(
           if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
         } catch (_) {}
       }
-      const imageFields = getImageFieldNamesFromFormLayout(formDoc);
-      if (!imageFields.has(fieldName)) {
+      const formImageField = getImageFieldNamesFromFormLayout(formDoc).has(fieldName);
+      const profileFileField = isProfileFileField(profileDoc, fieldName);
+      if (!formImageField && !profileFileField) {
         return res.status(400).json({
-          error: "Field is not configured as Image type on this entry form.",
+          error:
+            "Field is not configured for file attachments. Set the profile field to “file”, or use an Image field on the Single Entry form.",
         });
       }
 
@@ -5378,57 +5799,77 @@ app.post(
         req.file.mimetype && String(req.file.mimetype).split(";")[0]
           ? String(req.file.mimetype).split(";")[0].trim().toLowerCase()
           : "";
-      if (!ALLOWED_ENTRY_IMAGE_MIMES.has(mime)) {
-        return res.status(400).json({ error: "Unsupported image type. Use JPEG, PNG, WebP, or GIF." });
-      }
 
-      let meta;
-      try {
-        meta = await sharp(req.file.buffer, { failOn: "truncated" }).metadata();
-        if (!meta.width || !meta.height) {
+      const treatAsImage = formImageField || (profileFileField && ALLOWED_ENTRY_IMAGE_MIMES.has(mime));
+      let outBuffer;
+      let outMime;
+      let baseName;
+      let storedExt;
+
+      if (treatAsImage) {
+        if (!ALLOWED_ENTRY_IMAGE_MIMES.has(mime)) {
+          return res.status(400).json({ error: "Unsupported image type. Use JPEG, PNG, WebP, or GIF." });
+        }
+        let meta;
+        try {
+          meta = await sharp(req.file.buffer, { failOn: "truncated" }).metadata();
+          if (!meta.width || !meta.height) {
+            return res.status(400).json({ error: "Invalid image file." });
+          }
+        } catch (_) {
           return res.status(400).json({ error: "Invalid image file." });
         }
-      } catch (_) {
-        return res.status(400).json({ error: "Invalid image file." });
-      }
-
-      const layoutItem = getFieldLayoutItemForFieldName(formDoc, fieldName);
-      const layoutWidthStr =
-        layoutItem && typeof layoutItem.width === "string" && layoutItem.width.trim()
-          ? layoutItem.width.trim()
-          : "";
-      const uploadMaxEdge = uploadMaxEdgeFromFieldLayoutWidth(layoutWidthStr || undefined);
-      const exceedsLayout = meta.width > uploadMaxEdge || meta.height > uploadMaxEdge;
-
-      let outBuffer = req.file.buffer;
-      let outMime = mime;
-      if (exceedsLayout) {
-        try {
-          outBuffer = await sharp(req.file.buffer)
-            .rotate()
-            .resize(uploadMaxEdge, uploadMaxEdge, { fit: "inside", withoutEnlargement: true })
-            .jpeg({ quality: 85, mozjpeg: true })
-            .toBuffer();
-          outMime = "image/jpeg";
-        } catch (e) {
-          console.warn("Entry image upload resize failed:", e && e.message);
-          return res.status(400).json({ error: "Could not process image." });
+        const layoutItem = getFieldLayoutItemForFieldName(formDoc, fieldName);
+        const layoutWidthStr =
+          layoutItem && typeof layoutItem.width === "string" && layoutItem.width.trim()
+            ? layoutItem.width.trim()
+            : "";
+        const uploadMaxEdge = uploadMaxEdgeFromFieldLayoutWidth(layoutWidthStr || undefined);
+        const exceedsLayout = meta.width > uploadMaxEdge || meta.height > uploadMaxEdge;
+        outBuffer = req.file.buffer;
+        outMime = mime;
+        if (exceedsLayout) {
+          try {
+            outBuffer = await sharp(req.file.buffer)
+              .rotate()
+              .resize(uploadMaxEdge, uploadMaxEdge, { fit: "inside", withoutEnlargement: true })
+              .jpeg({ quality: 85, mozjpeg: true })
+              .toBuffer();
+            outMime = "image/jpeg";
+          } catch (e) {
+            console.warn("Entry image upload resize failed:", e && e.message);
+            return res.status(400).json({ error: "Could not process image." });
+          }
         }
-      }
-
-      let baseName = normalizeEntryAttachmentFilename(req.file.originalname);
-      if (!baseName) baseName = "image";
-      if (exceedsLayout) {
-        const stem = baseName.includes(".") ? baseName.slice(0, baseName.lastIndexOf(".")) : baseName;
-        baseName = stem + ".jpg";
+        baseName = normalizeEntryAttachmentFilename(req.file.originalname);
+        if (!baseName) baseName = "image";
+        if (exceedsLayout) {
+          const stem = baseName.includes(".") ? baseName.slice(0, baseName.lastIndexOf(".")) : baseName;
+          baseName = stem + ".jpg";
+        } else {
+          const extFromOrig = entryImageMimeToExt(mime);
+          if (extFromOrig && !baseName.toLowerCase().endsWith(extFromOrig)) {
+            baseName += extFromOrig;
+          }
+        }
+        storedExt = entryImageMimeToExt(outMime);
       } else {
-        const extFromOrig = entryImageMimeToExt(mime);
-        if (extFromOrig && !baseName.toLowerCase().endsWith(extFromOrig)) {
-          baseName += extFromOrig;
+        if (!ALLOWED_PROFILE_FILE_ATTACHMENT_MIMES.has(mime)) {
+          return res.status(400).json({
+            error:
+              "Unsupported file type for a profile “file” field. Use an image (JPEG, PNG, WebP, GIF), PDF, or plain text.",
+          });
         }
+        outBuffer = req.file.buffer;
+        outMime = mime;
+        baseName = normalizeEntryAttachmentFilename(req.file.originalname);
+        if (!baseName) baseName = "file";
+        const extFromMime = attachmentMimeToExt(mime);
+        if (extFromMime && !baseName.toLowerCase().endsWith(extFromMime)) {
+          baseName += extFromMime;
+        }
+        storedExt = attachmentMimeToExt(outMime);
       }
-
-      const storedExt = entryImageMimeToExt(outMime);
       let safeName = baseName;
       let counter = 1;
       while (record._attachments && record._attachments[safeName]) {
@@ -5517,7 +5958,8 @@ app.get("/api/profiles/:profileId/entries/:entryId/attachments/:filename", requi
 
     const buf = await db.attachment.get(entryId, filename);
 
-    if (maxEdge > 0) {
+    const isImageCt = String(contentType).toLowerCase().startsWith("image/");
+    if (maxEdge > 0 && isImageCt) {
       try {
         const out = await sharp(buf)
           .rotate()
@@ -5917,9 +6359,49 @@ function blockOrCellStyle(o) {
   return parts.join(";");
 }
 
+/**
+ * Stack outer `.entry-field-block`: x/y/width, and min-height only when height is not moved to the inner `.value`
+ * (image / file-preview fields — see fieldLayoutImageValueHeightConstraints).
+ */
+function blockOrCellStyleStackOuter(o, innerImageHeightHandled) {
+  const parts = [];
+  if (o.x != null) parts.push("left:" + o.x + "ch");
+  if (o.y != null) parts.push("top:" + o.y + "em");
+  const useOuterMinHeight = o.height != null && !innerImageHeightHandled;
+  if (useOuterMinHeight) parts.push("min-height:" + o.height + "em");
+  if (o.width && typeof o.width === "string" && o.width.trim()) parts.push("width:" + o.width.trim());
+  if (parts.length === 0) return "";
+  const needsAbsolute = o.x != null || o.y != null || useOuterMinHeight;
+  if (needsAbsolute) parts.unshift("position:absolute");
+  return parts.join(";");
+}
+
 function gridCellStyle(o) {
   if (o.width && typeof o.width === "string" && o.width.trim()) return "width:" + o.width.trim();
   return "";
+}
+
+/**
+ * Grid / stack: Height (em) on an image-capable field constrains the `.value` box so the image scales inside it.
+ * View: Single Entry image fields only. Edit: image fields + profile "file" fields (preview).
+ */
+function fieldLayoutImageValueHeightConstraints(o, profileDoc, forEdit) {
+  if (!o || o.type !== "field") return { className: "", style: "" };
+  let match = o.fieldType === "image";
+  if (forEdit && profileDoc && isProfileFileField(profileDoc, o.fieldName)) match = true;
+  if (!match) return { className: "", style: "" };
+  if (o.height == null || o.height === "") return { className: "", style: "" };
+  const n = Number(o.height);
+  if (!Number.isFinite(n) || n <= 0) return { className: "", style: "" };
+  return {
+    className: " entry-grid-image-height",
+    style:
+      "box-sizing:border-box;height:" +
+      n +
+      "em;max-height:" +
+      n +
+      "em;min-height:0;overflow:auto;display:flex;flex-direction:column;align-items:flex-start;justify-content:flex-start;",
+  };
 }
 
 function linkedQueryBlockStyleForLayout(layout, cfg) {
@@ -6130,6 +6612,36 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   const backUrl = "/profile/" + encodeURIComponent(profileId) + returnQueryStr;
   const editUrl = "/profile/" + encodeURIComponent(profileId) + "/entry/" + encodeURIComponent(entryId) + "/edit" + returnQueryStr;
 
+  const entryNavEnabled =
+    formDoc &&
+    (formDoc.entryNavForwardBackEnabled === true || formDoc.entryNavForwardBackEnabled === "true");
+  let entryNavPrevId = null;
+  let entryNavNextId = null;
+  if (entryNavEnabled) {
+    const adj = await getAdjacentEntryIdsForProfile(db, doc, entryId);
+    entryNavPrevId = adj.prevId;
+    entryNavNextId = adj.nextId;
+  }
+  function entryViewUrlForId(targetId) {
+    return (
+      "/profile/" +
+      encodeURIComponent(profileId) +
+      "/entry/" +
+      encodeURIComponent(targetId) +
+      returnQueryStr
+    );
+  }
+  let entryNavHtml = "";
+  if (entryNavEnabled) {
+    const prevEl = entryNavPrevId
+      ? `<a href="${escapeHtml(entryViewUrlForId(entryNavPrevId))}" class="entry-nav-pag" title="Previous entry" aria-label="Previous entry">◀</a>`
+      : `<span class="entry-nav-pag entry-nav-disabled" title="No previous entry" aria-disabled="true" aria-label="No previous entry">◀</span>`;
+    const nextEl = entryNavNextId
+      ? `<a href="${escapeHtml(entryViewUrlForId(entryNavNextId))}" class="entry-nav-pag" title="Next entry" aria-label="Next entry">▶</a>`
+      : `<span class="entry-nav-pag entry-nav-disabled" title="No next entry" aria-disabled="true" aria-label="No next entry">▶</span>`;
+    entryNavHtml = `<span class="entry-nav-wrap">` + prevEl + nextEl + `</span>`;
+  }
+
   const theme = formDoc && formDoc.theme ? formDoc.theme : DEFAULT_ENTRY_VIEW_THEME;
   const bg = theme.background || DEFAULT_ENTRY_VIEW_THEME.background;
   const text = theme.text || DEFAULT_ENTRY_VIEW_THEME.text;
@@ -6218,6 +6730,18 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         MAX_IMAGE_DISPLAY_EDGE;
       return `<img class="entry-inline-image" src="${escapeHtml(src)}" alt="${escapeHtml(o.fieldName || "Image")}" loading="lazy">`;
     }
+    if (isProfileFileField(doc, o.fieldName) && value) {
+      const raw = String(value).trim();
+      if (!raw) return "";
+      const href =
+        "/api/profiles/" +
+        encodeURIComponent(profileId) +
+        "/entries/" +
+        encodeURIComponent(attEntry) +
+        "/attachments/" +
+        encodeURIComponent(raw);
+      return `<a class="entry-attachment-link" href="${escapeHtml(href)}" download>${escapeHtml(raw)}</a>`;
+    }
     return escapeHtml(value);
   }
 
@@ -6296,7 +6820,9 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         .map((o) => {
           const isLabel = o.type === "label";
           const value = itemValue(o);
-          const blockStyle = blockOrCellStyle(o);
+          const gImg = fieldLayoutImageValueHeightConstraints(o, doc, false);
+          const innerImgHeight = !!gImg.style;
+          const blockStyle = blockOrCellStyleStackOuter(o, innerImgHeight);
           const styleAttr = blockStyle ? ' style="' + escapeHtml(blockStyle) + '"' : "";
           const labelOnlyClass = isLabel ? " entry-label-only" : "";
           const lc = labelClass(o);
@@ -6308,17 +6834,18 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
           }
           const valueHtml = formatValueHtml(o, value);
           const valueClass =
-            o.fieldType === "markdown"
+            (o.fieldType === "markdown"
               ? " value entry-value-markdown"
               : o.fieldType === "url"
               ? " value entry-value-url"
               : o.fieldType === "image"
               ? " value entry-value-image"
-              : " value";
+              : " value") + gImg.className;
+          const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
           return `
         <div class="entry-field-block"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
-          <div class="${valueClass}">${valueHtml}</div>
+          <div class="${valueClass}"${valueBoxStyle}>${valueHtml}</div>
         </div>`;
         })
         .join("") +
@@ -6343,18 +6870,20 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         </div>`;
           }
           const valueHtml = formatValueHtml(o, value);
+          const gImg = fieldLayoutImageValueHeightConstraints(o, doc, false);
           const valueClass =
-            o.fieldType === "markdown"
+            (o.fieldType === "markdown"
               ? " value entry-value-markdown"
               : o.fieldType === "url"
               ? " value entry-value-url"
               : o.fieldType === "image"
               ? " value entry-value-image"
-              : " value";
+              : " value") + gImg.className;
+          const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
           return `
         <div class="entry-grid-cell"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
-          <div class="${valueClass}">${valueHtml}</div>
+          <div class="${valueClass}"${valueBoxStyle}>${valueHtml}</div>
         </div>`;
         })
         .join("") +
@@ -6410,9 +6939,39 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .sub { color: var(--entry-label, #8b949e); margin: 0; }
     .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 0.75rem; }
     .topbar-main { min-width: 0; flex: 1 1 auto; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
-    .topbar-links { margin: 0; display: inline-flex; align-items: baseline; gap: 0.75rem; }
+    .topbar-links { margin: 0; display: inline-flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; }
     .topbar-links a { color: var(--entry-link, #58a6ff); text-decoration: none; }
     .topbar-links a:hover { text-decoration: underline; }
+    .entry-nav-wrap { display: inline-flex; align-items: center; gap: 0.35rem; }
+    /* Match database list row navigation (◀ / ▶) — same filled triangles as .pagination .btn-pag-row */
+    .entry-nav-pag {
+      display: inline-block;
+      padding: 0.5rem 0.75rem;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      line-height: 1;
+      border: 1px solid var(--entry-field-border, #21262d);
+      background: #21262d;
+      color: var(--entry-link, #58a6ff);
+      text-decoration: none;
+      box-sizing: border-box;
+    }
+    a.entry-nav-pag:hover { text-decoration: none; background: #30363d; color: var(--entry-link, #58a6ff); }
+    .entry-nav-pag.entry-nav-disabled { color: #484f58; pointer-events: none; cursor: default; background: #21262d; }
+    .topbar-links .topbar-back-link { font-size: 1.35rem; line-height: 1; }
+    @media (max-width: 768px) {
+      .topbar-links .topbar-back-link {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.25rem -0.45rem -0.5rem;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
     .topbar-actions { flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 0.5rem; }
     table { width: 100%; border-collapse: collapse; }
@@ -6446,8 +7005,23 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .entry-value-markdown h3 { font-size: 1rem; }
     .entry-value-markdown a { color: var(--entry-link, #58a6ff); }
     .entry-value-url a { color: var(--entry-link, #58a6ff); word-break: break-all; }
+    .entry-profile-file-dl a { color: var(--entry-link, #58a6ff); word-break: break-all; }
     .entry-value-image { min-height: 0; }
     .entry-inline-image { max-width: 100%; height: auto; max-height: 24rem; display: block; border-radius: 6px; }
+    .entry-view-grid .entry-grid-cell .value.entry-grid-image-height .entry-inline-image {
+      max-height: 100%;
+      width: auto;
+      height: auto;
+      object-fit: contain;
+      object-position: left top;
+    }
+    .entry-view-stack .entry-field-block:not(.entry-label-only) .value.entry-grid-image-height .entry-inline-image {
+      max-height: 100%;
+      width: auto;
+      height: auto;
+      object-fit: contain;
+      object-position: left top;
+    }
     .entry-grid-cell.entry-label-only .label { white-space: nowrap; }
     .entry-label-row .label { white-space: nowrap; }
     .linked-query-block { margin-top: 1rem; background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 8px; padding: 0.75rem; }
@@ -6472,7 +7046,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
 <body>
   <div class="topbar">
     <div class="topbar-main">
-      <div class="topbar-links">${isSplitEmbed ? "" : `<a href="${escapeHtml(backUrl)}" title="Back to database" aria-label="Back to database">⮜</a>`}${canEdit ? `<a href="${editUrl}">Edit</a>` : ""}</div>
+      <div class="topbar-links">${isSplitEmbed ? "" : `<a href="${escapeHtml(backUrl)}" class="topbar-back-link" title="Back to database" aria-label="Back to database">⮜</a>`}${canEdit ? `<a href="${editUrl}">Edit</a>` : ""}${entryNavHtml}</div>
       <div class="topbar-titleline">
         <h1>${title}</h1>
         ${formLabel ? `<span class="sub">Form: ${escapeHtml(formLabel)}</span>` : ""}
@@ -6579,17 +7153,25 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     const item = getFieldLayoutItemForFieldName(formDoc, o.fieldName);
     return !!(item && normalizeEntryFieldType(item.fieldType) === "image");
   }
+  function entryFieldIsAttachmentBacked(o) {
+    if (!o || o.type !== "field") return false;
+    return entryFieldIsImage(o) || isProfileFileField(doc, o.fieldName);
+  }
+  function entryFieldIsProfileFileNotFormImage(o) {
+    return entryFieldIsAttachmentBacked(o) && !entryFieldIsImage(o);
+  }
   function editFieldLabelHtml(o) {
     const lc = labelClass(o);
     const text = escapeHtml(itemLabel(o));
-    if (!entryFieldIsImage(o)) {
+    if (!entryFieldIsAttachmentBacked(o)) {
       if (layout === "table") return text;
       return `<span class="${lc}">${text}</span>`;
     }
+    const pickTitle = entryFieldIsProfileFileNotFormImage(o) ? "Attach file" : "Attach image file";
     if (layout === "table") {
-      return `<button type="button" class="entry-image-import-btn" title="Attach image file">${text}</button>`;
+      return `<button type="button" class="entry-image-import-btn" title="${escapeHtml(pickTitle)}">${text}</button>`;
     }
-    return `<button type="button" class="${lc} entry-image-import-btn" title="Attach image file">${text}</button>`;
+    return `<button type="button" class="${lc} entry-image-import-btn" title="${escapeHtml(pickTitle)}">${text}</button>`;
   }
   function editControlHtml(o, value) {
     const escapedName = escapeHtml(o.fieldName);
@@ -6623,6 +7205,32 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
         `</div>`
       );
     }
+    if (isProfileFileField(doc, o.fieldName)) {
+      const v = value != null ? String(value).trim() : "";
+      const dlHref = v
+        ? "/api/profiles/" +
+          encodeURIComponent(profileId) +
+          "/entries/" +
+          encodeURIComponent(entryId) +
+          "/attachments/" +
+          encodeURIComponent(v)
+        : "";
+      const noneVis = v ? ' style="display:none"' : "";
+      const dlStyle = v ? "" : ' style="display:none"';
+      return (
+        `<div class="entry-image-edit-wrap" data-profile-file="1">` +
+        `<img class="entry-image-preview" alt="" loading="lazy" style="display:none">` +
+        `<span class="entry-image-none"${noneVis}>No file</span>` +
+        `<a class="entry-profile-file-dl" href="${v ? escapeHtml(dlHref) : "#"}"${dlStyle}>${escapedValue}</a> ` +
+        `<input type="hidden" class="entry-field entry-image-filename" name="${escapedName}" value="${escapedValue}">` +
+        `<div class="entry-image-actions">` +
+        `<input type="file" class="entry-image-file" aria-label="Upload file for ${escapedName}" tabindex="-1">` +
+        `<button type="button" class="btn btn-secondary entry-image-clear">Clear</button>` +
+        `</div>` +
+        `<span class="entry-image-upload-status" aria-live="polite"></span>` +
+        `</div>`
+      );
+    }
     if (o.fieldType === "url") {
       return `<input type="url" class="entry-field" name="${escapedName}" placeholder="${escapedName}" value="${escapedValue}">`;
     }
@@ -6638,7 +7246,9 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       orderedItems
         .map((o) => {
           const isLabel = o.type === "label";
-          const blockStyle = blockOrCellStyle(o);
+          const gImg = fieldLayoutImageValueHeightConstraints(o, doc, true);
+          const innerImgHeight = !!gImg.style;
+          const blockStyle = blockOrCellStyleStackOuter(o, innerImgHeight);
           const styleAttr = blockStyle ? ' style="' + escapeHtml(blockStyle) + '"' : "";
           const labelOnlyClass = isLabel ? " entry-label-only" : "";
           const lc = labelClass(o);
@@ -6649,10 +7259,11 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
         </div>`;
           }
           const value = record[o.fieldName] != null ? String(record[o.fieldName]) : "";
+          const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
           return `
         <div class="entry-field-block"${styleAttr}>
           ${editFieldLabelHtml(o)}
-          <div class="value">${editControlHtml(o, value)}</div>
+          <div class="value${gImg.className}"${valueBoxStyle}>${editControlHtml(o, value)}</div>
         </div>`;
         })
         .join("") +
@@ -6675,10 +7286,12 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
         </div>`;
           }
           const value = record[o.fieldName] != null ? String(record[o.fieldName]) : "";
+          const gImg = fieldLayoutImageValueHeightConstraints(o, doc, true);
+          const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
           return `
         <div class="entry-grid-cell"${styleAttr}>
           ${editFieldLabelHtml(o)}
-          <div class="value">${editControlHtml(o, value)}</div>
+          <div class="value${gImg.className}"${valueBoxStyle}>${editControlHtml(o, value)}</div>
         </div>`;
         })
         .join("") +
@@ -6741,6 +7354,20 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     .topbar-links { display: inline-flex; align-items: baseline; gap: 0.75rem; }
     .topbar-links a { color: var(--entry-link, #58a6ff); text-decoration: none; }
     .topbar-links a:hover { text-decoration: underline; }
+    .topbar-links .topbar-back-link { font-size: 1.35rem; line-height: 1; }
+    @media (max-width: 768px) {
+      .topbar-links .topbar-back-link {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.25rem -0.45rem -0.5rem;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
     .topbar-actions { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
     table { width: 100%; border-collapse: collapse; }
@@ -6792,6 +7419,28 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       border-radius: 6px;
       display: block;
       flex-shrink: 0;
+    }
+    .entry-grid-cell .value.entry-grid-image-height .entry-image-edit-wrap {
+      flex: 1 1 auto;
+      min-height: 0;
+      max-height: 100%;
+      width: 100%;
+      overflow: auto;
+    }
+    .entry-grid-cell .value.entry-grid-image-height .entry-image-preview {
+      max-height: 100%;
+      flex-shrink: 1;
+    }
+    .entry-view-stack .entry-field-block .value.entry-grid-image-height .entry-image-edit-wrap {
+      flex: 1 1 auto;
+      min-height: 0;
+      max-height: 100%;
+      width: 100%;
+      overflow: auto;
+    }
+    .entry-view-stack .entry-field-block .value.entry-grid-image-height .entry-image-preview {
+      max-height: 100%;
+      flex-shrink: 1;
     }
     .entry-view-stack .entry-field-block .value:has(.entry-image-edit-wrap),
     .entry-grid-cell .value:has(.entry-image-edit-wrap),
@@ -6855,7 +7504,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
 <body>
   <div class="topbar">
     <div class="topbar-main">
-      <div class="topbar-links"><a href="${escapeHtml(viewUrl)}" title="Back to entry" aria-label="Back to entry">⮜</a></div>
+      <div class="topbar-links"><a href="${escapeHtml(viewUrl)}" class="topbar-back-link" title="Back to entry" aria-label="Back to entry">⮜</a></div>
       <div class="topbar-titleline">
         <h1>${title}</h1>
         <span class="sub">Edit entry</span>
@@ -6884,9 +7533,26 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     function syncEntryImagePreview(wrap) {
       if (!wrap) return;
       const hidden = wrap.querySelector('.entry-image-filename');
+      const v = hidden && hidden.value ? String(hidden.value).trim() : '';
+      if (wrap.getAttribute('data-profile-file') === '1') {
+        const none = wrap.querySelector('.entry-image-none');
+        const dl = wrap.querySelector('.entry-profile-file-dl');
+        if (dl) {
+          if (v) {
+            dl.href = '/api/profiles/' + encodeURIComponent(profileId) + '/entries/' + encodeURIComponent(entryId) + '/attachments/' + encodeURIComponent(v);
+            dl.textContent = v;
+            dl.style.display = '';
+          } else {
+            dl.removeAttribute('href');
+            dl.textContent = '';
+            dl.style.display = 'none';
+          }
+        }
+        if (none) none.style.display = v ? 'none' : '';
+        return;
+      }
       const img = wrap.querySelector('.entry-image-preview');
       const none = wrap.querySelector('.entry-image-none');
-      const v = hidden && hidden.value ? String(hidden.value).trim() : '';
       if (v && img) {
         img.src = '/api/profiles/' + encodeURIComponent(profileId) + '/entries/' + encodeURIComponent(entryId) + '/attachments/' + encodeURIComponent(v) + '?max=' + maxImageEdge + '&t=' + Date.now();
         img.style.display = '';
@@ -7221,6 +7887,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .topbar-links { margin: 0; display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
     .topbar-links a { color: var(--profile-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .topbar-links a:hover { text-decoration: underline; }
+    .topbar-links .topbar-back-link { font-size: 1.35rem; line-height: 1; }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
     .topbar-actions { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: flex-end; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.35rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.9rem; }
@@ -7292,13 +7959,32 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       .search-bar, .guardian-import { flex: 1 1 auto; width: 100%; }
       .search-bar { flex-wrap: wrap; }
       .guardian-import { flex-wrap: wrap; }
+      /* On phones, always fall back to plain list mode even if split is configured. */
+      .split-view-wrap { display: block; height: auto !important; min-height: 0; }
+      .split-entry-pane, .split-divider { display: none !important; }
+      .split-list-pane { flex: 0 0 auto; min-height: 0; overflow: visible !important; }
+      /* Row prev/next tie into split single-entry navigation; hide on phones. */
+      .pagination .btn-pag-row { display: none !important; }
+      .topbar-links .topbar-back-link {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem -0.5rem;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
       th.col-mobile-hidden,
       td.col-mobile-hidden { display: none; }
       .entry-link-desktop-only { display: none; }
       .entry-plain-mobile-only { display: inline; }
       .entry-plain-desktop-only { display: none; }
       .entry-link-mobile-only { display: inline; }
-      th.col-desktop-hidden, td.col-desktop-hidden { display: table-cell !important; }
+      /* Show desktop-hidden columns on narrow screens only when they are in the mobile list (not col-mobile-hidden). */
+      th.col-desktop-hidden:not(.col-mobile-hidden),
+      td.col-desktop-hidden:not(.col-mobile-hidden) { display: table-cell !important; }
     }
   </style>
   ${customCss ? `<style>${customCss}</style>` : ""}
@@ -7306,7 +7992,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
 <body>
   <div class="topbar">
     <div class="topbar-main">
-      <div class="topbar-links"><a href="/" title="Profiles" aria-label="Profiles">⮜</a>${canEdit && isAdmin ? `<a href="/profile/${encodeURIComponent(doc._id)}/edit">Edit profile</a>` : ""}</div>
+      <div class="topbar-links"><a href="/" class="topbar-back-link" title="Profiles" aria-label="Profiles">⮜</a>${canEdit && isAdmin ? `<a href="/profile/${encodeURIComponent(doc._id)}/edit">Edit profile</a>` : ""}</div>
       <div class="topbar-titleline">
         <h1>${title}</h1>
         ${description ? `<span class="sub">${description}</span>` : ""}
@@ -7399,6 +8085,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       var frame = document.getElementById('split-entry-frame');
       var empty = document.getElementById('split-entry-empty');
       if (!frame || !wrap || !listPane || !entryPane || !divider) return;
+      if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) return;
       function applyRatio(rawRatio) {
         var ratio = Number(rawRatio);
         if (!Number.isFinite(ratio)) ratio = 50;
@@ -7426,6 +8113,17 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       function saveRatio(ratio) {
         try { window.localStorage.setItem(ratioKey, String(ratio)); } catch (_) {}
       }
+      function applyHorizontalViewportHeight() {
+        if (orientation !== 'horizontal') return;
+        var top = wrap.getBoundingClientRect().top;
+        var bodyStyle = window.getComputedStyle(document.body);
+        var padBottom = parseFloat(bodyStyle.paddingBottom || '0') || 0;
+        var available = window.innerHeight - top - padBottom;
+        var minHeightPx = 28 * 16;
+        if (!Number.isFinite(available) || available <= 0) return;
+        wrap.style.height = Math.max(minHeightPx, Math.floor(available)) + 'px';
+      }
+      applyHorizontalViewportHeight();
       var currentRatio = applyRatio(loadStoredRatio());
       function setSelected(entryId) {
         document.querySelectorAll('tr.entry-row.selected').forEach(function(tr) { tr.classList.remove('selected'); });
@@ -7477,7 +8175,10 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
         dragging = false;
         saveRatio(currentRatio);
       });
-      window.addEventListener('resize', function() { applyRatio(currentRatio); });
+      window.addEventListener('resize', function() {
+        applyHorizontalViewportHeight();
+        applyRatio(currentRatio);
+      });
       document.querySelectorAll('a.entry-open-link').forEach(function(a) {
         a.addEventListener('click', function(ev) {
           ev.preventDefault();
@@ -7576,6 +8277,23 @@ function renderDeletionsPage(batches, appUi) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .batch { background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #21262d); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
     .batch-title { margin: 0 0 0.5rem 0; }
     .batch-ids { font-size: 0.875rem; color: var(--app-label, #8b949e); word-break: break-all; margin: 0 0 0.75rem 0; }
@@ -7657,6 +8375,23 @@ function renderEntryFormsListPage(forms, appUi) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
     .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
@@ -7770,6 +8505,23 @@ function renderDeleteEntryFormPage(doc, appUi) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .warning { background: #3d1f1f; color: #f85149; padding: 1rem; border-radius: 8px; margin: 1rem 0; }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; margin-right: 0.5rem; margin-top: 0.5rem; }
     .btn-danger { background: #da3633; color: #fff; }
@@ -7862,6 +8614,23 @@ function renderFlowsListPage(flows, appUi) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
     .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
@@ -8025,6 +8794,23 @@ function renderProfilesListPage(profiles, appUi) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
     .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
@@ -8378,6 +9164,23 @@ function renderJsProcessingListPage(list, appUi) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
     .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
@@ -8706,6 +9509,23 @@ function renderApisListPage(apis, appUi) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
     .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
@@ -8885,6 +9705,23 @@ function renderQueriesListPage(queries, appUi, profiles) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
     .btn:hover { background: #2ea043; text-decoration: none; }
     .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
@@ -9039,6 +9876,23 @@ function renderEditQueryPage(doc, err, appUi, profiles) {
     .actions { margin-bottom: 1rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     label { display: block; margin-top: 0.75rem; color: var(--app-label, #8b949e); }
     input, select, textarea { width: 100%; max-width: 32rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
     textarea { min-height: 4rem; resize: vertical; }
@@ -9226,6 +10080,23 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
     .actions { margin-bottom: 1rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     label { display: block; margin-top: 0.75rem; color: var(--app-label, #8b949e); }
     input, select, textarea { width: 100%; max-width: 28rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
     .btn { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; border: none; }
@@ -9392,6 +10263,23 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
     .actions { margin-bottom: 1rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     label { display: block; margin-top: 0.75rem; color: var(--app-label, #8b949e); }
     input { width: 100%; max-width: 28rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
     .btn { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; border: none; }
@@ -9614,6 +10502,10 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
   const linkedQueryYVal = linkedQueryCfg && linkedQueryCfg.y != null ? String(linkedQueryCfg.y) : "";
   const linkedQueryHeightVal = linkedQueryCfg && linkedQueryCfg.height != null ? String(linkedQueryCfg.height) : "";
   const linkedQueryLoadOnDemandVal = !!(linkedQueryCfg && linkedQueryCfg.loadOnDemand);
+  const entryNavForwardBackVal = !!(
+    doc &&
+    (doc.entryNavForwardBackEnabled === true || doc.entryNavForwardBackEnabled === "true")
+  );
   const revInput = rev ? `<input type="hidden" id="rev" value="${escapeHtml(rev)}">` : "";
   const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
   const title = isEdit ? "Single Entry form configuration" : "Create Single Entry form configuration";
@@ -9735,6 +10627,26 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
     .flow-config-table tbody tr:last-child td { border-bottom: none; }
     .flow-config-table input[type="text"] { margin: 0; }
     .flow-config-table select { margin: 0; min-width: 10rem; }
+    .actions { margin-bottom: 1rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
   </style>
 </head>
 <body>
@@ -9778,7 +10690,7 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
     </table>
     <button type="button" class="btn btn-secondary" id="add-label" style="margin-top:0.5rem;">+ Add label</button>
     <label class="field-list-label" style="margin-top:1.5rem;">Field layout (optional: field name or label id, order, type, width, position)</label>
-    <p class="sub" style="margin-top:0;">Use a profile field name or a label id from above. Type: Text (plain), Markdown (rendered in view mode), URL (clickable link in view mode), or Image (single image per field; value is the attachment filename). On edit entry, the field name is the button that opens the file picker. Each upload is limited to ${Math.round(MAX_ENTRY_IMAGE_BYTES / 1024)} KiB before processing (an app policy to keep memory and attachments bounded; not a CouchDB hard limit). Administrators can raise or lower it with the environment variable <code>MAX_ENTRY_IMAGE_BYTES</code> (bytes). For Image fields, the layout Width column also sets the maximum long edge in pixels when scaling on upload (e.g. <code>400px</code>, <code>32ch</code>, or <code>50%</code> of the default screen cap). Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning; Grid uses width as column size only.</p>
+    <p class="sub" style="margin-top:0;">Use a profile field name or a label id from above. Type: Text (plain), Markdown (rendered in view mode), URL (clickable link in view mode), or Image (single image per field; value is the attachment filename). On edit entry, the field name is the button that opens the file picker. Each upload is limited to ${Math.round(MAX_ENTRY_IMAGE_BYTES / 1024)} KiB before processing (an app policy to keep memory and attachments bounded; not a CouchDB hard limit). Administrators can raise or lower it with the environment variable <code>MAX_ENTRY_IMAGE_BYTES</code> (bytes). For Image fields, the layout Width column also sets the maximum long edge in pixels when scaling on upload (e.g. <code>400px</code>, <code>32ch</code>, or <code>50%</code> of the default screen cap). Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning. In <strong>Grid</strong> layout, Width sets the column size. In <strong>Stack</strong> layout, Height on image/file-preview fields sizes the value box (and no longer forces <code>position:absolute</code> when only Height is set). <strong>Height (em)</strong> limits the box around those fields in both layouts (single-entry view and edit).</p>
     <table class="field-layout-table">
       <thead><tr><th>Field name or label id</th><th>Order</th><th>Type</th><th>Width</th><th>X (ch)</th><th>Y (em)</th><th>Height (em)</th><th></th></tr></thead>
       <tbody id="field-layout-tbody">${fieldLayoutRows}
@@ -9820,6 +10732,12 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
       </span>
     </div>
     <p class="sub" style="margin-top:0.5rem;">Grid layout: X/Y/Height position the table. Other layouts: table is placed below entry data. Height adds a vertical scrollbar when needed.</p>
+    <label style="margin-top:1.5rem;">Forward / Back (single-entry view)</label>
+    <p class="sub" style="margin-top:0;">Optional buttons after <strong>Edit</strong> that open the previous or next entry in this database using the same order as the list (sort key and direction on the profile).</p>
+    <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;">
+      <input type="checkbox" id="entryNavForwardBack" ${entryNavForwardBackVal ? "checked" : ""} style="width:auto;">
+      <span style="color:var(--app-text,#e6edf3);">Show Forward and Back on single-entry view</span>
+    </label>
     <label style="margin-top:1.5rem;">Flow buttons (single-entry view)</label>
     <p class="sub" style="margin-top:0;">Each row adds a button on the single-entry view that sends the entry dataset to the Flow facility. First column enables the button.</p>
     <table class="flow-config-table" style="margin-top:0.5rem;">
@@ -10030,7 +10948,16 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
       const linkedQueryY = parseNumInput(document.getElementById('linkedQueryY'));
       const linkedQueryH = parseNumInput(document.getElementById('linkedQueryHeight'));
       const linkedQueryLoadOnDemand = !!(document.getElementById('linkedQueryLoadOnDemand') && document.getElementById('linkedQueryLoadOnDemand').checked);
-      const body = { name, labels, theme, layout, fieldLayout, customCss, flowConfigs };
+      const body = {
+        name,
+        labels,
+        theme,
+        layout,
+        fieldLayout,
+        customCss,
+        flowConfigs,
+        entryNavForwardBackEnabled: !!(document.getElementById('entryNavForwardBack') && document.getElementById('entryNavForwardBack').checked),
+      };
       if (linkedQueryId && linkedQueryId.trim()) {
         body.linkedQuery = { id: linkedQueryId.trim() };
         if (linkedQueryWidth) body.linkedQuery.width = linkedQueryWidth;
@@ -10079,6 +11006,23 @@ function renderDeleteProfilePage(doc) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: #58a6ff; text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .warning { background: #3d1f1f; color: #f85149; padding: 1rem; border-radius: 8px; margin: 1rem 0; }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; margin-right: 0.5rem; margin-top: 0.5rem; }
     .btn-danger { background: #da3633; color: #fff; }
@@ -10188,6 +11132,23 @@ function renderAllDocumentsPage(docs, appUi) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
     th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
@@ -10415,6 +11376,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
   const fieldDefaultSources = Array.isArray(doc.fieldDefaultSources) ? doc.fieldDefaultSources : [];
   const initialDefaultSources = fieldNames.map((_, i) => (fieldDefaultSources[i] !== undefined && DEFAULT_VALUE_SOURCES.includes(fieldDefaultSources[i]) ? fieldDefaultSources[i] : ""));
   const initialFieldDisplay = normalizeFieldDisplay(fieldNames, doc.fieldDisplay);
+  const initialFieldKinds = normalizeFieldKinds(fieldNames, doc.fieldKinds);
   const rev = escapeHtml(doc._rev || "");
   const customCss = doc.customCss || "";
   const listFields = Array.isArray(doc.listFields)
@@ -10537,13 +11499,24 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     select:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .field-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center; flex-wrap: wrap; }
     .field-row input[name="fieldNames"] { flex: 1; min-width: 10rem; }
+    .field-row select[name="fieldKinds"] { flex: 0 0 auto; width: auto; min-width: 5.5rem; max-width: 7rem; font-size: 0.875rem; }
     .field-row select[name="fieldDefaultSources"] { flex: 0 0 auto; width: auto; min-width: 10rem; max-width: 14rem; }
     .field-row select[name="fieldDisplay"] { flex: 0 0 6.75rem; min-width: 6.75rem; max-width: 7.5rem; font-size: 0.875rem; }
     .field-list-header { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.25rem; font-size: 0.875rem; color: #8b949e; flex-wrap: wrap; }
+    .field-list-header .col-name,
+    .field-list-header .col-type,
+    .field-list-header .col-prefill,
+    .field-list-header .col-display {
+      padding: 0.5rem;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      box-sizing: border-box;
+    }
     .field-list-header .col-name { flex: 1; min-width: 10rem; }
+    .field-list-header .col-type { flex: 0 0 auto; min-width: 5.5rem; max-width: 7rem; }
     .field-list-header .col-prefill { flex: 0 0 auto; width: auto; min-width: 10rem; max-width: 14rem; }
     .field-list-header .col-display { flex: 0 0 6.75rem; min-width: 6.75rem; font-size: 0.8rem; }
-    .field-list-header .col-action { flex: 0 0 auto; min-width: 5rem; }
+    .field-list-header .col-action { flex: 0 0 2.75rem; width: 2.75rem; min-width: 2.75rem; box-sizing: border-box; }
     .field-list { margin: 1rem 0; }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
     .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
@@ -10612,6 +11585,23 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: #58a6ff; text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
   </style>
 </head>
 <body>
@@ -10631,9 +11621,9 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     <label for="description">Description</label>
     <textarea id="description" name="description" placeholder="Optional description">${description}</textarea>
     <label class="field-list-label">Field names</label>
-    <p class="sub" style="margin-top:0.25rem;">Optional default value is used when creating a new entry (form is prefilled; you can change it before saving). <strong>Display</strong> sets desktop list column width: <em>Auto</em> shares leftover space; <em>Hide</em> hides the column on desktop (still visible on mobile if selected in the mobile list below); percentage widths are scaled so they sum to 100% together.</p>
+    <p class="sub" style="margin-top:0.25rem;"><strong>Type</strong> is stored on the profile: <em>Text</em> values live in the entry document; <em>File</em> stores the filename on the entry and the bytes as a CouchDB attachment (images, PDF, or plain text for now—same size limit as entry images). Optional default value is used when creating a new entry. <strong>Display</strong> sets desktop list column width: <em>Auto</em> shares leftover space; <em>Hide</em> hides the column on desktop (still visible on mobile if selected in the mobile list below); percentage widths are scaled so they sum to 100% together.</p>
     <div class="field-list" id="field-list">
-      <div class="field-list-header"><span class="col-name">Field name</span><span class="col-prefill">Prefill value</span><span class="col-display">Display</span><span class="col-action"></span></div>
+      <div class="field-list-header"><span class="col-name">Field name</span><span class="col-type">Type</span><span class="col-prefill">Prefill value</span><span class="col-display">Display</span><span class="col-action"></span></div>
     </div>
     <button type="button" class="btn btn-secondary" id="add-field">+ Add field</button>
     <label>Theme (colours)</label>
@@ -10707,8 +11697,8 @@ function renderEditProfilePage(doc, forms = [], appUi) {
       <div><label for="primaryKeyField2" style="margin:0;font-size:0.875rem;">2</label><br>${pkSelect2}<label for="primaryKeyLen2" style="display:block;margin-top:0.35rem;font-size:0.8rem;">Length</label><input type="number" id="primaryKeyLen2" min="${PRIMARY_KEY_SEGMENT_LEN_MIN}" max="${PRIMARY_KEY_SEGMENT_LEN_MAX}" step="1" value="${escapeHtml(pkLen1)}" style="max-width:6rem;padding:0.35rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);"></div>
       <div><label for="primaryKeyField3" style="margin:0;font-size:0.875rem;">3</label><br>${pkSelect3}<label for="primaryKeyLen3" style="display:block;margin-top:0.35rem;font-size:0.8rem;">Length</label><input type="number" id="primaryKeyLen3" min="${PRIMARY_KEY_SEGMENT_LEN_MIN}" max="${PRIMARY_KEY_SEGMENT_LEN_MAX}" step="1" value="${escapeHtml(pkLen2)}" style="max-width:6rem;padding:0.35rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);"></div>
     </div>
-    <label for="primaryKeyImportPolicy" style="margin-top:0.75rem;">Bulk import policy (reserved)</label>
-    <p class="sub" style="margin-top:0.25rem;">For future CSV / import behaviour when a primary key collides. Not used yet.</p>
+    <label for="primaryKeyImportPolicy" style="margin-top:0.75rem;">Bulk import policy</label>
+    <p class="sub" style="margin-top:0.25rem;">When CSV or picture import would create a duplicate business primary key: <em>Skip duplicate</em> leaves the existing entry unchanged; <em>Overwrite existing</em> replaces that entry’s data (CSV) or the file field and attachment (picture import). Default matches skip.</p>
     <select id="primaryKeyImportPolicy" name="primaryKeyImportPolicy">
       <option value=""${!primaryKeyImportPolicyVal ? " selected" : ""}>— Default —</option>
       <option value="skip"${primaryKeyImportPolicyVal === "skip" ? " selected" : ""}>Skip duplicate</option>
@@ -10773,6 +11763,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     }
     const initialFields = ${JSON.stringify(fieldNames)};
     const initialDefaultSources = ${JSON.stringify(initialDefaultSources)};
+    const initialFieldKinds = ${JSON.stringify(initialFieldKinds)};
     const initialFieldDisplay = ${JSON.stringify(initialFieldDisplay)};
     const displayOptions = [
       { value: 'auto', label: 'Auto' },
@@ -10791,24 +11782,28 @@ function renderEditProfilePage(doc, forms = [], appUi) {
       { value: 'currentUser', label: 'Current user' }
     ];
 
-    function addFieldRow(value, defaultSource, displayVal) {
+    function addFieldRow(value, defaultSource, kindVal, displayVal) {
       const row = document.createElement('div');
       row.className = 'field-row';
       const esc = (v) => (v || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       const selectOpts = defaultSourceOptions.map(function(opt) {
         return '<option value="' + esc(opt.value) + '"' + (defaultSource === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
       }).join('');
+      const kind = kindVal === 'file' ? 'file' : 'text';
+      const kindOpts =
+        '<option value="text"' + (kind === 'text' ? ' selected' : '') + '>Text</option>' +
+        '<option value="file"' + (kind === 'file' ? ' selected' : '') + '>File</option>';
       const disp = displayVal && typeof displayVal === 'string' ? displayVal : 'auto';
       const dispOpts = displayOptions.map(function(opt) {
         return '<option value="' + esc(opt.value) + '"' + (disp === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
       }).join('');
-      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + esc(value) + '"><select name="fieldDefaultSources" title="Default for new entries">' + selectOpts + '</select><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
+      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + esc(value) + '"><select name="fieldKinds" title="Field type: text or file">' + kindOpts + '</select><select name="fieldDefaultSources" title="Default for new entries">' + selectOpts + '</select><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
       row.querySelector('.btn-remove').onclick = () => row.remove();
       fieldList.appendChild(row);
     }
 
-    addBtn.onclick = () => addFieldRow('', '', 'auto');
-    (initialFields.length ? initialFields : ['', '']).forEach((v, i) => addFieldRow(v, initialDefaultSources[i] || '', (initialFieldDisplay && initialFieldDisplay[i]) ? initialFieldDisplay[i] : 'auto'));
+    addBtn.onclick = () => addFieldRow('', '', 'text', 'auto');
+    (initialFields.length ? initialFields : ['', '']).forEach((v, i) => addFieldRow(v, initialDefaultSources[i] || '', (initialFieldKinds && initialFieldKinds[i]) ? initialFieldKinds[i] : 'text', (initialFieldDisplay && initialFieldDisplay[i]) ? initialFieldDisplay[i] : 'auto'));
 
     const cssFileInput = document.getElementById('customCssFile');
     const cssTextarea = document.getElementById('customCss');
@@ -10968,15 +11963,18 @@ function renderEditProfilePage(doc, forms = [], appUi) {
       const _rev = document.getElementById('rev').value;
       const fieldRows = Array.from(document.getElementById('field-list').querySelectorAll('.field-row'));
       const fieldNames = [];
+      const fieldKinds = [];
       const fieldDefaultSources = [];
       const fieldDisplay = [];
       fieldRows.forEach((row) => {
         const input = row.querySelector('input[name="fieldNames"]');
+        const kindSel = row.querySelector('select[name="fieldKinds"]');
         const select = row.querySelector('select[name="fieldDefaultSources"]');
         const dispSel = row.querySelector('select[name="fieldDisplay"]');
         const name = input ? input.value.trim() : '';
         if (name) {
           fieldNames.push(name);
+          fieldKinds.push(kindSel && kindSel.value === 'file' ? 'file' : 'text');
           fieldDefaultSources.push(select ? select.value : '');
           fieldDisplay.push(dispSel ? dispSel.value : 'auto');
         }
@@ -11004,6 +12002,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
             description,
             customCss,
             fieldNames,
+            fieldKinds,
             fieldDefaultSources,
             fieldDisplay,
             entryFormId: entryFormIds[0] || '',
@@ -11100,10 +12099,21 @@ function renderCreateProfilePage(appUi) {
     textarea:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .field-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center; flex-wrap: wrap; }
     .field-row input { flex: 1; min-width: 8rem; }
+    .field-row select[name="fieldKinds"] { flex: 0 0 auto; min-width: 5.5rem; max-width: 7rem; font-size: 0.875rem; }
     .field-row select[name="fieldDisplay"] { flex: 0 0 6.75rem; min-width: 6.75rem; font-size: 0.875rem; }
     .field-list-header { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.25rem; font-size: 0.875rem; color: #8b949e; flex-wrap: wrap; }
+    .field-list-header .col-name,
+    .field-list-header .col-type,
+    .field-list-header .col-display {
+      padding: 0.5rem;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      box-sizing: border-box;
+    }
     .field-list-header .col-name { flex: 1; min-width: 8rem; }
+    .field-list-header .col-type { flex: 0 0 auto; min-width: 5.5rem; max-width: 7rem; }
     .field-list-header .col-display { flex: 0 0 6.75rem; min-width: 6.75rem; font-size: 0.8rem; }
+    .field-list-header .col-action { flex: 0 0 2.75rem; width: 2.75rem; min-width: 2.75rem; box-sizing: border-box; }
     .field-list { margin: 1rem 0; }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
     .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
@@ -11131,9 +12141,9 @@ function renderCreateProfilePage(appUi) {
     <label for="customCssFile">Load CSS from file</label>
     <input type="file" id="customCssFile" accept=".css,text/css">
     <label class="field-list-label">Field names</label>
-    <p class="sub" style="margin-top:0.25rem;"><strong>Display</strong> sets desktop list column width (Auto, Hide, or percentages scaled to 100% together).</p>
+    <p class="sub" style="margin-top:0.25rem;"><strong>Type</strong>: Text (default) or File (attachment on each entry). <strong>Display</strong> sets desktop list column width (Auto, Hide, or percentages scaled to 100% together).</p>
     <div class="field-list" id="field-list">
-      <div class="field-list-header"><span class="col-name">Field name</span><span class="col-display">Display</span><span class="col-action"></span></div>
+      <div class="field-list-header"><span class="col-name">Field name</span><span class="col-type">Type</span><span class="col-display">Display</span><span class="col-action"></span></div>
     </div>
     <button type="button" class="btn btn-secondary" id="add-field">+ Add field</button>
     <hr>
@@ -11169,21 +12179,25 @@ function renderCreateProfilePage(appUi) {
       { value: '40%', label: '40%' },
       { value: '50%', label: '50%' }
     ];
-    function addFieldRow(value, displayVal) {
+    function addFieldRow(value, kindVal, displayVal) {
       const row = document.createElement('div');
       row.className = 'field-row';
       const esc = (v) => (v || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+      const kind = kindVal === 'file' ? 'file' : 'text';
+      const kindOpts =
+        '<option value="text"' + (kind === 'text' ? ' selected' : '') + '>Text</option>' +
+        '<option value="file"' + (kind === 'file' ? ' selected' : '') + '>File</option>';
       const disp = displayVal && typeof displayVal === 'string' ? displayVal : 'auto';
       const dispOpts = displayOptions.map(function(opt) {
         return '<option value="' + esc(opt.value) + '"' + (disp === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
       }).join('');
-      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + (value || '').replace(/"/g, '&quot;') + '"><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
+      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + (value || '').replace(/"/g, '&quot;') + '"><select name="fieldKinds" title="Field type: text or file">' + kindOpts + '</select><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
       row.querySelector('.btn-remove').onclick = () => row.remove();
       fieldList.appendChild(row);
     }
 
-    addBtn.onclick = () => addFieldRow('', 'auto');
-    addFieldRow('', 'auto'); addFieldRow('', 'auto');
+    addBtn.onclick = () => addFieldRow('', 'text', 'auto');
+    addFieldRow('', 'text', 'auto'); addFieldRow('', 'text', 'auto');
 
     const cssFileInput = document.getElementById('customCssFile');
     const cssTextarea = document.getElementById('customCss');
@@ -11263,13 +12277,16 @@ function renderCreateProfilePage(appUi) {
       const customCss = document.getElementById('customCss').value;
       const fieldRows = Array.from(document.getElementById('field-list').querySelectorAll('.field-row'));
       const fieldNames = [];
+      const fieldKinds = [];
       const fieldDisplay = [];
       fieldRows.forEach((row) => {
         const input = row.querySelector('input[name="fieldNames"]');
+        const kindSel = row.querySelector('select[name="fieldKinds"]');
         const dispSel = row.querySelector('select[name="fieldDisplay"]');
         const fn = input ? input.value.trim() : '';
         if (fn) {
           fieldNames.push(fn);
+          fieldKinds.push(kindSel && kindSel.value === 'file' ? 'file' : 'text');
           fieldDisplay.push(dispSel ? dispSel.value : 'auto');
         }
       });
@@ -11277,7 +12294,7 @@ function renderCreateProfilePage(appUi) {
         const r = await fetch('/api/profiles', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, description, customCss, fieldNames, fieldDisplay })
+          body: JSON.stringify({ name, description, customCss, fieldNames, fieldKinds, fieldDisplay })
         });
         const data = await r.json();
         if (!r.ok) { msgEl.textContent = data.error || 'Failed'; msgEl.className = 'msg err'; return; }
@@ -11508,6 +12525,23 @@ function renderEditAppConfigPage(appUi, err) {
     .actions { margin-bottom: 1.5rem; }
     .actions a { color: #58a6ff; text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
     .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
     .el-theme-colours { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem; width: 100%; }
@@ -11768,9 +12802,28 @@ function renderDataExportImportPage(profiles, appUi) {
       border: 1px solid transparent;
     }
     .actions .back-nav:hover { text-decoration: underline; background: var(--app-bg, #0f1419); color: var(--app-link, #58a6ff); }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .section { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--app-table-border, #30363d); }
     .radio-group { margin-top: 0.5rem; }
     .radio-group label { display: inline; margin-top: 0; }
+    .import-pictures-divider { margin: 1.25rem 0 0; padding-top: 1.25rem; border-top: 1px solid var(--app-table-border, #30363d); }
+    .import-pictures-divider h2 { font-size: 1rem; font-weight: 600; margin: 0 0 0.5rem; color: var(--app-text, #e6edf3); }
   </style>
 </head>
 <body>
@@ -11778,7 +12831,7 @@ function renderDataExportImportPage(profiles, appUi) {
     <a href="/" class="back-nav">← Profiles</a>
   </div>
   <h1>Export / Import data</h1>
-  <p class="sub">Export entry data from an Elenko database or import rows from a semicolon-separated CSV file into one.</p>
+  <p class="sub">Export entry data from an Elenko database, import rows from a semicolon-separated CSV file, or import multiple pictures into file-type profile fields.</p>
 
   <div class="radio-group">
     <label><input type="radio" name="dataMode" value="export" checked> Export</label>
@@ -11808,6 +12861,17 @@ function renderDataExportImportPage(profiles, appUi) {
     </div>
     <p class="sub" style="margin-top:0.35rem;">When checked, the first row lists column titles; they are matched to profile field names (case-insensitive). When unchecked, columns are read in profile field order (first column → first field, etc.).</p>
     <button type="button" id="import-data-btn" class="btn btn-primary" style="margin-top:1rem;">Import data</button>
+
+    <div id="import-pictures-block" class="import-pictures-divider" style="display:none;">
+      <h2>Import pictures</h2>
+      <p class="sub" id="import-pictures-summary" style="margin-top:0;"></p>
+      <label for="import-picture-field-select">File field</label>
+      <select id="import-picture-field-select" aria-describedby="import-pictures-summary"></select>
+      <label for="import-picture-files" style="margin-top:0.75rem;">Pictures</label>
+      <input type="file" id="import-picture-files" accept="image/jpeg,image/png,image/webp,image/gif,.jpg,.jpeg,.png,.webp,.gif" multiple>
+      <p class="sub" style="margin-top:0.35rem;">JPEG, PNG, WebP, or GIF. Each file becomes one entry; other fields use profile prefill defaults where set. If the business primary key includes this file field, the stored filename (after sanitising) must fit the segment length. When the key already exists: <em>Skip duplicate</em> ignores the file; <em>Overwrite existing</em> replaces that entry’s attachment and field (profile setting under primary key).</p>
+      <button type="button" id="import-pictures-btn" class="btn btn-primary" style="margin-top:0.75rem;">Import pictures</button>
+    </div>
   </div>
 
   <div id="data-import-msg" class="sub" style="display:none; margin-top:1rem; white-space:pre-wrap;"></div>
@@ -11821,17 +12885,91 @@ function renderDataExportImportPage(profiles, appUi) {
       var fileInput = document.getElementById('import-csv-file');
       var profileSel = document.getElementById('data-profile');
       var headerChk = document.getElementById('import-header-match');
+      var picturesBlock = document.getElementById('import-pictures-block');
+      var picturesSummary = document.getElementById('import-pictures-summary');
+      var pictureFieldSel = document.getElementById('import-picture-field-select');
+      var pictureFilesInput = document.getElementById('import-picture-files');
+      var picturesBtn = document.getElementById('import-pictures-btn');
+      var importMeta = null;
+
+      function escAttr(s) {
+        return String(s != null ? s : '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+      }
+
+      function escOptText(s) {
+        return String(s != null ? s : '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+      }
+
+      function refreshImportMeta() {
+        importMeta = null;
+        if (picturesBlock) picturesBlock.style.display = 'none';
+        if (pictureFieldSel) pictureFieldSel.innerHTML = '';
+        var modeImp = document.querySelector('input[name="dataMode"]:checked');
+        var isImport = modeImp && modeImp.value === 'import';
+        var pid = profileSel && profileSel.value ? profileSel.value.trim() : '';
+        if (!isImport || !pid || !picturesBlock) return;
+        fetch('/api/profiles/' + encodeURIComponent(pid) + '/data-import-meta')
+          .then(function(r) {
+            return r.json().then(function(d) {
+              return { ok: r.ok, status: r.status, data: d };
+            });
+          })
+          .then(function(o) {
+            if (!o.ok || !o.data || !Array.isArray(o.data.fileFields) || o.data.fileFields.length === 0) {
+              return;
+            }
+            importMeta = o.data;
+            picturesBlock.style.display = 'block';
+            if (pictureFieldSel) {
+              pictureFieldSel.innerHTML = o.data.fileFields
+                .map(function(fn) {
+                  return '<option value="' + escAttr(fn) + '">' + escOptText(fn) + '</option>';
+                })
+                .join('');
+            }
+            if (picturesSummary) {
+              var lines = [
+                'This profile has file-type field(s): ' + o.data.fileFields.map(function(f) { return '"' + f + '"'; }).join(', ') + '.'
+              ];
+              if (o.data.fileFieldsInPrimaryKey && o.data.fileFieldsInPrimaryKey.length) {
+                lines.push(
+                  'Included in the business primary key: ' +
+                    o.data.fileFieldsInPrimaryKey.map(function(f) { return '"' + f + '"'; }).join(', ') +
+                    '.'
+                );
+              }
+              var pol = o.data.primaryKeyImportPolicy || '';
+              if (pol === 'overwrite') {
+                lines.push('Bulk import policy: overwrite existing entry when the primary key matches.');
+              } else if (pol === 'skip') {
+                lines.push('Bulk import policy: skip files that would duplicate an existing primary key.');
+              } else {
+                lines.push('Bulk import policy: default (skip duplicates) unless you set Overwrite on the profile.');
+              }
+              picturesSummary.textContent = lines.join(' ');
+            }
+          })
+          .catch(function() {
+            importMeta = null;
+            if (picturesBlock) picturesBlock.style.display = 'none';
+          });
+      }
 
       function setMode(isImport) {
         if (exportSection) exportSection.style.display = isImport ? 'none' : 'block';
         if (importSection) importSection.style.display = isImport ? 'block' : 'none';
         if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+        refreshImportMeta();
       }
       document.querySelectorAll('input[name="dataMode"]').forEach(function(r) {
         r.addEventListener('change', function() {
           setMode(r.value === 'import');
         });
       });
+      if (profileSel) profileSel.addEventListener('change', refreshImportMeta);
 
       if (importBtn) {
         importBtn.addEventListener('click', function() {
@@ -11955,6 +13093,112 @@ function renderDataExportImportPage(profiles, appUi) {
           reader.readAsText(file, 'UTF-8');
         });
       }
+
+      if (picturesBtn) {
+        picturesBtn.addEventListener('click', function() {
+          var pid = profileSel && profileSel.value ? profileSel.value.trim() : '';
+          if (!pid) {
+            if (msgEl) {
+              msgEl.style.display = 'block';
+              msgEl.style.color = '#f85149';
+              msgEl.textContent = 'Select an Elenko database first.';
+            }
+            return;
+          }
+          if (!importMeta || !importMeta.fileFields || !importMeta.fileFields.length) {
+            if (msgEl) {
+              msgEl.style.display = 'block';
+              msgEl.style.color = '#f85149';
+              msgEl.textContent = 'This profile has no file-type fields for picture import.';
+            }
+            return;
+          }
+          var fieldName = pictureFieldSel && pictureFieldSel.value ? pictureFieldSel.value.trim() : '';
+          if (!fieldName) {
+            if (msgEl) {
+              msgEl.style.display = 'block';
+              msgEl.style.color = '#f85149';
+              msgEl.textContent = 'Choose a file field.';
+            }
+            return;
+          }
+          var files = pictureFilesInput && pictureFilesInput.files ? pictureFilesInput.files : null;
+          if (!files || !files.length) {
+            if (msgEl) {
+              msgEl.style.display = 'block';
+              msgEl.style.color = '#f85149';
+              msgEl.textContent = 'Choose one or more pictures.';
+            }
+            return;
+          }
+          picturesBtn.disabled = true;
+          if (msgEl) {
+            msgEl.style.display = 'block';
+            msgEl.style.color = 'var(--app-label, #8b949e)';
+            msgEl.textContent = 'Uploading…';
+          }
+          var fd = new FormData();
+          fd.append('fieldName', fieldName);
+          for (var i = 0; i < files.length; i++) {
+            fd.append('files', files[i]);
+          }
+          fetch('/api/profiles/' + encodeURIComponent(pid) + '/import-pictures', { method: 'POST', body: fd })
+            .then(function(r) {
+              return r.text().then(function(t) {
+                var d = null;
+                try {
+                  d = t && t.length ? JSON.parse(t) : null;
+                } catch (parseErr) {
+                  return {
+                    ok: false,
+                    data: {
+                      error:
+                        'Server response was not JSON (HTTP ' +
+                        r.status +
+                        '). ' +
+                        (t && t.length ? t.slice(0, 120).replace(/\\s+/g, ' ') : ''),
+                    },
+                  };
+                }
+                return { ok: r.ok, data: d };
+              });
+            })
+            .then(function(o) {
+              picturesBtn.disabled = false;
+              if (!msgEl) return;
+              msgEl.style.display = 'block';
+              if (o.ok && o.data && o.data.ok) {
+                msgEl.style.color = '#7ee787';
+                var lines = ['Imported ' + (o.data.imported || 0) + ' new entr' + ((o.data.imported || 0) === 1 ? 'y' : 'ies') + '.'];
+                if (o.data.overwritten) {
+                  lines.push('Updated ' + o.data.overwritten + ' existing (same primary key).');
+                }
+                if (o.data.skippedDuplicates) {
+                  lines.push('Skipped ' + o.data.skippedDuplicates + ' (duplicate primary key).');
+                }
+                if (o.data.failed) lines.push('Failed: ' + o.data.failed + ' file(s).');
+                if (o.data.rowErrors && o.data.rowErrors.length) {
+                  lines.push('');
+                  o.data.rowErrors.forEach(function(err) {
+                    lines.push(String(err.row) + ': ' + err.message);
+                  });
+                }
+                msgEl.textContent = lines.join(String.fromCharCode(10));
+              } else {
+                msgEl.style.color = '#f85149';
+                msgEl.textContent = (o.data && o.data.error) ? o.data.error : 'Import failed';
+              }
+            })
+            .catch(function(e) {
+              picturesBtn.disabled = false;
+              if (msgEl) {
+                msgEl.style.display = 'block';
+                msgEl.style.color = '#f85149';
+                msgEl.textContent = e.message || 'Request failed';
+              }
+            });
+        });
+      }
     })();
   </script>
 </body>
@@ -11965,8 +13209,9 @@ function renderConfigExportImportPage(profiles, appUi) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const profileOptions = profiles.length
-    ? '<option value="">— Select database —</option>' + profiles.map((p) => `<option value="${escapeHtml(p._id)}">${escapeHtml(p.name || p._id)}</option>`).join("")
-    : '<option value="">No databases</option>';
+    ? '<option value="__app__">Elenko App Design</option><option value="">— Select database —</option>' +
+        profiles.map((p) => `<option value="${escapeHtml(p._id)}">${escapeHtml(p.name || p._id)}</option>`).join("")
+    : '<option value="__app__">Elenko App Design</option><option value="">No databases</option>';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11997,6 +13242,23 @@ function renderConfigExportImportPage(profiles, appUi) {
       border: 1px solid transparent;
     }
     .actions .back-nav:hover { text-decoration: underline; background: var(--app-bg, #0f1419); color: var(--app-link, #58a6ff); }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .section { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--app-table-border, #30363d); }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
@@ -12148,6 +13410,7 @@ function renderConfigExportImportPage(profiles, appUi) {
           var parts = [
             'profiles: ' + c.profiles,
             'forms: ' + c.entryForms,
+            'linked queries: ' + c.queries,
             'flows: ' + c.flows,
             'APIs: ' + c.apis,
             'JS Processing: ' + c.jsProcessing
@@ -12339,10 +13602,28 @@ function renderManageUsersPage(users, currentUsername, appUi) {
     .btn:hover { background: #2ea043; text-decoration: none; }
     a.btn:not(.btn-secondary) { color: #fff; }
     a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
+    .actions { margin-bottom: 1rem; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
   </style>
 </head>
 <body>
-  <div><a href="/">← Profiles</a> <a href="/account/users/create" class="btn">Create user</a></div>
+  <div class="actions"><a href="/">← Profiles</a> <a href="/account/users/create" class="btn">Create user</a></div>
   <h1>Manage users</h1>
   <p class="sub">Change role, set password, or delete users.</p>
   <table>
