@@ -52,7 +52,7 @@ function runScriptInSandbox(script, input, timeoutMs) {
 }
 
 parentPort.on("message", (msg) => {
-  if (!msg || msg.kind !== "scriptRequest") return;
+  if (!msg || msg.type !== "scriptRequest") return;
   const { requestId, script, input, timeoutMs } = msg;
 
   const result = runScriptInSandbox(script, input, timeoutMs);
@@ -78,7 +78,7 @@ parentPort.on("message", (msg) => {
   // Node will throw on postMessage. We catch and fall back to a JSON-safe representation.
   try {
     parentPort.postMessage({
-      kind: "scriptResponse",
+      type: "scriptResponse",
       requestId,
       returnValue: safeReturnValue,
       output: outputEnum,
@@ -99,7 +99,7 @@ parentPort.on("message", (msg) => {
       jsonSafeReturn = String(safeReturnValue);
     }
     parentPort.postMessage({
-      kind: "scriptResponse",
+      type: "scriptResponse",
       requestId,
       returnValue: jsonSafeReturn,
       output: jsonSafeOutput,

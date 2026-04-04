@@ -43,7 +43,7 @@ try {
   scriptWorker.on("error", (err) => {
     // Forward to main via a flow log message; also surface errors to stderr.
     parentPort.postMessage({
-      kind: "scriptWorker.error",
+      type: "scriptWorker.error",
       error: err && err.message ? err.message : String(err),
     });
     console.error("Flow worker: scriptWorker error:", err);
@@ -59,10 +59,9 @@ function writeNext() {
   if (writing || queue.length === 0) return;
   writing = true;
   const msg = queue.shift();
-
   const line = JSON.stringify({
     ...msg,
-    ts: msg.ts || new Date().toISOString(),
+    ts: (msg && msg.ts) || new Date().toISOString(),
   }) + "\n";
 
   fs.appendFile(logFile, line, (err) => {
@@ -77,7 +76,7 @@ function writeNext() {
 
 // Log startup and current debug level to the flow log
 queue.push({
-  kind: "flowWorker.start",
+  type: "flowWorker.start",
   payload: envStatus === ".env not found" ? { debug, env: envStatus, envPath } : { debug, env: envStatus },
   ts: new Date().toISOString(),
 });
@@ -88,17 +87,17 @@ if (!parentPort) {
 }
 
 parentPort.on("message", (msg) => {
-  const kind = msg && msg.kind ? msg.kind : "";
-  const skipLogging = kind === "flow.scriptRequest" || kind === "flow.scriptResponse";
+  const eventType = msg && msg.type ? msg.type : "";
+  const skipLogging = eventType === "flow.scriptRequest" || eventType === "flow.scriptResponse";
   if (debug && !skipLogging) {
     queue.push(msg);
     writeNext();
   }
 
-  if (kind === "flow.scriptRequest") {
+  if (eventType === "flow.scriptRequest") {
     if (!scriptWorker) {
       parentPort.postMessage({
-        kind: "flow.scriptResponse",
+        type: "flow.scriptResponse",
         requestId: msg.payload && msg.payload.requestId,
         returnValue: undefined,
         output: {},
@@ -109,7 +108,7 @@ parentPort.on("message", (msg) => {
     }
     try {
       scriptWorker.postMessage({
-        kind: "scriptRequest",
+        type: "scriptRequest",
         requestId: msg.payload && msg.payload.requestId,
         script: msg.payload && msg.payload.script,
         input: msg.payload && msg.payload.input,
@@ -117,7 +116,7 @@ parentPort.on("message", (msg) => {
       });
     } catch (err) {
       parentPort.postMessage({
-        kind: "flow.scriptResponse",
+        type: "flow.scriptResponse",
         requestId: msg.payload && msg.payload.requestId,
         returnValue: undefined,
         output: {},
@@ -129,30 +128,30 @@ parentPort.on("message", (msg) => {
   }
 
   // Response messages produced by scriptWorker are forwarded to main as flow.scriptResponse.
-  if (kind === "scriptResponse") return;
+  if (eventType === "scriptResponse") return;
 
   const target = msg.payload && msg.payload.target;
-  if (msg.kind === "entry.sendToFlow" && target === "localDb") {
+  if (msg.type === "entry.sendToFlow" && target === "localDb") {
     parentPort.postMessage({
-      kind: "createEntryInProfile",
+      type: "createEntryInProfile",
       targetProfileId: (msg.payload.param != null ? String(msg.payload.param) : "").trim(),
       sourceDocId: msg.payload.entryId,
       dataset: msg.payload.dataset,
     });
     return;
   }
-  if (msg.kind === "entry.sendToFlow" && target === "response") {
+  if (msg.type === "entry.sendToFlow" && target === "response") {
     parentPort.postMessage({
-      kind: "createResponseInProfile",
+      type: "createResponseInProfile",
       sourceDocId: msg.payload.entryId,
       profileId: msg.payload.profileId,
       dataset: msg.payload.dataset,
     });
     return;
   }
-  if (msg.kind === "entry.sendToFlow" && target === "api") {
+  if (msg.type === "entry.sendToFlow" && target === "api") {
     parentPort.postMessage({
-      kind: "callApi",
+      type: "callApi",
       apiDocId: (msg.payload.param != null ? String(msg.payload.param) : "").trim(),
       entryId: msg.payload.entryId,
       profileId: msg.payload.profileId,
@@ -168,9 +167,9 @@ parentPort.on("message", (msg) => {
 
 if (scriptWorker) {
   scriptWorker.on("message", (msg) => {
-    if (!msg || msg.kind !== "scriptResponse") return;
+    if (!msg || msg.type !== "scriptResponse") return;
     parentPort.postMessage({
-      kind: "flow.scriptResponse",
+      type: "flow.scriptResponse",
       requestId: msg.requestId,
       returnValue: msg.returnValue,
       output: msg.output && typeof msg.output === "object" ? msg.output : {},
@@ -179,4 +178,3 @@ if (scriptWorker) {
     });
   });
 }
-

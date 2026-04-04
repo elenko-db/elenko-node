@@ -62,6 +62,9 @@ const IO_DIR = process.env.IO_DIR || path.join(__dirname, "io");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const CONFIG_BACKUPS_DIR = path.join(PUBLIC_DIR, "backups");
 const MAX_ENTRIES_PER_PROFILE = 500000;
+/** Max elenko_records deleted in one flow "purge old" step (safety cap). */
+const PURGE_OLD_MAX_DELETE = 500;
+const PURGE_OLD_MS_PER_DAY = 24 * 60 * 60 * 1000;
 const ENTRIES_PAGE_SIZE = 25;
 const ENTRIES_PAGE_SIZE_MIN = 5;
 const ENTRIES_PAGE_SIZE_MAX = 200;
@@ -370,7 +373,182 @@ function normalizeEntryFieldType(raw) {
   if (s === "markdown") return "markdown";
   if (s === "url") return "url";
   if (s === "image") return "image";
+  if (s === "chart") return "chart";
   return "text";
+}
+
+/** Cap for Chart field series length (request/DoS guard). */
+const ENTRY_CHART_MAX_POINTS = 25000;
+
+/**
+ * Chart field JSON — version 1
+ *
+ * Full object:
+ *   {
+ *     "version": 1,
+ *     "chartType": "line" | "bar" | "scatter",
+ *     "title": "optional",
+ *     "xAxis": { "title": "X axis", "values": [ ... ] },
+ *     "yAxis": { "title": "Y axis", "values": [ ... ] },
+ *     "heightPx": 280
+ *   }
+ * - yAxis.values (or top-level "y") is required. xAxis.values optional; if omitted, X labels are "0" .. "n-1".
+ * - Lengths of xAxis.values and yAxis.values must match when xAxis.values is present.
+ * - scatter: xAxis.values required; all entries must be finite numbers (linear X scale).
+ * - heightPx: optional canvas container height (120..900).
+ * Shorthand: a JSON array of numbers is treated as y values (line chart, index labels).
+ *
+ * @returns {{ ok: true, spec: object } | { ok: false, error: string }}
+ */
+function normalizeEntryChartSpec(parsed) {
+  let obj = parsed;
+  if (obj != null && Array.isArray(obj)) {
+    const y = [];
+    for (const v of obj) {
+      const n = Number(v);
+      if (Number.isFinite(n)) y.push(n);
+    }
+    if (y.length === 0) return { ok: false, error: "Array has no numeric y values." };
+    if (y.length > ENTRY_CHART_MAX_POINTS) return { ok: false, error: "Too many data points." };
+    return {
+      ok: true,
+      spec: {
+        chartType: "line",
+        title: "",
+        heightPx: 280,
+        xTitle: "Index",
+        yTitle: "Value",
+        labels: y.map((_, i) => String(i)),
+        xNumeric: null,
+        y,
+      },
+    };
+  }
+  if (!obj || typeof obj !== "object") return { ok: false, error: "Chart field must be a JSON object or number array." };
+
+  const ver = obj.version == null ? 1 : Number(obj.version);
+  if (!Number.isFinite(ver) || ver !== 1) return { ok: false, error: "Unsupported chart version (use 1)." };
+
+  const ctRaw = String(obj.chartType || "line").trim().toLowerCase();
+  const chartType = ctRaw === "bar" || ctRaw === "scatter" ? ctRaw : "line";
+
+  const title = obj.title != null ? String(obj.title) : "";
+
+  let yVals = [];
+  if (obj.yAxis && Array.isArray(obj.yAxis.values)) {
+    for (const v of obj.yAxis.values) {
+      const n = Number(v);
+      if (Number.isFinite(n)) yVals.push(n);
+      else return { ok: false, error: "yAxis.values must be numeric." };
+    }
+  } else if (Array.isArray(obj.y)) {
+    for (const v of obj.y) {
+      const n = Number(v);
+      if (Number.isFinite(n)) yVals.push(n);
+      else return { ok: false, error: "y must be numeric." };
+    }
+  }
+  if (yVals.length === 0) return { ok: false, error: "Missing yAxis.values or y array." };
+  if (yVals.length > ENTRY_CHART_MAX_POINTS) return { ok: false, error: "Too many data points." };
+
+  const xa = obj.xAxis && typeof obj.xAxis === "object" ? obj.xAxis : null;
+  const xTitle = xa && xa.title != null ? String(xa.title) : chartType === "scatter" ? "X" : "";
+  const yTitle =
+    obj.yAxis && typeof obj.yAxis === "object" && obj.yAxis.title != null ? String(obj.yAxis.title) : "Y";
+
+  let heightPx = 280;
+  if (obj.heightPx != null) {
+    const h = Number(obj.heightPx);
+    if (Number.isFinite(h) && h >= 120 && h <= 900) heightPx = Math.round(h);
+  }
+
+  if (chartType === "scatter") {
+    if (!xa || !Array.isArray(xa.values) || xa.values.length === 0) {
+      return { ok: false, error: "scatter requires xAxis.values (numeric, same length as y)." };
+    }
+    if (xa.values.length !== yVals.length) return { ok: false, error: "x and y length mismatch." };
+    const xNumeric = [];
+    for (const v of xa.values) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return { ok: false, error: "scatter requires numeric xAxis.values." };
+      xNumeric.push(n);
+    }
+    return {
+      ok: true,
+      spec: { chartType: "scatter", title, heightPx, xTitle, yTitle, labels: null, xNumeric, y: yVals },
+    };
+  }
+
+  let labels;
+  if (xa && Array.isArray(xa.values)) {
+    if (xa.values.length !== yVals.length) return { ok: false, error: "x and y length mismatch." };
+    labels = xa.values.map((v) => (v == null ? "" : String(v)));
+  } else {
+    labels = yVals.map((_, i) => String(i));
+  }
+
+  return {
+    ok: true,
+    spec: {
+      chartType,
+      title,
+      heightPx,
+      xTitle,
+      yTitle,
+      labels,
+      xNumeric: null,
+      y: yVals,
+    },
+  };
+}
+
+function escapeJsonForInlineScript(jsonStr) {
+  return String(jsonStr).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+}
+
+function entryChartDomSlug(fieldName) {
+  return "elenko_ch_" + String(fieldName || "chart").replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function formatEntryChartFieldHtml(fieldName, value) {
+  if (value == null || String(value).trim() === "") {
+    return '<p class="empty">No chart data.</p>';
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(String(value));
+  } catch {
+    return '<p class="entry-chart-error">Invalid JSON in chart field.</p>';
+  }
+  const norm = normalizeEntryChartSpec(parsed);
+  if (!norm.ok) {
+    return '<p class="entry-chart-error">' + escapeHtml(norm.error) + "</p>";
+  }
+  const spec = norm.spec;
+  const slug = entryChartDomSlug(fieldName);
+  const canvasId = slug + "_canvas";
+  const specId = slug + "_spec";
+  const h = spec.heightPx || 280;
+  const payload = escapeJsonForInlineScript(JSON.stringify(spec));
+  return (
+    '<div class="entry-chart-mount" data-elenko-chart="1" style="height:' +
+    escapeHtml(String(h)) +
+    'px;position:relative;width:100%;min-width:0;max-width:100%;">' +
+    '<canvas class="entry-chart-canvas" id="' +
+    escapeHtml(canvasId) +
+    '" aria-label="' +
+    escapeHtml(spec.title || "Chart") +
+    '"></canvas>' +
+    '<script type="application/json" class="entry-chart-spec" id="' +
+    escapeHtml(specId) +
+    '">' +
+    payload +
+    "</script></div>"
+  );
+}
+
+function entryViewChartInitScript() {
+  return `(function(){function tc(){var b=document.body;return b&&(getComputedStyle(b).color||"").trim()||"#e6edf3";}function cfg(spec){var textColor=tc(),grid="rgba(139,148,158,0.28)";var titlePl=spec.title?{display:true,text:spec.title,color:textColor,font:{size:14}}:{display:false};var legendPl={labels:{color:textColor}};var axisTitle=function(t){return{display:!!(t&&String(t).trim()),text:t||"",color:textColor,font:{size:11}};};if(spec.chartType==="scatter"){return{type:"scatter",data:{datasets:[{label:spec.title||spec.yTitle||"Y",data:spec.xNumeric.map(function(x,i){return{x:x,y:spec.y[i]};}),borderColor:"#58a6ff",backgroundColor:"rgba(88,166,255,0.45)",pointRadius:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:legendPl,title:titlePl},scales:{x:{type:"linear",title:axisTitle(spec.xTitle),grid:{color:grid},ticks:{color:textColor}},y:{title:axisTitle(spec.yTitle),grid:{color:grid},ticks:{color:textColor}}}}};}var fill=spec.chartType==="line";return{type:spec.chartType==="bar"?"bar":"line",data:{labels:spec.labels,datasets:[{label:spec.title||spec.yTitle||"Y",data:spec.y,borderColor:"#58a6ff",backgroundColor:spec.chartType==="bar"?"rgba(88,166,255,0.55)":"rgba(88,166,255,0.12)",fill:fill,tension:0.15}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:legendPl,title:titlePl},scales:{x:{title:axisTitle(spec.xTitle),grid:{color:grid},ticks:{color:textColor,maxRotation:45,minRotation:0}},y:{title:axisTitle(spec.yTitle),grid:{color:grid},ticks:{color:textColor}}}}};}function run(){if(typeof Chart==="undefined")return;document.querySelectorAll(".entry-chart-mount[data-elenko-chart]").forEach(function(mount){var specEl=mount.querySelector('script.entry-chart-spec[type="application/json"]');var canvas=mount.querySelector("canvas.entry-chart-canvas");if(!specEl||!canvas)return;var spec;try{spec=JSON.parse(specEl.textContent||"{}");}catch(e){return;}var prev=typeof Chart.getChart==="function"?Chart.getChart(canvas):null;if(prev)prev.destroy();try{new Chart(canvas,cfg(spec));}catch(e){}});}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",run);else run();})();`;
 }
 
 /** Safe attachment name for CouchDB (basename, no path segments). */
@@ -735,6 +913,10 @@ function makeUniqueFlowCopyName(originalName, existingNames) {
   return makeUniqueCopyOfLabel(originalName, existingNames, "flow");
 }
 
+function makeUniqueTimerCopyName(originalName, existingNames) {
+  return makeUniqueCopyOfLabel(originalName, existingNames, "timer");
+}
+
 function makeUniqueApiCopyName(originalName, existingNames) {
   return makeUniqueCopyOfLabel(originalName, existingNames, "API");
 }
@@ -759,19 +941,24 @@ function buildJsProcessingDocFromSource(baseDoc, name) {
 
 /** New elenko_api document from an existing API (new _id; apiKeyRef cleared). */
 function buildApiDocFromSource(baseApi, name) {
+  const authT = normalizeElenkoApiAuthType(baseApi);
   return {
     type: "elenko_api",
     name,
     description: typeof baseApi.description === "string" ? baseApi.description.trim() : "",
     url: typeof baseApi.url === "string" ? baseApi.url.trim() : "",
     method: baseApi.method === "POST" || baseApi.method === "PUT" || baseApi.method === "PATCH" ? baseApi.method : "GET",
+    apiAuthType: authT,
     apiKeyRef: "",
+    apiUserRef: "",
+    apiPasswordRef: "",
     responseTarget:
       baseApi.responseTarget === "create" ? "create" : baseApi.responseTarget === "forward" ? "forward" : "update",
     template: typeof baseApi.template === "string" ? baseApi.template.trim() : "",
     responseField: typeof baseApi.responseField === "string" ? baseApi.responseField.trim() : "",
     responseStart: typeof baseApi.responseStart === "string" ? baseApi.responseStart : "",
     responseEnd: typeof baseApi.responseEnd === "string" ? baseApi.responseEnd : "",
+    ...(typeof baseApi.getQueryFromEntry === "boolean" ? { getQueryFromEntry: baseApi.getQueryFromEntry } : {}),
   };
 }
 
@@ -783,6 +970,157 @@ function buildFlowDocFromSource(baseFlow, name) {
     description: typeof baseFlow.description === "string" ? baseFlow.description.trim() : "",
     steps: normalizeFlowSteps(baseFlow.steps || []),
   };
+}
+
+/** Repeat interval keys for elenko_timer.intervalKey (milliseconds). */
+const TIMER_INTERVAL_MS = {
+  m10: 10 * 60 * 1000,
+  m20: 20 * 60 * 1000,
+  m30: 30 * 60 * 1000,
+  h1: 60 * 60 * 1000,
+  h2: 2 * 60 * 60 * 1000,
+  h6: 6 * 60 * 60 * 1000,
+  h12: 12 * 60 * 60 * 1000,
+  h24: 24 * 60 * 60 * 1000,
+  w1: 7 * 24 * 60 * 60 * 1000,
+};
+
+const TIMER_INTERVAL_LABEL = {
+  m10: "Every 10 minutes",
+  m20: "Every 20 minutes",
+  m30: "Every 30 minutes",
+  h1: "Every hour",
+  h2: "Every 2 hours",
+  h6: "Every 6 hours",
+  h12: "Every 12 hours",
+  h24: "Every 24 hours",
+  w1: "Every week",
+};
+
+/** Stable order for timer interval dropdowns. */
+const TIMER_INTERVAL_ORDER = ["m10", "m20", "m30", "h1", "h2", "h6", "h12", "h24", "w1"];
+
+function normalizeTimerIntervalMs(key) {
+  const k = typeof key === "string" ? key.trim() : "";
+  const v = TIMER_INTERVAL_MS[k];
+  return typeof v === "number" && v >= 60000 ? v : TIMER_INTERVAL_MS.h1;
+}
+
+function normalizeTimerIntervalKeyString(k) {
+  const x = typeof k === "string" ? k.trim() : "";
+  return TIMER_INTERVAL_MS[x] ? x : "h1";
+}
+
+function defaultTimerStartDateLocal() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function defaultTimerStartTimeNextHourLocal() {
+  const d = new Date();
+  d.setMinutes(0, 0, 0);
+  d.setHours(d.getHours() + 1);
+  const hh = String(d.getHours()).padStart(2, "0");
+  return `${hh}:00`;
+}
+
+/** Interpret date + time in server local timezone. @returns {number} ms or NaN */
+function parseTimerLocalDateTimeMs(dateStr, timeStr) {
+  const ds = typeof dateStr === "string" ? dateStr.trim() : "";
+  const ts = typeof timeStr === "string" ? timeStr.trim() : "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ds)) return NaN;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(ts);
+  if (!m) return NaN;
+  const hh = parseInt(m[1], 10);
+  const mm = parseInt(m[2], 10);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm) || mm < 0 || mm > 59 || hh < 0 || hh > 23) return NaN;
+  const tnorm = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+  const inst = new Date(`${ds}T${tnorm}:00`);
+  return inst.getTime();
+}
+
+function timerDocumentToWorkerPayload(doc) {
+  if (!doc || doc.type !== "elenko_timer" || !doc._id) return null;
+  const anchorMs = parseTimerLocalDateTimeMs(doc.startDate, doc.startTime);
+  if (!Number.isFinite(anchorMs)) return null;
+  const intervalMs = normalizeTimerIntervalMs(doc.intervalKey);
+  const flowId = typeof doc.flowId === "string" ? doc.flowId.trim() : "";
+  const profileId = typeof doc.profileId === "string" ? doc.profileId.trim() : "";
+  if (!flowId || !profileId) return null;
+  return {
+    id: doc._id,
+    active: !!(doc.active === true || doc.active === "true"),
+    anchorMs,
+    intervalMs,
+    flowId,
+    profileId,
+    entryId: typeof doc.entryId === "string" ? doc.entryId.trim() : "",
+    param: typeof doc.param === "string" ? doc.param.trim() : "",
+  };
+}
+
+function normalizeTimerCreateBody(body) {
+  const out = {};
+  out.name = typeof body.name === "string" ? body.name.trim() : "";
+  out.description = typeof body.description === "string" ? body.description.trim() : "";
+  out.flowId = typeof body.flowId === "string" ? body.flowId.trim() : "";
+  out.profileId = typeof body.profileId === "string" ? body.profileId.trim() : "";
+  out.entryId = typeof body.entryId === "string" ? body.entryId.trim() : "";
+  out.param = typeof body.param === "string" ? body.param.trim() : "";
+  out.startDate =
+    typeof body.startDate === "string" && body.startDate.trim() ? body.startDate.trim() : defaultTimerStartDateLocal();
+  out.startTime =
+    typeof body.startTime === "string" && body.startTime.trim()
+      ? body.startTime.trim()
+      : defaultTimerStartTimeNextHourLocal();
+  out.intervalKey = normalizeTimerIntervalKeyString(body.intervalKey);
+  out.active = !!(body.active === true || body.active === "true" || body.active === "on");
+  return out;
+}
+
+/** New elenko_timer from an existing timer (new _id on insert). */
+function buildTimerDocFromSource(baseTimer, name) {
+  return {
+    type: "elenko_timer",
+    name,
+    description: typeof baseTimer.description === "string" ? baseTimer.description.trim() : "",
+    flowId: typeof baseTimer.flowId === "string" ? baseTimer.flowId.trim() : "",
+    profileId: typeof baseTimer.profileId === "string" ? baseTimer.profileId.trim() : "",
+    entryId: typeof baseTimer.entryId === "string" ? baseTimer.entryId.trim() : "",
+    param: typeof baseTimer.param === "string" ? baseTimer.param.trim() : "",
+    startDate: typeof baseTimer.startDate === "string" && baseTimer.startDate.trim()
+      ? baseTimer.startDate.trim()
+      : defaultTimerStartDateLocal(),
+    startTime:
+      typeof baseTimer.startTime === "string" && baseTimer.startTime.trim()
+        ? baseTimer.startTime.trim()
+        : defaultTimerStartTimeNextHourLocal(),
+    intervalKey: normalizeTimerIntervalKeyString(baseTimer.intervalKey),
+    active: !!(baseTimer.active === true || baseTimer.active === "true"),
+  };
+}
+
+/** Flow log line when an active timer is persisted (create / update / copy). */
+function sendFlowMessageTimerSaved(action, timerId, fields) {
+  if (!fields || !fields.active) return;
+  const tid = timerId != null ? String(timerId).trim() : "";
+  if (!tid) return;
+  sendFlowMessage("timer.saved", {
+    action,
+    timerId: tid,
+    name: fields.name,
+    flowId: fields.flowId,
+    profileId: fields.profileId,
+    entryId: fields.entryId || "",
+    param: fields.param || "",
+    intervalKey: fields.intervalKey,
+    startDate: fields.startDate,
+    startTime: fields.startTime,
+    active: true,
+  });
 }
 
 function makeUniqueProfileCopyName(originalName, existingNames) {
@@ -882,12 +1220,82 @@ function normalizeFlowSteps(steps) {
           ? "update"
           : t === "create"
           ? "create"
+          : t === "purgeOld"
+          ? "purgeOld"
           : "log";
       const param = typeof (s && s.param) === "string" ? s.param.trim() : "";
       const label = typeof (s && s.label) === "string" ? s.label.trim() : "";
       return { target, param, label: label || target };
     })
     .filter(Boolean);
+}
+
+/** Purge Param: only days (d) or weeks (w), e.g. 7d, 2w. Minimum 1. */
+function parsePurgeOldAgeParam(param) {
+  const s = typeof param === "string" ? param.trim().toLowerCase() : "";
+  const m = /^(\d+)(d|w)$/.exec(s);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n < 1) return null;
+  const unit = m[2];
+  const ageMs = unit === "w" ? n * 7 * PURGE_OLD_MS_PER_DAY : n * PURGE_OLD_MS_PER_DAY;
+  return { ageMs, label: s };
+}
+
+/**
+ * Delete up to PURGE_OLD_MAX_DELETE elenko_record docs in profile with createdAt strictly before cutoff.
+ */
+async function purgeOldEntriesInProfile(dbInstance, profileId, parsed, stepIndex) {
+  const pid = (profileId != null ? String(profileId) : "").trim();
+  const emptyResult = { deleted: 0, capped: false };
+  if (!pid || !dbInstance || !parsed) return emptyResult;
+  const cutoffIso = new Date(Date.now() - parsed.ageMs).toISOString();
+  let deleted = 0;
+  let capped = false;
+  try {
+    const result = await dbInstance.find({
+      selector: {
+        type: "elenko_record",
+        profileId: pid,
+        createdAt: { $lt: cutoffIso },
+      },
+      limit: PURGE_OLD_MAX_DELETE + 1,
+      fields: ["_id", "_rev", "type", "profileId", "createdAt"],
+    });
+    let docs = result.docs || [];
+    if (docs.length > PURGE_OLD_MAX_DELETE) {
+      capped = true;
+      docs = docs.slice(0, PURGE_OLD_MAX_DELETE);
+    }
+    for (const doc of docs) {
+      if (!doc || doc.type !== "elenko_record" || doc.profileId !== pid || !doc._id || !doc._rev) continue;
+      try {
+        await dbInstance.destroy(doc._id, doc._rev);
+        deleted++;
+      } catch (e) {
+        console.error("purgeOldEntriesInProfile destroy:", doc._id, e);
+      }
+    }
+    if (deleted > 0) clearProfileListCache(pid);
+    sendFlowMessage("flow.purgeOld", {
+      stepIndex,
+      profileId: pid,
+      param: parsed.label,
+      cutoffIso,
+      deleted,
+      capped,
+      maxPerRun: PURGE_OLD_MAX_DELETE,
+    });
+    return { deleted, capped };
+  } catch (e) {
+    sendFlowMessage("flow.purgeOldError", {
+      stepIndex,
+      profileId: pid,
+      param: parsed.label,
+      error: e && e.message ? String(e.message) : "Query or delete failed",
+    });
+    return emptyResult;
+  }
 }
 
 /** SHA-256 hash of script content for integrity verification when non-admin runs the flow. */
@@ -904,6 +1312,13 @@ function previewApiKey(apiKey) {
   return s.slice(0, 2) + "…" + s.slice(-2);
 }
 
+/** Flow log preview: never derive previews from username/password (treated as credential leaks). */
+function previewApiCredentialsForFlow(bundle) {
+  const t = bundle && bundle.authType ? String(bundle.authType).trim().toLowerCase() : "";
+  if (t === "digest" || t === "basic" || t === "fritz") return "";
+  return previewApiKey(bundle && bundle.apiKey != null ? bundle.apiKey : "");
+}
+
 function apiKeyLookupErrorInfo(err) {
   if (!err) return { message: "unknown error", code: "" };
   const message = err && err.message ? String(err.message) : String(err);
@@ -911,6 +1326,74 @@ function apiKeyLookupErrorInfo(err) {
     ? String(err.statusCode != null ? err.statusCode : err.code)
     : "";
   return { message, code };
+}
+
+/** Stored on `elenko_api.apiAuthType`. Legacy docs without it use bearer when `apiKeyRef` is set, else none. */
+function normalizeElenkoApiAuthType(apiDoc) {
+  const t = apiDoc && typeof apiDoc.apiAuthType === "string" ? apiDoc.apiAuthType.trim().toLowerCase() : "";
+  if (t === "none" || t === "bearer" || t === "basic" || t === "digest" || t === "fritz") return t;
+  const kr = apiDoc && typeof apiDoc.apiKeyRef === "string" ? apiDoc.apiKeyRef.trim() : "";
+  return kr ? "bearer" : "none";
+}
+
+function credentialFromElenkoKeyDoc(doc) {
+  if (!doc) return null;
+  if (doc.key != null) return String(doc.key);
+  if (doc.value != null) return String(doc.value);
+  return null;
+}
+
+/**
+ * Loads secrets for `apiWorker` from config DB. Used by pipeline and flow worker Call API.
+ * @returns {Promise<{ authType: string, apiKey: string | null, apiUsername: string | null, apiPassword: string | null, apiKeyRef: string, apiUserRef: string, apiPasswordRef: string }>}
+ */
+async function resolveApiWorkerAuthBundle(apiDoc) {
+  const authType = normalizeElenkoApiAuthType(apiDoc);
+  let apiKey = null;
+  let apiUsername = null;
+  let apiPassword = null;
+  let apiKeyRef = "";
+  let apiUserRef = "";
+  let apiPasswordRef = "";
+
+  async function loadRef(ref) {
+    if (!ref || !configDb) return { value: null, err: null, empty: false };
+    try {
+      const kd = await configDb.get(ref);
+      const v = credentialFromElenkoKeyDoc(kd);
+      if (v == null || v === "") return { value: null, err: null, empty: true };
+      return { value: v, err: null, empty: false };
+    } catch (e) {
+      return { value: null, err: e, empty: false };
+    }
+  }
+
+  if (authType === "bearer") {
+    apiKeyRef = apiDoc && typeof apiDoc.apiKeyRef === "string" ? apiDoc.apiKeyRef.trim() : "";
+    if (apiKeyRef) {
+      const r = await loadRef(apiKeyRef);
+      if (r.err) throw Object.assign(new Error("apiKeyRef"), { credentialField: "apiKeyRef", apiKeyRef, cause: r.err });
+      if (r.empty) throw Object.assign(new Error("emptyKey"), { credentialField: "apiKeyRef", apiKeyRef });
+      apiKey = r.value;
+    }
+  } else if (authType === "basic" || authType === "digest" || authType === "fritz") {
+    apiUserRef = apiDoc && typeof apiDoc.apiUserRef === "string" ? apiDoc.apiUserRef.trim() : "";
+    apiPasswordRef = apiDoc && typeof apiDoc.apiPasswordRef === "string" ? apiDoc.apiPasswordRef.trim() : "";
+    if (apiUserRef) {
+      const r = await loadRef(apiUserRef);
+      if (r.err) throw Object.assign(new Error("apiUserRef"), { credentialField: "apiUserRef", apiUserRef, cause: r.err });
+      if (r.empty) throw Object.assign(new Error("emptyKey"), { credentialField: "apiUserRef", apiUserRef });
+      apiUsername = r.value;
+    }
+    if (apiPasswordRef) {
+      const r = await loadRef(apiPasswordRef);
+      if (r.err) throw Object.assign(new Error("apiPasswordRef"), { credentialField: "apiPasswordRef", apiPasswordRef, cause: r.err });
+      if (r.empty) throw Object.assign(new Error("emptyKey"), { credentialField: "apiPasswordRef", apiPasswordRef });
+      apiPassword = r.value;
+    }
+  }
+
+  return { authType, apiKey, apiUsername, apiPassword, apiKeyRef, apiUserRef, apiPasswordRef };
 }
 
 function buildSortKey(record, sortKeyFields) {
@@ -1254,6 +1737,14 @@ async function createEntryInProfileFromContext(dbInstance, context, targetProfil
   const now = new Date().toISOString();
   record.createdAt = now;
   record.updatedAt = now;
+  const sources = Array.isArray(targetProfile.fieldDefaultSources) ? targetProfile.fieldDefaultSources : [];
+  const req = context && context.req;
+  for (let i = 0; i < fieldNames.length; i++) {
+    const src = sources[i];
+    if (src === "createdAt" || src === "updatedAt" || src === "currentUser") {
+      record[fieldNames[i]] = resolveDefaultValue(src, req);
+    }
+  }
   targetProfile = await ensureProfileDbCode8(dbInstance, targetProfile);
   const sortKeyFields = Array.isArray(targetProfile.sortKeyFields) ? targetProfile.sortKeyFields : [];
   record.sortKey = buildSortKey(record, sortKeyFields);
@@ -1328,6 +1819,21 @@ async function updateCurrentEntryFromDataset(dbInstance, context) {
   clearProfileListCache(profileId);
 }
 
+/** Subset of elenko_api sent to apiWorker (no secrets). */
+function apiDocPayloadForApiWorker(apiDoc) {
+  const o = {
+    url: apiDoc.url,
+    method: apiDoc.method,
+    responseTarget: apiDoc.responseTarget,
+    template: apiDoc.template,
+    responseField: apiDoc.responseField,
+    responseStart: apiDoc.responseStart,
+    responseEnd: apiDoc.responseEnd,
+  };
+  if (typeof apiDoc.getQueryFromEntry === "boolean") o.getQueryFromEntry = apiDoc.getQueryFromEntry;
+  return o;
+}
+
 /** Run a single API call and return a Promise that resolves with the response. Used by pipeline. */
 function runApiCallAndWait(apiDocId, context) {
   return new Promise((resolve, reject) => {
@@ -1340,7 +1846,7 @@ function runApiCallAndWait(apiDocId, context) {
         p.reject(new Error("API call timeout"));
       }
     }, 60000);
-    pendingApiRequests.set(requestId, { resolve, reject, timeoutId: timeout, apiKeyPreview: "" });
+    pendingApiRequests.set(requestId, { resolve, reject, timeoutId: timeout, apiKeyPreview: "", authType: "" });
     (async () => {
       try {
         if (!configDb || !apiWorker) {
@@ -1369,45 +1875,79 @@ function runApiCallAndWait(apiDocId, context) {
           if (p) { pendingApiRequests.delete(requestId); clearTimeout(timeout); p.reject(new Error("API doc not found: " + tid)); }
           return;
         }
-        let apiKey = null;
-        let apiKeyRef = "";
-        let apiKeyLookupError = null;
-        if (apiDoc.apiKeyRef && typeof apiDoc.apiKeyRef === "string" && apiDoc.apiKeyRef.trim()) {
-          apiKeyRef = apiDoc.apiKeyRef.trim();
-          try {
-            const keyDoc = await configDb.get(apiKeyRef);
-            if (keyDoc && (keyDoc.key != null || keyDoc.value != null)) apiKey = keyDoc.key != null ? String(keyDoc.key) : String(keyDoc.value);
-          } catch (e) {
-            apiKeyLookupError = e;
+        let bundle;
+        try {
+          bundle = await resolveApiWorkerAuthBundle(apiDoc);
+        } catch (credErr) {
+          const p = pendingApiRequests.get(requestId);
+          const field = credErr.credentialField || "apiKeyRef";
+          const ref =
+            credErr.apiKeyRef || credErr.apiUserRef || credErr.apiPasswordRef || "";
+          if (p) p.apiKeyPreview = previewApiKey("");
+          if (flowWorker) {
+            if (credErr.message === "emptyKey") {
+              sendFlowMessage("api.keyLookupError", {
+                entryId: context.entryId,
+                profileId: context.profileId,
+                apiKeyRef: ref,
+                credentialField: field,
+                code: "",
+                reason: "Credential document has no key/value field",
+              });
+            } else {
+              const info = apiKeyLookupErrorInfo(credErr.cause || credErr);
+              sendFlowMessage("api.keyLookupError", {
+                entryId: context.entryId,
+                profileId: context.profileId,
+                apiKeyRef: ref,
+                credentialField: field,
+                code: info.code,
+                reason: info.message,
+              });
+            }
+          }
+          if (p) {
+            pendingApiRequests.delete(requestId);
+            clearTimeout(timeout);
+            p.reject(new Error(credErr.message === "emptyKey" ? "Credential document has no key/value field" : "Credential lookup failed"));
+          }
+          return;
+        }
+        if (bundle.authType === "basic" || bundle.authType === "digest" || bundle.authType === "fritz") {
+          if (!bundle.apiUserRef || !bundle.apiPasswordRef) {
+            const p = pendingApiRequests.get(requestId);
+            if (p) p.apiKeyPreview = "";
+            if (flowWorker) {
+              sendFlowMessage("api.keyLookupError", {
+                entryId: context.entryId,
+                profileId: context.profileId,
+                apiKeyRef: "",
+                credentialField: !bundle.apiUserRef ? "apiUserRef" : "apiPasswordRef",
+                code: "",
+                reason: "Set username and password key document IDs for Basic or Digest auth.",
+              });
+            }
+            if (p) {
+              pendingApiRequests.delete(requestId);
+              clearTimeout(timeout);
+              p.reject(new Error("API auth requires username and password key documents"));
+            }
+            return;
           }
         }
         const p = pendingApiRequests.get(requestId);
-        if (p) p.apiKeyPreview = previewApiKey(apiKey);
-        if (flowWorker) {
-          if (apiKeyLookupError) {
-            const info = apiKeyLookupErrorInfo(apiKeyLookupError);
-            sendFlowMessage("api.keyLookupError", {
-              entryId: context.entryId,
-              profileId: context.profileId,
-              apiKeyRef: apiKeyRef || "",
-              code: info.code,
-              reason: info.message,
-            });
-          } else if (apiKeyRef && !apiKey) {
-            sendFlowMessage("api.keyLookupError", {
-              entryId: context.entryId,
-              profileId: context.profileId,
-              apiKeyRef,
-              code: "",
-              reason: "API key document has no key/value field",
-            });
-          }
+        if (p) {
+          p.apiKeyPreview = previewApiCredentialsForFlow(bundle);
+          p.authType = bundle.authType || "";
         }
         apiWorker.postMessage({
-          kind: "apiRequest",
+          type: "apiRequest",
           requestId,
-          apiDoc: { url: apiDoc.url, method: apiDoc.method, responseTarget: apiDoc.responseTarget, template: apiDoc.template, responseField: apiDoc.responseField, responseStart: apiDoc.responseStart, responseEnd: apiDoc.responseEnd },
-          apiKey,
+          apiDoc: apiDocPayloadForApiWorker(apiDoc),
+          authType: bundle.authType,
+          apiKey: bundle.apiKey,
+          apiUsername: bundle.apiUsername,
+          apiPassword: bundle.apiPassword,
           dataset: context.dataset,
           entryId: context.entryId,
           profileId: context.profileId,
@@ -1424,7 +1964,10 @@ function runApiCallAndWait(apiDocId, context) {
 async function runPipeline(context, flowDoc) {
   const steps = Array.isArray(flowDoc && flowDoc.steps) ? flowDoc.steps : [];
   let hasExplicitPersistStep = false;
-  const suppressSinglePersist = !!(context && context.suppressSinglePersist);
+  /** Skip update/response (need a current entry). Timer without entry uses this; guardian import always. */
+  const suppressPipelineEntryWrites = !!(context && context.suppressPipelineEntryWrites);
+  /** Skip stand-alone create step. Guardian import uses this so only script _createMany adds rows. */
+  const suppressPipelineCreate = !!(context && context.suppressPipelineCreate);
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const rawTarget = step && step.target;
@@ -1441,6 +1984,8 @@ async function runPipeline(context, flowDoc) {
         ? "update"
         : rawTarget === "create"
         ? "create"
+        : rawTarget === "purgeOld"
+        ? "purgeOld"
         : "log";
     if (target === "log") {
       sendFlowMessage("entry.sendToFlow", {
@@ -1454,13 +1999,13 @@ async function runPipeline(context, flowDoc) {
       continue;
     }
     if (target === "update") {
-      if (suppressSinglePersist) continue;
+      if (suppressPipelineEntryWrites) continue;
       hasExplicitPersistStep = true;
       await updateCurrentEntryFromDataset(db, context);
       continue;
     }
     if (target === "create") {
-      if (suppressSinglePersist) continue;
+      if (suppressPipelineCreate) continue;
       hasExplicitPersistStep = true;
       if (context.profileId && db) {
         const created = await createEntryInProfileFromContext(db, context, context.profileId);
@@ -1469,12 +2014,42 @@ async function runPipeline(context, flowDoc) {
       continue;
     }
     if (target === "response") {
-      if (suppressSinglePersist) continue;
+      if (suppressPipelineEntryWrites) continue;
       hasExplicitPersistStep = true;
       if (context.profileId && context.entryId && db) {
         const created = await createResponseEntryFromContext(db, context, context.entryId);
         context.dataset = { ...(context.dataset || {}), _lastCreatedId: created._id, _lastResponseId: created._id };
       }
+      continue;
+    }
+    if (target === "purgeOld") {
+      const param = (step && typeof step.param === "string") ? step.param.trim() : "";
+      const parsed = parsePurgeOldAgeParam(param);
+      if (!parsed) {
+        sendFlowMessage("flow.purgeOldError", {
+          stepIndex: i,
+          error: 'Invalid Param: use age only, e.g. 7d or 2w (days or weeks; minimum 1).',
+          param,
+          profileId: context.profileId,
+        });
+        continue;
+      }
+      const profileIdFlow = context.profileId != null ? String(context.profileId).trim() : "";
+      if (!profileIdFlow || !db) {
+        sendFlowMessage("flow.purgeOldError", {
+          stepIndex: i,
+          error: "Missing profile or database in flow context.",
+          param: parsed.label,
+          profileId: context.profileId,
+        });
+        continue;
+      }
+      const purgeRes = await purgeOldEntriesInProfile(db, profileIdFlow, parsed, i);
+      context.dataset = {
+        ...(context.dataset || {}),
+        _lastPurgeDeleted: purgeRes.deleted,
+        _lastPurgeCapped: purgeRes.capped,
+      };
       continue;
     }
     if (target === "script") {
@@ -1580,6 +2155,7 @@ const SALT_LEN = 16;
 const KEY_LEN = 32;
 
 let flowWorker;
+let timerWorker;
 let apiWorker;
 
 // Forward *server.js* console errors to the flow log as well.
@@ -1617,7 +2193,7 @@ function runScriptInFlowWorker(script, input, timeoutMs) {
 
     try {
       flowWorker.postMessage({
-        kind: "flow.scriptRequest",
+        type: "flow.scriptRequest",
         payload: {
           requestId,
           script,
@@ -1636,46 +2212,204 @@ function runScriptInFlowWorker(script, input, timeoutMs) {
 
 let cachedAppConfig = null;
 let cachedAppConfigLoadedAt = 0;
+/** False after a failed configDb read so the next request retries instead of using the 30s TTL. */
+let cachedAppConfigAuthoritative = false;
+
+function invalidateAppUiConfigCache() {
+  cachedAppConfig = null;
+  cachedAppConfigLoadedAt = 0;
+  cachedAppConfigAuthoritative = false;
+}
+
+function defaultAppUiConfigObject() {
+  return {
+    theme: { ...DEFAULT_APP_THEME },
+    logoUrl: "",
+    logoWidth: 0,
+    logoHeight: 0,
+    loginTextAbove: "",
+    loginTextBelow: "",
+    couchdbPassword: "",
+    flowLogDisplayMode: "utc",
+    flowLogIana: "",
+    flowLogUtcOffsetMinutes: 0,
+    flowLogDockerAdjustMinutes: 0,
+  };
+}
 
 async function getAppUiConfig() {
   const now = Date.now();
-  if (cachedAppConfig && now - cachedAppConfigLoadedAt < 30000) return cachedAppConfig;
-  if (!configDb) {
-    cachedAppConfig = { theme: { ...DEFAULT_APP_THEME }, logoUrl: "", logoWidth: 0, logoHeight: 0, loginTextAbove: "", loginTextBelow: "", couchdbPassword: "" };
-    cachedAppConfigLoadedAt = now;
+  if (cachedAppConfig && cachedAppConfigAuthoritative && now - cachedAppConfigLoadedAt < 30000) {
     return cachedAppConfig;
   }
-  try {
-    const result = await configDb.find({
-      selector: { type: "elenko_app_config" },
-      limit: 1,
-    });
-    const doc = (result.docs && result.docs[0]) || null;
-    if (!doc) {
-      cachedAppConfig = { theme: { ...DEFAULT_APP_THEME }, logoUrl: "", logoWidth: 0, logoHeight: 0, loginTextAbove: "", loginTextBelow: "", couchdbPassword: "" };
-    } else {
-      const theme = normalizeAppTheme(doc.theme);
-      cachedAppConfig = {
-        _id: doc._id,
-        _rev: doc._rev,
-        theme,
-        logoUrl: typeof doc.logoUrl === "string" ? doc.logoUrl.trim() : "",
-        logoWidth: Number.isFinite(doc.logoWidth) ? doc.logoWidth : 0,
-        logoHeight: Number.isFinite(doc.logoHeight) ? doc.logoHeight : 0,
-        loginTextAbove: typeof doc.loginTextAbove === "string" ? doc.loginTextAbove.trim() : "",
-        loginTextBelow: typeof doc.loginTextBelow === "string" ? doc.loginTextBelow.trim() : "",
-        couchdbPassword: typeof doc.couchdbPassword === "string" ? doc.couchdbPassword : "",
-      };
-    }
-  } catch {
-    cachedAppConfig = { theme: { ...DEFAULT_APP_THEME }, logoUrl: "", logoWidth: 0, logoHeight: 0, loginTextAbove: "", loginTextBelow: "", couchdbPassword: "" };
+  if (!configDb) {
+    cachedAppConfig = defaultAppUiConfigObject();
+    cachedAppConfigLoadedAt = now;
+    cachedAppConfigAuthoritative = true;
+    ensureAppUiTimeFields(cachedAppConfig);
+    return cachedAppConfig;
   }
-  cachedAppConfigLoadedAt = now;
+
+  let loadError = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 200 * attempt));
+      const result = await configDb.find({
+        selector: { type: "elenko_app_config" },
+        limit: 1,
+      });
+      const doc = (result.docs && result.docs[0]) || null;
+      if (!doc) {
+        cachedAppConfig = defaultAppUiConfigObject();
+      } else {
+        const theme = normalizeAppTheme(doc.theme);
+        cachedAppConfig = {
+          _id: doc._id,
+          _rev: doc._rev,
+          theme,
+          logoUrl: typeof doc.logoUrl === "string" ? doc.logoUrl.trim() : "",
+          logoWidth: Number.isFinite(doc.logoWidth) ? doc.logoWidth : 0,
+          logoHeight: Number.isFinite(doc.logoHeight) ? doc.logoHeight : 0,
+          loginTextAbove: typeof doc.loginTextAbove === "string" ? doc.loginTextAbove.trim() : "",
+          loginTextBelow: typeof doc.loginTextBelow === "string" ? doc.loginTextBelow.trim() : "",
+          couchdbPassword: typeof doc.couchdbPassword === "string" ? doc.couchdbPassword : "",
+          flowLogDisplayMode: normalizeFlowLogDisplayMode(doc.flowLogDisplayMode),
+          flowLogIana: typeof doc.flowLogIana === "string" ? doc.flowLogIana.trim() : "",
+          flowLogUtcOffsetMinutes: parseBoundedInt(doc.flowLogUtcOffsetMinutes, 0, -840, 840),
+          flowLogDockerAdjustMinutes: parseBoundedInt(doc.flowLogDockerAdjustMinutes, 0, -10080, 10080),
+        };
+      }
+      cachedAppConfigLoadedAt = Date.now();
+      cachedAppConfigAuthoritative = true;
+      loadError = null;
+      break;
+    } catch (e) {
+      loadError = e;
+    }
+  }
+
+  if (loadError) {
+    console.warn("getAppUiConfig: failed to load elenko_app_config from CouchDB after retries:", loadError.message || loadError);
+    cachedAppConfigAuthoritative = false;
+    if (!cachedAppConfig) {
+      cachedAppConfig = defaultAppUiConfigObject();
+    }
+  }
+
   // Ensure new fields always present for older config docs or cache
   if (cachedAppConfig && typeof cachedAppConfig.loginTextAbove !== "string") cachedAppConfig.loginTextAbove = "";
   if (cachedAppConfig && typeof cachedAppConfig.loginTextBelow !== "string") cachedAppConfig.loginTextBelow = "";
   if (cachedAppConfig && typeof cachedAppConfig.couchdbPassword !== "string") cachedAppConfig.couchdbPassword = "";
+  if (cachedAppConfig) ensureAppUiTimeFields(cachedAppConfig);
   return cachedAppConfig;
+}
+
+const FLOW_LOG_DISPLAY_MODES = new Set(["utc", "iana", "utc_offset"]);
+
+function normalizeFlowLogDisplayMode(m) {
+  const s = typeof m === "string" ? m.trim().toLowerCase() : "";
+  return FLOW_LOG_DISPLAY_MODES.has(s) ? s : "utc";
+}
+
+function parseBoundedInt(v, def, min, max) {
+  const n = typeof v === "number" ? v : parseInt(String(v || "").trim(), 10);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(max, Math.max(min, n));
+}
+
+/** Ensure flow-log time settings exist on an app UI object (mutates). */
+function ensureAppUiTimeFields(obj) {
+  if (!obj || typeof obj !== "object") return;
+  obj.flowLogDisplayMode = normalizeFlowLogDisplayMode(obj.flowLogDisplayMode);
+  obj.flowLogIana = typeof obj.flowLogIana === "string" ? obj.flowLogIana.trim() : "";
+  obj.flowLogUtcOffsetMinutes = parseBoundedInt(obj.flowLogUtcOffsetMinutes, 0, -840, 840);
+  obj.flowLogDockerAdjustMinutes = parseBoundedInt(obj.flowLogDockerAdjustMinutes, 0, -10080, 10080);
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function pad3(n) {
+  return String(n).padStart(3, "0");
+}
+
+/** Civil time = UTC wall + fixed offset; ISO-like string with zone suffix ±HH:MM. */
+function formatInstantWithFixedUtcOffsetLabel(ms, offsetMinutes) {
+  const off = Math.round(offsetMinutes);
+  const d = new Date(ms);
+  const tic = Date.UTC(
+    d.getUTCFullYear(),
+    d.getUTCMonth(),
+    d.getUTCDate(),
+    d.getUTCHours(),
+    d.getUTCMinutes() + off,
+    d.getUTCSeconds(),
+    d.getUTCMilliseconds()
+  );
+  const c = new Date(tic);
+  const y = c.getUTCFullYear();
+  const mo = pad2(c.getUTCMonth() + 1);
+  const day = pad2(c.getUTCDate());
+  const h = pad2(c.getUTCHours());
+  const mi = pad2(c.getUTCMinutes());
+  const s = pad2(c.getUTCSeconds());
+  const f = pad3(c.getUTCMilliseconds());
+  const sign = off >= 0 ? "+" : "-";
+  const abs = Math.abs(off);
+  const oh = pad2(Math.floor(abs / 60));
+  const om = pad2(abs % 60);
+  return `${y}-${mo}-${day}T${h}:${mi}:${s}.${f}${sign}${oh}:${om}`;
+}
+
+function formatFlowLogIanaDisplay(ms, timeZone) {
+  const tz = typeof timeZone === "string" ? timeZone.trim() : "";
+  if (!tz) return null;
+  const d = new Date(ms);
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+      fractionalSecondDigits: 3,
+    });
+    let s = fmt.format(d);
+    s = s.replace(", ", "T");
+    return `${s} [${tz}]`;
+  } catch {
+    return null;
+  }
+}
+
+/** Human-oriented flow log time for an instant and app settings (empty if mode is UTC). */
+function computeFlowLogTsDisplay(msEvent, cfg) {
+  if (!cfg) return "";
+  ensureAppUiTimeFields(cfg);
+  const dockAdj = Number.isFinite(cfg.flowLogDockerAdjustMinutes) ? cfg.flowLogDockerAdjustMinutes : 0;
+  const t = msEvent + dockAdj * 60000;
+  const mode = cfg.flowLogDisplayMode || "utc";
+  if (mode === "utc") return "";
+  if (mode === "iana") {
+    return formatFlowLogIanaDisplay(t, cfg.flowLogIana) || "";
+  }
+  if (mode === "utc_offset") {
+    const off = Number.isFinite(cfg.flowLogUtcOffsetMinutes) ? cfg.flowLogUtcOffsetMinutes : 0;
+    return formatInstantWithFixedUtcOffsetLabel(t, off);
+  }
+  return "";
+}
+
+/** Adds ts (UTC ISO) and optional tsDisplay for flow log lines from sync app cache. */
+function augmentFlowLogMessageTimestamps(msg) {
+  const msEvent = Date.now();
+  msg.ts = new Date(msEvent).toISOString();
+  const disp = computeFlowLogTsDisplay(msEvent, cachedAppConfig);
+  if (disp) msg.tsDisplay = disp;
 }
 
 const CONFIG_EXPORT_VERSION = 1;
@@ -1686,6 +2420,7 @@ const EXPORTABLE_CONFIG_TYPES = new Set([
   "elenko_api",
   "elenko_js_processing",
   "elenko_query",
+  "elenko_timer",
 ]);
 
 function stripForExport(doc, type) {
@@ -1694,6 +2429,8 @@ function stripForExport(doc, type) {
   delete out._rev;
   if (type === "elenko_api") {
     out.apiKeyRef = "";
+    out.apiUserRef = "";
+    out.apiPasswordRef = "";
   }
   if (type === "elenko_app_config") {
     delete out.couchdbPassword;
@@ -1974,7 +2711,11 @@ async function applyConfigImport(data, overwrite) {
     const id = doc._id;
     const toInsert = { ...doc };
     delete toInsert._rev;
-    if (toInsert.type === "elenko_api") toInsert.apiKeyRef = toInsert.apiKeyRef || "";
+    if (toInsert.type === "elenko_api") {
+      toInsert.apiKeyRef = toInsert.apiKeyRef || "";
+      toInsert.apiUserRef = toInsert.apiUserRef || "";
+      toInsert.apiPasswordRef = toInsert.apiPasswordRef || "";
+    }
     try {
       if (!configDb) {
         errors.push({ id: id || "(new)", type: doc.type, message: "Config store not available" });
@@ -2004,8 +2745,7 @@ async function applyConfigImport(data, overwrite) {
   }
 
   if (importedConfig > 0 || docsConfig.some((d) => d && d.type === "elenko_app_config")) {
-    cachedAppConfig = null;
-    cachedAppConfigLoadedAt = 0;
+    invalidateAppUiConfigCache();
   }
   return {
     ok: errors.length === 0,
@@ -2027,13 +2767,14 @@ function startApiWorker() {
     }
   });
   apiWorker.on("message", (msg) => {
-    if (msg.kind !== "apiResponse") return;
+    if (msg.type !== "apiResponse") return;
     const requestId = msg.requestId;
     if (requestId != null && pendingApiRequests.has(requestId)) {
       const p = pendingApiRequests.get(requestId);
       pendingApiRequests.delete(requestId);
       if (p.timeoutId) clearTimeout(p.timeoutId);
       const apiKeyPreview = p.apiKeyPreview;
+      const authType = p.authType || "";
       const responseStart = msg.responseStart;
       const responseEnd = msg.responseEnd;
       let bodyToResolve = msg.body;
@@ -2061,6 +2802,7 @@ function startApiWorker() {
         sendFlowMessage("api.keyPreview", {
           entryId: msg.entryId,
           profileId: msg.profileId,
+          authType,
           apiKeyPreview: apiKeyPreview || "",
         });
       }
@@ -2124,7 +2866,7 @@ function startFlowWorker() {
     }
   });
   flowWorker.on("message", (msg) => {
-    if (msg && msg.kind === "flow.scriptResponse") {
+    if (msg && msg.type === "flow.scriptResponse") {
       const requestId = msg.requestId;
       if (requestId != null && pendingScriptRequests.has(requestId)) {
         const p = pendingScriptRequests.get(requestId);
@@ -2139,11 +2881,11 @@ function startFlowWorker() {
       }
       return;
     }
-    if (msg && msg.kind === "scriptWorker.error") {
+    if (msg && msg.type === "scriptWorker.error") {
       console.error("Script worker error:", msg.error || msg);
       return;
     }
-    if (msg.kind === "callApi") {
+    if (msg.type === "callApi") {
       const apiDocId = (msg.apiDocId != null ? String(msg.apiDocId) : "").trim();
       if (!apiDocId || !apiWorker) {
         if (!apiDocId) {
@@ -2179,6 +2921,48 @@ function startFlowWorker() {
             });
             return;
           }
+          let bundle;
+          try {
+            bundle = await resolveApiWorkerAuthBundle(apiDoc);
+          } catch (credErr) {
+            const field = credErr.credentialField || "apiKeyRef";
+            const ref =
+              credErr.apiKeyRef || credErr.apiUserRef || credErr.apiPasswordRef || "";
+            if (credErr.message === "emptyKey") {
+              sendFlowMessage("api.keyLookupError", {
+                entryId: msg.entryId,
+                profileId: msg.profileId,
+                apiKeyRef: ref,
+                credentialField: field,
+                code: "",
+                reason: "Credential document has no key/value field",
+              });
+            } else {
+              const info = apiKeyLookupErrorInfo(credErr.cause || credErr);
+              sendFlowMessage("api.keyLookupError", {
+                entryId: msg.entryId,
+                profileId: msg.profileId,
+                apiKeyRef: ref,
+                credentialField: field,
+                code: info.code,
+                reason: info.message,
+              });
+            }
+            return;
+          }
+          if (bundle.authType === "basic" || bundle.authType === "digest" || bundle.authType === "fritz") {
+            if (!bundle.apiUserRef || !bundle.apiPasswordRef) {
+              sendFlowMessage("api.keyLookupError", {
+                entryId: msg.entryId,
+                profileId: msg.profileId,
+                apiKeyRef: "",
+                credentialField: !bundle.apiUserRef ? "apiUserRef" : "apiPasswordRef",
+                code: "",
+                reason: "Set username and password key document IDs for Basic, Digest, or FRITZ!Box session auth.",
+              });
+              return;
+            }
+          }
           sendFlowMessage("api.request", {
             apiDocId,
             apiName: apiDoc.name,
@@ -2188,42 +2972,16 @@ function startFlowWorker() {
             method: apiDoc.method || "GET",
             responseTarget: apiDoc.responseTarget || "update",
             dataset: msg.dataset,
+            authType: bundle.authType,
           });
-          let apiKey = null;
-          let apiKeyRef = "";
-          let apiKeyLookupError = null;
-          if (apiDoc.apiKeyRef && typeof apiDoc.apiKeyRef === "string" && apiDoc.apiKeyRef.trim()) {
-            apiKeyRef = apiDoc.apiKeyRef.trim();
-            try {
-              const keyDoc = await configDb.get(apiKeyRef);
-              if (keyDoc && (keyDoc.key != null || keyDoc.value != null)) apiKey = keyDoc.key != null ? String(keyDoc.key) : String(keyDoc.value);
-            } catch (e) {
-              apiKeyLookupError = e;
-            }
-          }
-          if (apiKeyLookupError) {
-            const info = apiKeyLookupErrorInfo(apiKeyLookupError);
-            sendFlowMessage("api.keyLookupError", {
-              entryId: msg.entryId,
-              profileId: msg.profileId,
-              apiKeyRef: apiKeyRef || "",
-              code: info.code,
-              reason: info.message,
-            });
-          } else if (apiKeyRef && !apiKey) {
-            sendFlowMessage("api.keyLookupError", {
-              entryId: msg.entryId,
-              profileId: msg.profileId,
-              apiKeyRef,
-              code: "",
-              reason: "API key document has no key/value field",
-            });
-          }
-          const apiKeyPreview = previewApiKey(apiKey);
+          const apiKeyPreview = previewApiCredentialsForFlow(bundle);
           apiWorker.postMessage({
-            kind: "apiRequest",
-            apiDoc: { url: apiDoc.url, method: apiDoc.method, responseTarget: apiDoc.responseTarget, template: apiDoc.template, responseField: apiDoc.responseField, responseStart: apiDoc.responseStart, responseEnd: apiDoc.responseEnd },
-            apiKey,
+            type: "apiRequest",
+            apiDoc: apiDocPayloadForApiWorker(apiDoc),
+            authType: bundle.authType,
+            apiKey: bundle.apiKey,
+            apiUsername: bundle.apiUsername,
+            apiPassword: bundle.apiPassword,
             dataset: msg.dataset,
             entryId: msg.entryId,
             profileId: msg.profileId,
@@ -2231,6 +2989,7 @@ function startFlowWorker() {
           sendFlowMessage("api.keyPreview", {
             entryId: msg.entryId,
             profileId: msg.profileId,
+            authType: bundle.authType,
             apiKeyPreview: apiKeyPreview || "",
           });
         } catch (err) {
@@ -2239,7 +2998,7 @@ function startFlowWorker() {
       })();
       return;
     }
-    if (msg.kind === "createResponseInProfile") {
+    if (msg.type === "createResponseInProfile") {
       const sourceDocId = (msg.sourceDocId != null ? String(msg.sourceDocId) : "").trim();
       const profileId = (msg.profileId != null ? String(msg.profileId) : "").trim();
       if (!sourceDocId || !profileId) {
@@ -2255,7 +3014,7 @@ function startFlowWorker() {
       })();
       return;
     }
-    if (msg.kind !== "createEntryInProfile") return;
+    if (msg.type !== "createEntryInProfile") return;
     const targetProfileId = (msg.targetProfileId != null ? String(msg.targetProfileId) : "").trim();
     if (!targetProfileId) {
       console.error("Flow worker: createEntryInProfile missing targetProfileId");
@@ -2271,14 +3030,138 @@ function startFlowWorker() {
   });
 }
 
-function sendFlowMessage(kind, payload) {
+async function syncTimersFromDb() {
+  if (!timerWorker || !configDb) return;
+  try {
+    const result = await configDb.find({ selector: { type: "elenko_timer" }, limit: 500 });
+    const timers = [];
+    for (const doc of result.docs || []) {
+      const p = timerDocumentToWorkerPayload(doc);
+      if (p) timers.push(p);
+    }
+    timerWorker.postMessage({ type: "syncTimers", timers });
+  } catch (e) {
+    console.error("syncTimersFromDb:", e);
+  }
+}
+
+async function handleTimerFireMessage(msg) {
+  if (!msg || msg.type !== "timerFire") return;
+  const timerId = msg.timerId != null ? String(msg.timerId) : "";
+  if (!timerId || !configDb || !db) return;
+
+  let timerDoc = null;
+  try {
+    timerDoc = await configDb.get(timerId);
+  } catch (e) {
+    if (e.statusCode !== 404) console.error("Timer load:", e);
+    return;
+  }
+  if (!timerDoc || timerDoc.type !== "elenko_timer") return;
+  if (!(timerDoc.active === true || timerDoc.active === "true")) return;
+
+  const flowRef = timerDoc.flowId != null ? String(timerDoc.flowId).trim() : "";
+  const profileId = timerDoc.profileId != null ? String(timerDoc.profileId).trim() : "";
+  if (!flowRef || !profileId) return;
+
+  let flowDoc = null;
+  try {
+    flowDoc = await configDb.get(flowRef);
+  } catch (e) {
+    if (e.statusCode !== 404) throw e;
+  }
+  if (!flowDoc || flowDoc.type !== "elenko_flow") {
+    const byName = await configDb.find({ selector: { type: "elenko_flow", name: flowRef }, limit: 1 });
+    flowDoc = byName.docs && byName.docs[0];
+  }
+  if (!flowDoc || flowDoc.type !== "elenko_flow") {
+    sendFlowMessage("timer.error", { timerId, error: "Flow not found", flowRef });
+    return;
+  }
+
+  let profileDoc = null;
+  try {
+    profileDoc = await db.get(profileId);
+  } catch (e) {
+    if (e.statusCode !== 404) throw e;
+  }
+  if (!profileDoc || profileDoc.type !== "elenko_profile") {
+    sendFlowMessage("timer.error", { timerId, error: "Profile not found", profileId });
+    return;
+  }
+
+  const entryIdRaw = timerDoc.entryId != null ? String(timerDoc.entryId).trim() : "";
+  const param = timerDoc.param != null ? String(timerDoc.param).trim() : "";
+
+  let record = null;
+  if (entryIdRaw) {
+    try {
+      record = await db.get(entryIdRaw);
+    } catch (e) {
+      if (e.statusCode !== 404) throw e;
+    }
+    if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
+      sendFlowMessage("timer.error", { timerId, error: "Entry not found or wrong profile", entryId: entryIdRaw });
+      return;
+    }
+  }
+
+  const firedAt = new Date().toISOString();
+  sendFlowMessage("timer.fire", {
+    timerId,
+    timerName: timerDoc.name || timerId,
+    flowId: flowDoc._id,
+    flowName: flowDoc.name || flowDoc._id,
+    profileId,
+    entryId: entryIdRaw,
+    param,
+    firedAt,
+  });
+
+  const context = {
+    profileId,
+    entryId: entryIdRaw,
+    profileName: profileDoc.name || profileId,
+    dataset: record ? { ...record } : { _timerFiredAt: firedAt },
+    param,
+    suppressPipelineCreate: false,
+    suppressPipelineEntryWrites: !entryIdRaw,
+  };
+
+  try {
+    await runPipeline(context, flowDoc);
+  } catch (pipeErr) {
+    console.error("Timer pipeline error:", pipeErr);
+    sendFlowMessage("timer.pipelineError", {
+      timerId,
+      error: pipeErr && pipeErr.message ? String(pipeErr.message) : "Pipeline failed",
+    });
+  }
+}
+
+function startTimerWorker() {
+  const workerPath = path.join(__dirname, "timerWorker.js");
+  timerWorker = new Worker(workerPath, {
+    workerData: {},
+  });
+  timerWorker.on("error", (err) => {
+    console.error("Timer worker error:", err);
+  });
+  timerWorker.on("exit", (code) => {
+    if (code !== 0) console.error(`Timer worker exited with code ${code}`);
+  });
+  timerWorker.on("message", (wmsg) => {
+    if (!wmsg || wmsg.type !== "timerFire") return;
+    handleTimerFireMessage(wmsg).catch((e) => console.error("handleTimerFireMessage:", e));
+  });
+}
+
+function sendFlowMessage(type, payload) {
   if (!flowWorker) return;
   try {
-    flowWorker.postMessage({
-      kind,
-      payload,
-      ts: new Date().toISOString(),
-    });
+    const msg = { type, payload };
+    augmentFlowLogMessageTimestamps(msg);
+    flowWorker.postMessage(msg);
   } catch (err) {
     // Use the original console implementation to avoid recursion into this wrapper.
     originalConsoleError("Failed to send flow message:", err);
@@ -2472,8 +3355,7 @@ async function tryRestoreBootstrapFromStoredPassword() {
     await setCouchDbAdminPassword("admin", stored);
     writeBootstrapFile(stored);
     await initCouch({ password: stored });
-    cachedAppConfig = null;
-    cachedAppConfigLoadedAt = 0;
+    invalidateAppUiConfigCache();
     return true;
   } catch (e) {
     console.error("Restore bootstrap from stored password failed:", e);
@@ -2583,6 +3465,16 @@ async function initCouch(options) {
     await db.createIndex({
       index: { fields: ["type", "profileId", "sortKey"] },
       name: "records-by-profile-sortkey",
+    });
+  } catch (e) {
+    // Index may already exist
+  }
+
+  // Index for purge-old flow step (createdAt older than cutoff)
+  try {
+    await db.createIndex({
+      index: { fields: ["type", "profileId", "createdAt"] },
+      name: "records-by-profile-createdAt",
     });
   } catch (e) {
     // Index may already exist
@@ -2779,8 +3671,7 @@ app.post("/setup", async (req, res) => {
       }
       await configDb.insert(doc);
     }
-    cachedAppConfig = null;
-    cachedAppConfigLoadedAt = 0;
+    invalidateAppUiConfigCache();
     return res.redirect("/login");
   } catch (err) {
     console.error("Setup error:", err);
@@ -2855,8 +3746,7 @@ app.post("/setup/change-couchdb-password", async (req, res) => {
         });
       }
     }
-    cachedAppConfig = null;
-    cachedAppConfigLoadedAt = 0;
+    invalidateAppUiConfigCache();
   } catch (e) {
     console.error("Failed to update app config with new password:", e);
   }
@@ -3059,8 +3949,7 @@ app.post("/account/couchdb-password", requireAdmin, async (req, res) => {
         await configDb.insert(doc);
       }
     }
-    cachedAppConfig = null;
-    cachedAppConfigLoadedAt = 0;
+    invalidateAppUiConfigCache();
   } catch (e) {
     console.error("Failed to update app config with new password:", e);
   }
@@ -3076,6 +3965,55 @@ app.get("/app-config", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("Error loading app config:", err);
     res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/application-properties", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderApplicationPropertiesPage(appUi, null));
+  } catch (err) {
+    console.error("Error loading application properties:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/application-properties", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const body = req.body || {};
+    const mode = normalizeFlowLogDisplayMode(body.flowLogDisplayMode);
+    const iana = typeof body.flowLogIana === "string" ? body.flowLogIana.trim() : "";
+    const utcOff = parseBoundedInt(body.flowLogUtcOffsetMinutes, 0, -840, 840);
+    const dockAdj = parseBoundedInt(body.flowLogDockerAdjustMinutes, 0, -10080, 10080);
+
+    let doc = null;
+    const id = typeof body._id === "string" && body._id.trim() ? body._id.trim() : "";
+    if (id) {
+      try {
+        const existing = await configDb.get(id);
+        if (existing && existing.type === "elenko_app_config") doc = existing;
+      } catch (_) {}
+    }
+    if (!doc) {
+      const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+      doc = result.docs && result.docs[0];
+    }
+    if (!doc || doc.type !== "elenko_app_config") {
+      doc = { type: "elenko_app_config", theme: { ...DEFAULT_APP_THEME } };
+    }
+    doc.flowLogDisplayMode = mode;
+    doc.flowLogIana = iana;
+    doc.flowLogUtcOffsetMinutes = utcOff;
+    doc.flowLogDockerAdjustMinutes = dockAdj;
+    const ins = await configDb.insert(doc);
+    invalidateAppUiConfigCache();
+    res.json({ ok: true, id: ins.id, rev: ins.rev });
+  } catch (err) {
+    console.error("Error saving application properties:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -3614,8 +4552,7 @@ app.post("/api/app-config", requireAdmin, async (req, res) => {
     doc.loginTextAbove = loginTextAbove;
     doc.loginTextBelow = loginTextBelow;
     const result = await configDb.insert(doc);
-    cachedAppConfig = null;
-    cachedAppConfigLoadedAt = 0;
+    invalidateAppUiConfigCache();
     res.json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
     console.error("Error saving app config:", err);
@@ -4054,8 +4991,8 @@ app.get("/apis", requireAdmin, async (req, res) => {
   }
 });
 
-function getQueryApiKeyRef(req) {
-  const v = req.query && req.query.apiKeyRef;
+function pickQueryString(req, name) {
+  const v = req.query && req.query[name];
   if (typeof v === "string") return v.trim();
   if (Array.isArray(v) && typeof v[0] === "string") return v[0].trim();
   return "";
@@ -4063,9 +5000,11 @@ function getQueryApiKeyRef(req) {
 
 app.get("/apis/create", requireAdmin, async (req, res) => {
   const appUi = await getAppUiConfig();
-  const prefillKeyRef = getQueryApiKeyRef(req);
+  const prefillKeyRef = pickQueryString(req, "apiKeyRef");
+  const prefillUserRef = pickQueryString(req, "apiUserRef");
+  const prefillPasswordRef = pickQueryString(req, "apiPasswordRef");
   res.set("Content-Type", "text/html; charset=utf-8");
-  res.send(renderEditApiPage(null, null, req.originalUrl || "/apis/create", appUi, prefillKeyRef));
+  res.send(renderEditApiPage(null, null, req.originalUrl || "/apis/create", appUi, prefillKeyRef, prefillUserRef, prefillPasswordRef));
 });
 
 app.get("/apis/:id/edit", requireAdmin, async (req, res) => {
@@ -4075,17 +5014,21 @@ app.get("/apis/:id/edit", requireAdmin, async (req, res) => {
     if (!doc || doc.type !== "elenko_api") {
       return res.status(404).send(renderErrorPage("API not found"));
     }
-    const qRef = getQueryApiKeyRef(req);
-    // After Create/Update API key, browser returns here with ?apiKeyRef=key_... — persist to CouchDB
-    // (export strips apiKeyRef; slug sync in the form is UI-only until Save unless we save here).
-    if (qRef) {
-      doc.apiKeyRef = qRef;
+    const qKey = pickQueryString(req, "apiKeyRef");
+    const qUser = pickQueryString(req, "apiUserRef");
+    const qPass = pickQueryString(req, "apiPasswordRef");
+    // After Create/Update API key, browser returns with ?apiKeyRef= / ?apiUserRef= / ?apiPasswordRef= — persist to CouchDB
+    // (export strips refs; slug sync in the form is UI-only until Save unless we save here).
+    if (qKey || qUser || qPass) {
+      if (qKey) doc.apiKeyRef = qKey;
+      if (qUser) doc.apiUserRef = qUser;
+      if (qPass) doc.apiPasswordRef = qPass;
       await configDb.insert(doc);
       return res.redirect(303, "/apis/" + encodeURIComponent(req.params.id) + "/edit");
     }
     const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditApiPage(doc, null, "/apis/" + encodeURIComponent(req.params.id) + "/edit", appUi, ""));
+    res.send(renderEditApiPage(doc, null, "/apis/" + encodeURIComponent(req.params.id) + "/edit", appUi, "", "", ""));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("API not found"));
     console.error("Error loading API:", err);
@@ -4105,13 +5048,19 @@ app.post("/api/apis", requireAdmin, async (req, res) => {
       description: typeof body.description === "string" ? body.description.trim() : "",
       url: typeof body.url === "string" ? body.url.trim() : "",
       method: (body.method === "POST" || body.method === "PUT" || body.method === "PATCH") ? body.method : "GET",
+      apiAuthType: normalizeElenkoApiAuthType(body),
       apiKeyRef: typeof body.apiKeyRef === "string" ? body.apiKeyRef.trim() : "",
+      apiUserRef: typeof body.apiUserRef === "string" ? body.apiUserRef.trim() : "",
+      apiPasswordRef: typeof body.apiPasswordRef === "string" ? body.apiPasswordRef.trim() : "",
       responseTarget: body.responseTarget === "create" ? "create" : body.responseTarget === "forward" ? "forward" : "update",
       template: typeof body.template === "string" ? body.template.trim() : "",
       responseField: typeof body.responseField === "string" ? body.responseField.trim() : "",
       responseStart: typeof body.responseStart === "string" ? body.responseStart : "",
       responseEnd: typeof body.responseEnd === "string" ? body.responseEnd : "",
     };
+    if (Object.prototype.hasOwnProperty.call(body, "getQueryFromEntry")) {
+      doc.getQueryFromEntry = body.getQueryFromEntry === true;
+    }
     const result = await configDb.insert(doc);
     res.status(201).json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
@@ -4135,12 +5084,18 @@ app.put("/api/apis/:id", requireAdmin, async (req, res) => {
     doc.description = typeof body.description === "string" ? body.description.trim() : "";
     doc.url = typeof body.url === "string" ? body.url.trim() : "";
     doc.method = (body.method === "POST" || body.method === "PUT" || body.method === "PATCH") ? body.method : "GET";
+    doc.apiAuthType = normalizeElenkoApiAuthType(body);
     doc.apiKeyRef = typeof body.apiKeyRef === "string" ? body.apiKeyRef.trim() : "";
+    doc.apiUserRef = typeof body.apiUserRef === "string" ? body.apiUserRef.trim() : "";
+    doc.apiPasswordRef = typeof body.apiPasswordRef === "string" ? body.apiPasswordRef.trim() : "";
     doc.responseTarget = body.responseTarget === "create" ? "create" : body.responseTarget === "forward" ? "forward" : "update";
     doc.template = typeof body.template === "string" ? body.template.trim() : "";
     doc.responseField = typeof body.responseField === "string" ? body.responseField.trim() : "";
     doc.responseStart = typeof body.responseStart === "string" ? body.responseStart : "";
     doc.responseEnd = typeof body.responseEnd === "string" ? body.responseEnd : "";
+    if (Object.prototype.hasOwnProperty.call(body, "getQueryFromEntry")) {
+      doc.getQueryFromEntry = body.getQueryFromEntry === true;
+    }
     const result = await configDb.insert(doc);
     res.json({ ok: true, id: result.id, rev: result.rev });
   } catch (err) {
@@ -4387,7 +5342,12 @@ app.get("/apis/keys/create", requireAdmin, async (req, res) => {
     typeof req.query.apiKeyDocId === "string" && req.query.apiKeyDocId.trim()
       ? req.query.apiKeyDocId.trim()
       : "";
-  res.send(renderEditApiKeyPage(null, null, req.query.returnTo, defaultName, appUi, defaultApiKeyDocId));
+  let credentialField =
+    typeof req.query.credentialField === "string" && req.query.credentialField.trim()
+      ? req.query.credentialField.trim()
+      : "apiKeyRef";
+  if (!new Set(["apiKeyRef", "apiUserRef", "apiPasswordRef"]).has(credentialField)) credentialField = "apiKeyRef";
+  res.send(renderEditApiKeyPage(null, null, req.query.returnTo, defaultName, appUi, defaultApiKeyDocId, credentialField));
 });
 
 app.post("/api/apis/keys", requireAdmin, async (req, res) => {
@@ -4425,7 +5385,7 @@ app.get("/apis/keys/:id/edit", requireAdmin, async (req, res) => {
     const hasKey = doc && (doc.key != null || doc.value != null);
     const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditApiKeyPage(doc, null, req.query.returnTo, "", appUi, ""));
+    res.send(renderEditApiKeyPage(doc, null, req.query.returnTo, "", appUi, "", "apiKeyRef"));
   } catch (err) {
     if (err?.statusCode === 404) {
       // If key doc does not exist yet, open the create/upsert page with prefilled id.
@@ -4615,6 +5575,252 @@ app.post("/api/flows/:id/delete", requireAdmin, async (req, res) => {
     if (err?.statusCode === 404) return res.status(404).json({ error: "Flow not found" });
     if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict" });
     console.error("Error deleting flow:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function loadFlowsAndProfilesForTimerForms() {
+  let flows = [];
+  let profiles = [];
+  if (configDb) {
+    try {
+      const fr = await configDb.find({
+        selector: { type: "elenko_flow" },
+        fields: ["_id", "name"],
+        sort: [{ name: "asc" }],
+        limit: 500,
+      });
+      flows = fr.docs || [];
+    } catch (_) {}
+  }
+  if (db) {
+    try {
+      const pr = await db.find({
+        selector: { type: "elenko_profile" },
+        fields: ["_id", "name"],
+        sort: [{ name: "asc" }],
+        limit: 500,
+      });
+      profiles = pr.docs || [];
+    } catch (_) {}
+  }
+  return { flows, profiles };
+}
+
+// —— Timers (scheduled flows; timerWorker schedules, server runs pipeline) ——
+app.get("/api/timers", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const result = await configDb.find({
+      selector: { type: "elenko_timer" },
+      fields: [
+        "_id",
+        "_rev",
+        "name",
+        "description",
+        "flowId",
+        "profileId",
+        "entryId",
+        "startDate",
+        "startTime",
+        "intervalKey",
+        "active",
+      ],
+      sort: [{ name: "asc" }],
+      limit: 500,
+    });
+    res.json({ timers: result.docs || [] });
+  } catch (err) {
+    console.error("Error loading timers:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/timers", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    const result = await configDb.find({
+      selector: { type: "elenko_timer" },
+      fields: [
+        "_id",
+        "_rev",
+        "name",
+        "description",
+        "flowId",
+        "profileId",
+        "entryId",
+        "startDate",
+        "startTime",
+        "intervalKey",
+        "active",
+      ],
+      sort: [{ name: "asc" }],
+      limit: 500,
+    });
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderTimersListPage(result.docs || [], appUi));
+  } catch (err) {
+    console.error("Error loading timers:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/timers/create", requireAdmin, async (req, res) => {
+  try {
+    const appUi = await getAppUiConfig();
+    const { flows, profiles } = await loadFlowsAndProfilesForTimerForms();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderEditTimerPage(null, null, appUi, flows, profiles));
+  } catch (err) {
+    console.error("Error loading timer create:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/timers/:id/edit", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    const doc = await configDb.get(req.params.id);
+    if (!doc || doc.type !== "elenko_timer") {
+      return res.status(404).send(renderErrorPage("Timer not found"));
+    }
+    const appUi = await getAppUiConfig();
+    const { flows, profiles } = await loadFlowsAndProfilesForTimerForms();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderEditTimerPage(doc, null, appUi, flows, profiles));
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Timer not found"));
+    console.error("Error loading timer:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/timers", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const fields = normalizeTimerCreateBody(req.body || {});
+    if (!fields.name) return res.status(400).json({ error: "Name is required." });
+    if (!fields.flowId) return res.status(400).json({ error: "Flow is required." });
+    if (!fields.profileId) return res.status(400).json({ error: "Elenko database (profile) is required." });
+    if (!Number.isFinite(parseTimerLocalDateTimeMs(fields.startDate, fields.startTime))) {
+      return res.status(400).json({ error: "Invalid start date or time (use YYYY-MM-DD and HH:mm)." });
+    }
+    const doc = {
+      type: "elenko_timer",
+      name: fields.name,
+      description: fields.description,
+      flowId: fields.flowId,
+      profileId: fields.profileId,
+      entryId: fields.entryId,
+      param: fields.param,
+      startDate: fields.startDate,
+      startTime: fields.startTime,
+      intervalKey: fields.intervalKey,
+      active: fields.active,
+    };
+    const result = await configDb.insert(doc);
+    await syncTimersFromDb();
+    sendFlowMessageTimerSaved("created", result.id, fields);
+    res.status(201).json({ ok: true, id: result.id, rev: result.rev });
+  } catch (err) {
+    console.error("Error creating timer:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/timers/:id", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const existing = await configDb.get(id);
+    if (!existing || existing.type !== "elenko_timer") {
+      return res.status(404).json({ error: "Timer not found" });
+    }
+    const fields = normalizeTimerCreateBody(req.body || {});
+    if (!fields.name) return res.status(400).json({ error: "Name is required." });
+    if (!fields.flowId) return res.status(400).json({ error: "Flow is required." });
+    if (!fields.profileId) return res.status(400).json({ error: "Elenko database (profile) is required." });
+    if (!Number.isFinite(parseTimerLocalDateTimeMs(fields.startDate, fields.startTime))) {
+      return res.status(400).json({ error: "Invalid start date or time (use YYYY-MM-DD and HH:mm)." });
+    }
+    existing.name = fields.name;
+    existing.description = fields.description;
+    existing.flowId = fields.flowId;
+    existing.profileId = fields.profileId;
+    existing.entryId = fields.entryId;
+    existing.param = fields.param;
+    existing.startDate = fields.startDate;
+    existing.startTime = fields.startTime;
+    existing.intervalKey = fields.intervalKey;
+    existing.active = fields.active;
+    const result = await configDb.insert(existing);
+    await syncTimersFromDb();
+    sendFlowMessageTimerSaved("updated", id, fields);
+    res.json({ ok: true, id: result.id, rev: result.rev });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Timer not found" });
+    console.error("Error updating timer:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/timers/:id/copy", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    let base = null;
+    try {
+      base = await configDb.get(id);
+    } catch (e) {
+      if (e.statusCode === 404) return res.status(404).json({ error: "Timer not found" });
+      throw e;
+    }
+    if (!base || base.type !== "elenko_timer") {
+      return res.status(404).json({ error: "Timer not found" });
+    }
+    const nameResult = await configDb.find({
+      selector: { type: "elenko_timer" },
+      fields: ["name"],
+      limit: 5000,
+    });
+    const existing = new Set();
+    for (const d of nameResult.docs || []) {
+      if (d && typeof d.name === "string" && d.name.trim()) existing.add(d.name.trim());
+    }
+    const newName = makeUniqueTimerCopyName(base.name, existing);
+    const newDoc = buildTimerDocFromSource(base, newName);
+    const result = await configDb.insert(newDoc);
+    await syncTimersFromDb();
+    sendFlowMessageTimerSaved("copied", result.id, normalizeTimerCreateBody(newDoc));
+    res.status(201).json({ ok: true, id: result.id, rev: result.rev, name: newName });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Timer not found" });
+    console.error("Error copying timer:", err);
+    res.status(500).json({ error: err.message || "Copy failed" });
+  }
+});
+
+app.post("/api/timers/:id/delete", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const id = req.params.id;
+    const { _rev } = req.body || {};
+    if (!_rev) return res.status(400).json({ error: "Missing _rev" });
+    const doc = await configDb.get(id);
+    if (!doc || doc.type !== "elenko_timer") {
+      return res.status(404).json({ error: "Timer not found" });
+    }
+    if (doc._rev !== _rev) {
+      return res.status(409).json({ error: "Timer was modified; refresh and try again" });
+    }
+    await configDb.destroy(id, _rev);
+    await syncTimersFromDb();
+    res.json({ ok: true, redirect: "/timers" });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Timer not found" });
+    if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict" });
+    console.error("Error deleting timer:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -5457,8 +6663,9 @@ app.post("/api/profile/:id/run-flow", requireEditor, async (req, res) => {
       dataset,
       param: "",
       // Profile-page imports should only create rows from JS output._createMany.
-      // Prevent accidental single-record create/update steps from persisting a helper document.
-      suppressSinglePersist: true,
+      // Prevent accidental create/update/response steps from persisting a helper document.
+      suppressPipelineCreate: true,
+      suppressPipelineEntryWrites: true,
     };
     await runPipeline(context, flowDoc);
     const created = Number(context.dataset && context.dataset._lastCreatedCount) || 0;
@@ -6685,6 +7892,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       ? "position:relative;min-height:40em;"
       : "";
   const linkedQueryHtml = await buildLinkedQueryHtmlForEntry(doc, record, formDoc, layout, { forceLoad: false });
+  const viewHasChartField = orderedItems.some((o) => o.type === "field" && o.fieldType === "chart");
 
   function itemLabel(o) {
     return o.type === "label" ? o.text : o.fieldName;
@@ -6729,6 +7937,9 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         "?max=" +
         MAX_IMAGE_DISPLAY_EDGE;
       return `<img class="entry-inline-image" src="${escapeHtml(src)}" alt="${escapeHtml(o.fieldName || "Image")}" loading="lazy">`;
+    }
+    if (o.fieldType === "chart") {
+      return formatEntryChartFieldHtml(o.fieldName, value);
     }
     if (isProfileFileField(doc, o.fieldName) && value) {
       const raw = String(value).trim();
@@ -6840,6 +8051,8 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
               ? " value entry-value-url"
               : o.fieldType === "image"
               ? " value entry-value-image"
+              : o.fieldType === "chart"
+              ? " value entry-value-chart"
               : " value") + gImg.className;
           const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
           return `
@@ -6878,6 +8091,8 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
               ? " value entry-value-url"
               : o.fieldType === "image"
               ? " value entry-value-image"
+              : o.fieldType === "chart"
+              ? " value entry-value-chart"
               : " value") + gImg.className;
           const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
           return `
@@ -6911,6 +8126,8 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
               ? " value entry-value-url"
               : o.fieldType === "image"
               ? " value entry-value-image"
+              : o.fieldType === "chart"
+              ? " value entry-value-chart"
               : " value";
           return `
         <tr>
@@ -7040,6 +8257,9 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .entry-response-block { background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 8px; padding: 0.5rem 0.75rem; }
     .entry-response-block table { margin-top: 0.25rem; }
     .entry-response-marker { color: var(--entry-label, #8b949e); font-weight: 600; }
+    .entry-value-chart { max-height: none !important; overflow: visible !important; }
+    .entry-chart-error { color: #f85149; margin: 0; font-size: 0.9rem; }
+    .entry-chart-mount { box-sizing: border-box; }
   </style>
   ${formCustomCss ? `<style>${formCustomCss}</style>` : ""}
 </head>
@@ -7095,7 +8315,15 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         });
       });
     })();
-  </script>
+  </script>${
+    viewHasChartField
+      ? `
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" crossorigin="anonymous"></script>
+  <script>
+    ${entryViewChartInitScript()}
+  </script>`
+      : ""
+  }
 </body>
 </html>`;
 }
@@ -7233,6 +8461,9 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     }
     if (o.fieldType === "url") {
       return `<input type="url" class="entry-field" name="${escapedName}" placeholder="${escapedName}" value="${escapedValue}">`;
+    }
+    if (o.fieldType === "chart") {
+      return `<textarea class="entry-field entry-field-textarea entry-field-chart-json" name="${escapedName}" placeholder='{"version":1,"chartType":"line","xAxis":{"title":"X","values":[]},"yAxis":{"title":"Y","values":[]}}' rows="12" spellcheck="false">${escapedValue}</textarea>`;
     }
     return `<textarea class="entry-field entry-field-textarea" name="${escapedName}" placeholder="${escapedName}" rows="3">${escapedValue}</textarea>`;
   }
@@ -7392,6 +8623,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       overflow-y: auto;
       box-sizing: border-box;
     }
+    textarea.entry-field-chart-json { font-family: ui-monospace, "Cascadia Code", "Consolas", monospace; font-size: 0.8rem; line-height: 1.35; min-height: 8rem; }
     .entry-view-grid { display: grid; gap: 1rem; }
     .entry-grid-cell { min-width: 0; }
     .entry-grid-cell .label { display: block; margin-bottom: 0.25rem; color: var(--entry-label, #8b949e); }
@@ -8938,6 +10170,354 @@ function renderProfilesListPage(profiles, appUi) {
 </html>`;
 }
 
+function renderTimersListPage(timers, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
+  const intervalLabel = (key) => TIMER_INTERVAL_LABEL[key] || key || "—";
+  const activeLabel = (a) => (a === true || a === "true" ? "Active" : "Inactive");
+  const rows =
+    timers.length > 0
+      ? timers
+          .map(
+            (t) => `
+        <tr>
+          <td><a href="/timers/${encodeURIComponent(t._id)}/edit">${escapeHtml(t.name || t._id)}</a></td>
+          <td><code class="id-cell">${escapeHtml(truncate(t.flowId || "", 36))}</code></td>
+          <td><code class="id-cell">${escapeHtml(truncate(t.profileId || "", 28))}</code></td>
+          <td>${escapeHtml([t.startDate, t.startTime].filter(Boolean).join(" ") || "—")}</td>
+          <td>${escapeHtml(intervalLabel(t.intervalKey))}</td>
+          <td>${escapeHtml(activeLabel(t.active))}</td>
+          <td class="row-actions"><a href="/timers/${encodeURIComponent(t._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action timer-copy-btn" data-id="${escapeHtml(t._id)}" aria-label="Copy" title="Copy">⧉</button><button type="button" class="delete-btn icon-action delete-timer-btn" data-id="${escapeHtml(t._id)}" data-rev="${escapeHtml(t._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
+        </tr>`
+          )
+          .join("")
+      : `
+        <tr>
+          <td colspan="7" class="empty">No timers yet. Schedule a flow to run on a repeating interval.</td>
+        </tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Timers</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 64rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
+    .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type { font-size: 1.35rem; line-height: 1; }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
+    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-bottom: 1rem; }
+    .btn:hover { background: #2ea043; text-decoration: none; }
+    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    .row-actions { white-space: nowrap; }
+    .row-actions .icon-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 2rem;
+      min-height: 2rem;
+      margin: 0 0.15rem;
+      padding: 0.2rem 0.35rem;
+      font-size: 1.15rem;
+      line-height: 1;
+      vertical-align: middle;
+      text-decoration: none;
+      border-radius: 4px;
+    }
+    .row-actions .icon-action:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    .edit-link { color: var(--app-link, #58a6ff); }
+    .edit-link:hover { background: rgba(88, 166, 255, 0.12); }
+    .copy-btn { border: none; background: none; color: var(--app-label, #8b949e); font: inherit; cursor: pointer; }
+    .copy-btn:hover { color: var(--app-link, #58a6ff); background: rgba(88, 166, 255, 0.08); }
+    .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .delete-btn { border: none; background: none; color: #f85149; font: inherit; cursor: pointer; padding: 0.2rem 0.35rem; }
+    .delete-btn:hover { color: #ff7b72; background: rgba(248, 81, 73, 0.12); }
+    .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="actions"><a href="/">← Start</a><a href="/timers/create" class="btn">Create timer</a></div>
+  <h1>Timers</h1>
+  <p class="sub">Run a flow on a schedule. Start date and time use the server&apos;s local timezone. Toggle off to pause without deleting.</p>
+  <table>
+    <thead><tr><th>Name</th><th>Flow</th><th>Profile</th><th>Starts</th><th>Repeat</th><th>Status</th><th>Actions</th></tr></thead>
+    <tbody>${rows}
+    </tbody>
+  </table>
+  <div id="timer-list-msg" style="display:none;margin-top:0.75rem;font-size:0.875rem;"></div>
+  <script>
+    (function() {
+      var msgEl = document.getElementById('timer-list-msg');
+      function showErr(t) {
+        if (!msgEl) return;
+        msgEl.style.display = 'block';
+        msgEl.style.color = '#f85149';
+        msgEl.textContent = t || 'Request failed';
+      }
+      document.querySelectorAll('.timer-copy-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/timers/' + encodeURIComponent(id) + '/copy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok && o.data.id) {
+                window.location.href = '/timers/' + encodeURIComponent(o.data.id) + '/edit';
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Copy failed');
+            })
+            .catch(function(e) { btn.disabled = false; showErr(e.message || 'Copy failed'); });
+        });
+      });
+      document.querySelectorAll('.delete-timer-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          var rev = btn.getAttribute('data-rev');
+          if (!id || !rev) { showErr('Missing revision; refresh the page.'); return; }
+          if (!confirm('Delete this timer?')) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/timers/' + encodeURIComponent(id) + '/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ _rev: rev })
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok) { window.location.href = o.data.redirect || '/timers'; return; }
+              showErr(o.data && o.data.error ? o.data.error : 'Delete failed');
+            })
+            .catch(function(e) { btn.disabled = false; showErr(e.message || 'Delete failed'); });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderEditTimerPage(doc, err, appUi, flows, profiles) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const isEdit = !!(doc && doc._id);
+  const nameVal =
+    doc && typeof doc.name === "string" ? escapeHtml(doc.name) : "";
+  const descVal =
+    doc && typeof doc.description === "string" ? escapeHtml(doc.description) : "";
+  const startDateVal = escapeHtml(
+    (doc && doc.startDate && String(doc.startDate).trim()) || defaultTimerStartDateLocal()
+  );
+  const startTimeVal = escapeHtml(
+    (doc && doc.startTime && String(doc.startTime).trim()) || defaultTimerStartTimeNextHourLocal()
+  );
+  const entryVal =
+    doc && typeof doc.entryId === "string" ? escapeHtml(doc.entryId) : "";
+  const paramVal =
+    doc && typeof doc.param === "string" ? escapeHtml(doc.param) : "";
+  const intervalKey = normalizeTimerIntervalKeyString(doc && doc.intervalKey);
+  const activeChecked =
+    doc == null || doc.active === true || doc.active === "true";
+  const revInput = doc && doc._rev ? `<input type="hidden" id="rev" value="${escapeHtml(doc._rev)}">` : "";
+  const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+  const title = isEdit ? "Edit timer" : "Create timer";
+  const submitLabel = isEdit ? "Save" : "Create";
+
+  const flowResolved = (fid) =>
+    flows.some((f) => f._id === fid || f.name === fid);
+  const profileResolved = (pid) =>
+    profiles.some((p) => p._id === pid || p.name === pid);
+
+  let flowOpts = "";
+  if (doc && doc.flowId) {
+    const raw = String(doc.flowId).trim();
+    if (raw && !flowResolved(raw)) {
+      flowOpts += `<option value="${escapeHtml(raw)}" selected>${escapeHtml(raw)}</option>`;
+    }
+  }
+  for (const f of flows) {
+    const fid = f._id;
+    const sel =
+      doc &&
+      (doc.flowId === fid ||
+        (typeof doc.flowId === "string" && doc.flowId.trim() === f.name))
+        ? " selected"
+        : "";
+    flowOpts += `<option value="${escapeHtml(fid)}"${sel}>${escapeHtml(f.name || fid)}</option>`;
+  }
+
+  let profileOpts = "";
+  if (doc && doc.profileId) {
+    const raw = String(doc.profileId).trim();
+    if (raw && !profileResolved(raw)) {
+      profileOpts += `<option value="${escapeHtml(raw)}" selected>${escapeHtml(raw)}</option>`;
+    }
+  }
+  for (const p of profiles) {
+    const pid = p._id;
+    const sel =
+      doc &&
+      (doc.profileId === pid ||
+        (typeof doc.profileId === "string" && doc.profileId.trim() === p.name))
+        ? " selected"
+        : "";
+    profileOpts += `<option value="${escapeHtml(pid)}"${sel}>${escapeHtml(p.name || pid)}</option>`;
+  }
+
+  const intervalOpts = TIMER_INTERVAL_ORDER.map((key) => {
+    const lab = TIMER_INTERVAL_LABEL[key] || key;
+    const sel = intervalKey === key ? " selected" : "";
+    return `<option value="${escapeHtml(key)}"${sel}>${escapeHtml(lab)}</option>`;
+  }).join("");
+
+  const activeSwitch = `
+    <div class="toggle-row">
+      <span class="toggle-label">Active</span>
+      <label class="switch" title="When off, this timer does not run">
+        <input type="checkbox" id="active" name="active" value="true" ${activeChecked ? "checked" : ""}>
+        <span class="slider"></span>
+      </label>
+    </div>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – ${title}</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 40rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"], input[type="date"], input[type="time"] {
+      width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d);
+      border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem;
+    }
+    select { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    .actions-top { margin-bottom: 1rem; }
+    .actions-top a { color: var(--app-link, #58a6ff); }
+    .btn { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }
+    .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; display: inline-block; }
+    .msg.err { background: #3d1f1f; color: #f85149; padding: 0.5rem; border-radius: 6px; margin: 1rem 0; }
+    .toggle-row { display: flex; align-items: center; gap: 0.75rem; margin-top: 1.25rem; }
+    .toggle-label { color: var(--app-label, #8b949e); }
+    .switch { position: relative; display: inline-block; width: 2.75rem; height: 1.5rem; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; cursor: pointer; inset: 0; background: var(--app-table-border, #30363d);
+      border-radius: 1.5rem; transition: background 0.2s;
+    }
+    .slider:before {
+      position: absolute; content: ""; height: 1.15rem; width: 1.15rem; left: 0.2rem; bottom: 0.175rem;
+      background: var(--app-text, #e6edf3); border-radius: 50%; transition: transform 0.2s;
+    }
+    .switch input:checked + .slider { background: #238636; }
+    .switch input:checked + .slider:before { transform: translateX(1.2rem); }
+    .switch input:focus + .slider { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+  </style>
+</head>
+<body>
+  <div class="actions-top">
+    <a href="/timers">← Timers</a>
+    <button type="submit" form="timer-form" class="btn btn-primary" style="margin-left:1rem;">${submitLabel}</button>
+    <a href="/timers" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
+  </div>
+  <h1>${title}</h1>
+  <p class="sub">Optional entry: when set, the flow runs with that document; otherwise a minimal dataset (<code>_timerFiredAt</code>) is used and single-step persistence is suppressed unless the flow saves explicitly.</p>
+  ${errHtml}
+  <form id="timer-form">
+    ${revInput}
+    <label for="name">Name</label>
+    <input type="text" id="name" name="name" required placeholder="e.g. nightly export" value="${nameVal}">
+    <label for="description">Description</label>
+    <input type="text" id="description" name="description" placeholder="Optional" value="${descVal}">
+    <label for="flowId">Flow</label>
+    <select id="flowId" name="flowId" required>${flowOpts}</select>
+    <label for="profileId">Elenko database (profile)</label>
+    <select id="profileId" name="profileId" required>${profileOpts}</select>
+    <label for="entryId">Entry document ID (optional)</label>
+    <input type="text" id="entryId" name="entryId" placeholder="Leave empty for timer-only dataset" value="${entryVal}">
+    <label for="param">Param (optional)</label>
+    <input type="text" id="param" name="param" placeholder="Passed to the flow context" value="${paramVal}">
+    <label for="startDate">Start date</label>
+    <input type="date" id="startDate" name="startDate" required value="${startDateVal}">
+    <label for="startTime">Start time</label>
+    <input type="time" id="startTime" name="startTime" required value="${startTimeVal}">
+    <label for="intervalKey">Repeat every</label>
+    <select id="intervalKey" name="intervalKey">${intervalOpts}</select>
+    ${activeSwitch}
+  </form>
+  <script>
+    var formEl = document.getElementById('timer-form');
+    if (formEl) formEl.onsubmit = async function(e) {
+      e.preventDefault();
+      var name = document.getElementById('name').value.trim();
+      if (!name) { alert('Name is required.'); return; }
+      var body = {
+        name: name,
+        description: document.getElementById('description').value.trim(),
+        flowId: document.getElementById('flowId').value.trim(),
+        profileId: document.getElementById('profileId').value.trim(),
+        entryId: document.getElementById('entryId').value.trim(),
+        param: document.getElementById('param').value.trim(),
+        startDate: document.getElementById('startDate').value,
+        startTime: document.getElementById('startTime').value,
+        intervalKey: document.getElementById('intervalKey').value,
+        active: document.getElementById('active').checked
+      };
+      var url = ${isEdit ? JSON.stringify("/api/timers/" + encodeURIComponent(doc._id)) : "\"/api/timers\""};
+      var method = ${isEdit ? '"PUT"' : '"POST"'};
+      if (${isEdit ? "true" : "false"}) body._rev = document.getElementById('rev').value;
+      try {
+        var r = await fetch(url, { method: method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        var data = await r.json();
+        if (!r.ok) { alert(data.error || 'Failed'); return; }
+        window.location.href = '/timers';
+      } catch (err) {
+        alert(err.message || 'Request failed');
+      }
+    };
+  </script>
+</body>
+</html>`;
+}
+
 function renderEditFlowPage(doc, err, appUi) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
@@ -8987,7 +10567,7 @@ function renderEditFlowPage(doc, err, appUi) {
   </div>
   <h1>${title}</h1>
   <p class="sub">Steps run in order. Log = passthrough (data unchanged, written to flow log). API and Local DB use the Param column (API doc ID or profile ID).</p>
-  <p class="sub" style="margin-top:0.5rem; padding:0.5rem; background:var(--app-table-bg, #161b22); border-radius:6px; border-left:3px solid var(--app-link, #58a6ff);"><strong>Persistence:</strong> The flow writes to the database only when it includes one of: <em>Send to Local DB</em>, <em>Update current document</em>, or <em>Create new document in this profile</em>. If none of these steps are present, the result is not saved (&quot;fire and forget&quot;). Adding or removing a Log step does not change this — logging is neutral.</p>
+  <p class="sub" style="margin-top:0.5rem; padding:0.5rem; background:var(--app-table-bg, #161b22); border-radius:6px; border-left:3px solid var(--app-link, #58a6ff);"><strong>Persistence:</strong> The flow writes or deletes in the database when it includes one of: <em>Send to Local DB</em>, <em>Update current document</em>, <em>Create new document in this profile</em>, or <em>Delete old entries in this profile</em> (Param e.g. <code>7d</code> or <code>2w</code> — rows with <code>createdAt</code> older than that age, capped per run). If none of these are present, the result is not saved (&quot;fire and forget&quot;). Log steps are neutral.</p>
   ${errHtml}
   <form id="flow-form">
     ${revInput}
@@ -9032,6 +10612,8 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'update'
           : (step && step.target === 'create')
           ? 'create'
+          : (step && step.target === 'purgeOld')
+          ? 'purgeOld'
           : 'log';
       const label = (step && step.label != null) ? String(step.label).replace(/"/g, '&quot;') : '';
       const param = (step && step.param != null) ? String(step.param).replace(/"/g, '&quot;') : '';
@@ -9048,6 +10630,8 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'Not used'
           : target === 'create'
           ? 'Not used'
+          : target === 'purgeOld'
+          ? 'Age: 7d or 2w (days/weeks)'
           : '—';
       tr.innerHTML =
         '<td class="step-num"></td>' +
@@ -9059,6 +10643,7 @@ function renderEditFlowPage(doc, err, appUi) {
         '<option value="script"' + (target === 'script' ? ' selected' : '') + '>Run script (JS Processing)</option>' +
         '<option value="update"' + (target === 'update' ? ' selected' : '') + '>Update current document</option>' +
         '<option value="create"' + (target === 'create' ? ' selected' : '') + '>Create new document in this profile</option>' +
+        '<option value="purgeOld"' + (target === 'purgeOld' ? ' selected' : '') + '>Delete old entries in this profile</option>' +
         '</select></td>' +
         '<td><input type="text" class="step-label" placeholder="Step label" value="' + label + '"></td>' +
         '<td><input type="text" class="step-param" placeholder="' + paramPlaceholder + '" value="' + param + '"></td>' +
@@ -9081,6 +10666,8 @@ function renderEditFlowPage(doc, err, appUi) {
             stepParam.placeholder = 'Not used';
           } else if (this.value === 'create') {
             stepParam.placeholder = 'Not used';
+          } else if (this.value === 'purgeOld') {
+            stepParam.placeholder = 'Age: 7d or 2w (days/weeks)';
           } else {
             stepParam.placeholder = '—';
           }
@@ -10035,7 +11622,7 @@ function renderEditQueryPage(doc, err, appUi, profiles) {
 </html>`;
 }
 
-function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
+function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef, prefillUserRef, prefillPasswordRef) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const isEdit = !!(doc && doc._id);
@@ -10045,16 +11632,28 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
   const descVal = doc && typeof doc.description === "string" ? escapeHtml(doc.description) : "";
   const urlVal = doc && typeof doc.url === "string" ? escapeHtml(doc.url) : "";
   const methodVal = doc && doc.method === "POST" ? "POST" : doc && doc.method === "PUT" ? "PUT" : doc && doc.method === "PATCH" ? "PATCH" : "GET";
+  const authTypeStored = doc ? normalizeElenkoApiAuthType(doc) : "none";
   const apiKeyRefRaw =
     doc && typeof doc.apiKeyRef === "string" && doc.apiKeyRef.trim()
       ? doc.apiKeyRef.trim()
       : (typeof prefillApiKeyRef === "string" && prefillApiKeyRef.trim() ? prefillApiKeyRef.trim() : "");
   const apiKeyRefVal = apiKeyRefRaw ? escapeHtml(apiKeyRefRaw) : "";
+  const apiUserRefRaw =
+    doc && typeof doc.apiUserRef === "string" && doc.apiUserRef.trim()
+      ? doc.apiUserRef.trim()
+      : (typeof prefillUserRef === "string" && prefillUserRef.trim() ? prefillUserRef.trim() : "");
+  const apiUserRefVal = apiUserRefRaw ? escapeHtml(apiUserRefRaw) : "";
+  const apiPasswordRefRaw =
+    doc && typeof doc.apiPasswordRef === "string" && doc.apiPasswordRef.trim()
+      ? doc.apiPasswordRef.trim()
+      : (typeof prefillPasswordRef === "string" && prefillPasswordRef.trim() ? prefillPasswordRef.trim() : "");
+  const apiPasswordRefVal = apiPasswordRefRaw ? escapeHtml(apiPasswordRefRaw) : "";
   const responseTargetVal = doc && doc.responseTarget === "create" ? "create" : doc && doc.responseTarget === "forward" ? "forward" : "update";
   const templateVal = doc && typeof doc.template === "string" ? escapeHtml(doc.template) : "";
   const responseFieldVal = doc && typeof doc.responseField === "string" ? escapeHtml(doc.responseField) : "";
   const responseStartVal = doc && typeof doc.responseStart === "string" ? escapeHtml(doc.responseStart) : "";
   const responseEndVal = doc && typeof doc.responseEnd === "string" ? escapeHtml(doc.responseEnd) : "";
+  const getQueryFromEntryChecked = isEdit && doc ? doc.getQueryFromEntry !== false : false;
   const returnToRaw = (typeof returnTo === "string" && returnTo.trim()) ? returnTo.trim() : "";
   const defaultNameForKey = nameVal ? encodeURIComponent(nameVal) : "";
   const keyEditHref = apiKeyRefRaw
@@ -10134,20 +11733,48 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
       <option value="PUT"${methodVal === "PUT" ? " selected" : ""}>PUT</option>
       <option value="PATCH"${methodVal === "PATCH" ? " selected" : ""}>PATCH</option>
     </select>
-    <label for="template">Template <span class="sub">(optional) API call with placeholders: use #fieldName# for Elenko document fields, e.g. {directory-query:'#customer#'}</span></label>
+    <label for="apiAuthType">Authentication</label>
+    <select id="apiAuthType" name="apiAuthType">
+      <option value="none"${authTypeStored === "none" ? " selected" : ""}>None</option>
+      <option value="bearer"${authTypeStored === "bearer" ? " selected" : ""}>Bearer or API key (Authorization + api-key headers)</option>
+      <option value="basic"${authTypeStored === "basic" ? " selected" : ""}>HTTP Basic (username + password documents)</option>
+      <option value="digest"${authTypeStored === "digest" ? " selected" : ""}>HTTP Digest (username + password documents)</option>
+      <option value="fritz"${authTypeStored === "fritz" ? " selected" : ""}>FRITZ!Box session (login_sid.lua + sid — use for /api/v0/smarthome)</option>
+    </select>
+    <p class="sub" id="apiAuthHint" style="margin-top:0.25rem;"></p>
+    <div id="authBearerBlock">
+    <label for="apiKeyRef">Secret key document ID <span class="sub">(bearer token or API key)</span></label>
+    <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+      <input type="text" id="apiKeyRef" name="apiKeyRef" placeholder="key_..." value="${apiKeyRefVal}" style="max-width:20rem;">
+      <a href="#" id="createEditKeyLink" class="btn btn-secondary" style="margin-top:0;">Create / Edit secret document</a>
+    </div>
+    <div id="apiKeyRefNotice" class="msg" style="margin-top:0.25rem;" aria-live="polite"></div>
+    </div>
+    <div id="authUserPassBlock" style="display:none;">
+    <label for="apiUserRef">Username key document ID</label>
+    <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+      <input type="text" id="apiUserRef" name="apiUserRef" placeholder="key_...-user" value="${apiUserRefVal}" style="max-width:20rem;">
+      <a href="#" id="createEditUserKeyLink" class="btn btn-secondary" style="margin-top:0;">Create / Edit username document</a>
+    </div>
+    <label for="apiPasswordRef" style="margin-top:0.75rem;">Password key document ID</label>
+    <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+      <input type="text" id="apiPasswordRef" name="apiPasswordRef" placeholder="key_...-pass" value="${apiPasswordRefVal}" style="max-width:20rem;">
+      <a href="#" id="createEditPasswordKeyLink" class="btn btn-secondary" style="margin-top:0;">Create / Edit password document</a>
+    </div>
+    <div id="apiUserPassRefNotice" class="msg" style="margin-top:0.25rem;" aria-live="polite"></div>
+    </div>
+    <label for="template">Template <span class="sub">(optional) For POST/PUT/PATCH: request body with #fieldName# placeholders. For GET: use only if you need a dynamic URL or body-like URL; otherwise leave empty and set the URL above.</span></label>
     <textarea id="template" name="template" placeholder='e.g. {"query":"#customer#"}' rows="4" style="width:100%;max-width:28rem;font-family:monospace;">${templateVal}</textarea>
+    <label class="checkbox-row" for="getQueryFromEntry" style="display:flex;align-items:flex-start;gap:0.5rem;margin-top:0.75rem;max-width:32rem;color:var(--app-label, #8b949e);cursor:pointer;">
+      <input type="checkbox" id="getQueryFromEntry" name="getQueryFromEntry" style="width:auto;max-width:none;margin-top:0.2rem;flex-shrink:0;"${getQueryFromEntryChecked ? " checked" : ""}>
+      <span>Append entry fields as GET query parameters when Template is empty <span class="sub">(older behaviour; off for fixed URLs such as FRITZ!Box <code>/api/v0/...</code> to avoid very long URLs)</span></span>
+    </label>
     <label for="responseField">Response field <span class="sub">(optional) Elenko document field name where the raw API response body will be stored when updating the same entry)</span></label>
     <input type="text" id="responseField" name="responseField" placeholder="e.g. apiResponse" value="${responseFieldVal}">
     <label for="responseStart">Response start <span class="sub">(optional) Character sequence that marks the start of the useful text; everything before and including it is removed)</span></label>
     <input type="text" id="responseStart" name="responseStart" placeholder='e.g. "content":"' value="${responseStartVal}" style="font-family:monospace;">
     <label for="responseEnd">Response end <span class="sub">(optional) Character sequence that marks the end of the useful text; it and everything after it is removed)</span></label>
     <input type="text" id="responseEnd" name="responseEnd" placeholder='e.g. "}}]}' value="${responseEndVal}" style="font-family:monospace;">
-    <label for="apiKeyRef">API key document ID <span class="sub">(set from API name below, or enter manually)</span></label>
-    <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
-      <input type="text" id="apiKeyRef" name="apiKeyRef" placeholder="key_..." value="${apiKeyRefVal}" style="max-width:20rem;">
-      <a href="#" id="createEditKeyLink" class="btn btn-secondary" style="margin-top:0;">Create / Edit API key document</a>
-    </div>
-    <div id="apiKeyRefNotice" class="msg" style="margin-top:0.25rem;" aria-live="polite"></div>
     <label for="responseTarget">Response target</label>
     <select id="responseTarget" name="responseTarget">
       <option value="update"${responseTargetVal === "update" ? " selected" : ""}>Update same entry (lastApiResponse)</option>
@@ -10164,6 +11791,8 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
       return 'key_' + (slug.slice(0, 80) || 'key');
     }
     var apiKeyRefManuallyEdited = false;
+    var apiUserRefManuallyEdited = false;
+    var apiPasswordRefManuallyEdited = false;
     function syncApiKeyRefFromName() {
       var nameEl = document.getElementById('name');
       var refEl = document.getElementById('apiKeyRef');
@@ -10174,29 +11803,104 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
         refEl.value = n ? slugifyForKeyId(n) : '';
       }
     }
+    function syncUserPassRefsFromName() {
+      var nameEl = document.getElementById('name');
+      var userEl = document.getElementById('apiUserRef');
+      var passEl = document.getElementById('apiPasswordRef');
+      if (!nameEl || !userEl || !passEl) return;
+      var n = (nameEl.value || '').trim();
+      if (!n) return;
+      var base = slugifyForKeyId(n);
+      if (!apiUserRefManuallyEdited && !(userEl.value || '').trim()) userEl.value = base + '-user';
+      if (!apiPasswordRefManuallyEdited && !(passEl.value || '').trim()) passEl.value = base + '-pass';
+    }
+    function updateAuthUi() {
+      var sel = document.getElementById('apiAuthType');
+      var hint = document.getElementById('apiAuthHint');
+      var bBlock = document.getElementById('authBearerBlock');
+      var upBlock = document.getElementById('authUserPassBlock');
+      if (!sel || !hint || !bBlock || !upBlock) return;
+      var v = sel.value || 'none';
+      if (v === 'none') {
+        hint.textContent = 'No Authorization headers are sent.';
+        bBlock.style.display = 'none';
+        upBlock.style.display = 'none';
+      } else if (v === 'bearer') {
+        hint.textContent = 'The secret document value is sent as Bearer token and as the api-key header.';
+        bBlock.style.display = 'block';
+        upBlock.style.display = 'none';
+      } else if (v === 'fritz') {
+        hint.textContent = 'Same username/password key documents as Digest. Logs in via login_sid.lua and adds sid= to the request URL (needed for FRITZ! JSON Smart Home API, not plain HTTP Digest).';
+        bBlock.style.display = 'none';
+        upBlock.style.display = 'block';
+      } else {
+        hint.textContent = 'Use two key documents: one stores the username, one the password (FRITZ!Box and similar).';
+        bBlock.style.display = 'none';
+        upBlock.style.display = 'block';
+      }
+    }
+    function openKeyCreateUrl(credentialField) {
+      var name = (document.getElementById('name').value || '').trim();
+      var refEl = credentialField === 'apiUserRef' ? document.getElementById('apiUserRef')
+        : credentialField === 'apiPasswordRef' ? document.getElementById('apiPasswordRef')
+        : document.getElementById('apiKeyRef');
+      var docId = refEl ? (refEl.value || '').trim() : '';
+      var returnTo = window.location.pathname + window.location.search;
+      var q = new URLSearchParams();
+      if (returnTo) q.set('returnTo', returnTo);
+      q.set('credentialField', credentialField);
+      if (docId) q.set('apiKeyDocId', docId);
+      if (name) q.set('defaultName', name);
+      window.location.href = '/apis/keys/create?' + q.toString();
+    }
     var form = document.getElementById('api-form');
     var formId = document.getElementById('apiId').value;
     syncApiKeyRefFromName();
+    syncUserPassRefsFromName();
+    updateAuthUi();
     var apiKeyRefEl = document.getElementById('apiKeyRef');
     if (apiKeyRefEl) {
       apiKeyRefEl.addEventListener('input', function() {
         apiKeyRefManuallyEdited = true;
       });
     }
-    document.getElementById('name').addEventListener('input', syncApiKeyRefFromName);
-    document.getElementById('name').addEventListener('blur', syncApiKeyRefFromName);
+    var apiUserRefEl = document.getElementById('apiUserRef');
+    if (apiUserRefEl) {
+      apiUserRefEl.addEventListener('input', function() { apiUserRefManuallyEdited = true; });
+    }
+    var apiPasswordRefEl = document.getElementById('apiPasswordRef');
+    if (apiPasswordRefEl) {
+      apiPasswordRefEl.addEventListener('input', function() { apiPasswordRefManuallyEdited = true; });
+    }
+    document.getElementById('name').addEventListener('input', function() {
+      syncApiKeyRefFromName();
+      syncUserPassRefsFromName();
+    });
+    document.getElementById('name').addEventListener('blur', function() {
+      syncApiKeyRefFromName();
+      syncUserPassRefsFromName();
+    });
+    var apiAuthTypeEl = document.getElementById('apiAuthType');
+    if (apiAuthTypeEl) apiAuthTypeEl.addEventListener('change', updateAuthUi);
     var createEditKeyLink = document.getElementById('createEditKeyLink');
     if (createEditKeyLink) {
       createEditKeyLink.addEventListener('click', function(e) {
         e.preventDefault();
-        var name = (document.getElementById('name').value || '').trim();
-        var apiKeyRef = (document.getElementById('apiKeyRef').value || '').trim();
-        var returnTo = window.location.pathname + window.location.search;
-        var q = returnTo ? '?returnTo=' + encodeURIComponent(returnTo) : '';
-        // Always open create/upsert page; this also handles missing key docs gracefully.
-        if (apiKeyRef) q += (q ? '&' : '?') + 'apiKeyDocId=' + encodeURIComponent(apiKeyRef);
-        if (name) q += (q ? '&' : '?') + 'defaultName=' + encodeURIComponent(name);
-        window.location.href = '/apis/keys/create' + q;
+        openKeyCreateUrl('apiKeyRef');
+      });
+    }
+    var createEditUserKeyLink = document.getElementById('createEditUserKeyLink');
+    if (createEditUserKeyLink) {
+      createEditUserKeyLink.addEventListener('click', function(e) {
+        e.preventDefault();
+        openKeyCreateUrl('apiUserRef');
+      });
+    }
+    var createEditPasswordKeyLink = document.getElementById('createEditPasswordKeyLink');
+    if (createEditPasswordKeyLink) {
+      createEditPasswordKeyLink.addEventListener('click', function(e) {
+        e.preventDefault();
+        openKeyCreateUrl('apiPasswordRef');
       });
     }
     form.onsubmit = async function(e) {
@@ -10206,7 +11910,11 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
       var description = (document.getElementById('description').value || '').trim();
       var url = (document.getElementById('url').value || '').trim();
       var method = document.getElementById('method').value || 'GET';
+      var apiAuthType = (document.getElementById('apiAuthType').value || 'none').trim();
       var apiKeyRef = (document.getElementById('apiKeyRef').value || '').trim();
+      var apiUserRef = (document.getElementById('apiUserRef').value || '').trim();
+      var apiPasswordRef = (document.getElementById('apiPasswordRef').value || '').trim();
+      var getQueryFromEntry = !!(document.getElementById('getQueryFromEntry') && document.getElementById('getQueryFromEntry').checked);
       var responseTarget = document.getElementById('responseTarget').value || 'update';
       var template = (document.getElementById('template').value || '').trim();
       var responseField = (document.getElementById('responseField').value || '').trim();
@@ -10214,7 +11922,7 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
       var responseEnd = (document.getElementById('responseEnd').value || '');
       var urlApi = formId ? '/api/apis/' + encodeURIComponent(formId) : '/api/apis';
       var methodHttp = formId ? 'PUT' : 'POST';
-      var body = { name: name, description: description, url: url, method: method, template: template, responseField: responseField, responseStart: responseStart, responseEnd: responseEnd, apiKeyRef: apiKeyRef, responseTarget: responseTarget };
+      var body = { name: name, description: description, url: url, method: method, apiAuthType: apiAuthType, template: template, responseField: responseField, responseStart: responseStart, responseEnd: responseEnd, apiKeyRef: apiKeyRef, apiUserRef: apiUserRef, apiPasswordRef: apiPasswordRef, getQueryFromEntry: getQueryFromEntry, responseTarget: responseTarget };
       try {
         var r = await fetch(urlApi, { method: methodHttp, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         var data = await r.json();
@@ -10232,7 +11940,7 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef) {
 </html>`;
 }
 
-function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApiKeyDocId) {
+function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApiKeyDocId, credentialField) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const isEdit = !!(doc && doc._id);
@@ -10240,7 +11948,15 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
   const apiKeyDocIdVal = id ? id : (typeof defaultApiKeyDocId === "string" ? defaultApiKeyDocId.trim() : "");
   const rev = doc && doc._rev;
   const nameVal = doc && typeof doc.name === "string" ? escapeHtml(doc.name) : (typeof defaultName === "string" && defaultName ? escapeHtml(defaultName) : "");
-  const keyPlaceholder = isEdit ? "Leave blank to keep current key" : "API key / secret";
+  const credRaw = typeof credentialField === "string" ? credentialField.trim() : "";
+  const credentialReturnParam = new Set(["apiKeyRef", "apiUserRef", "apiPasswordRef"]).has(credRaw) ? credRaw : "apiKeyRef";
+  const keyLabelHint =
+    credentialReturnParam === "apiUserRef"
+      ? "Stored value is used as the HTTP username (Basic/Digest)."
+      : credentialReturnParam === "apiPasswordRef"
+        ? "Stored value is used as the HTTP password (Basic/Digest)."
+        : "Stored value is used as Bearer token and api-key header when the API uses bearer auth.";
+  const keyPlaceholder = isEdit ? "Leave blank to keep current value" : "Secret value";
   const returnToVal = typeof returnTo === "string" && returnTo.trim() ? escapeHtml(returnTo.trim()) : "";
   const returnToInput = returnToVal ? `<input type="hidden" name="returnTo" id="returnTo" value="${returnToVal}">` : "";
   const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
@@ -10300,7 +12016,7 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
     <a href="/apis" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
   </div>
   <h1>${title}</h1>
-  <p class="sub">Stored in the config store. The document ID is derived from the name (e.g. &quot;My Service&quot; → key_my-service). Use this ID in the API form as &quot;API key document ID&quot;.</p>
+  <p class="sub">Stored in the config store. The document ID is derived from the name (e.g. &quot;My Service&quot; → key_my-service). ${escapeHtml(keyLabelHint)}</p>
   ${errHtml}
   <form id="api-key-form" autocomplete="off">
     ${revInput}
@@ -10310,7 +12026,7 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
     <input type="text" id="apiKeyDocId" value="${apiKeyDocIdVal ? escapeHtml(apiKeyDocIdVal) : ""}" readonly>
     <label for="name">Description</label>
     <input type="text" id="name" name="name" required placeholder="e.g. OpenWeather API key" value="${nameVal}">
-    <label for="key">API key / secret</label>
+    <label for="key">Secret value</label>
     <input type="password" id="key" name="key" placeholder="${escapeHtml(keyPlaceholder)}" autocomplete="off">
   </form>
   <div id="msg"></div>
@@ -10320,6 +12036,7 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
     var apiKeyDocIdEl = document.getElementById('apiKeyDocId');
     var returnToEl = document.getElementById('returnTo');
     var returnToVal = returnToEl ? returnToEl.value : '';
+    var credentialField = ${JSON.stringify(credentialReturnParam)};
 
     function syncApiKeyDocId() {
       // In edit mode, the document id is fixed; in create mode it is derived from the "Description"/name.
@@ -10355,7 +12072,7 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
         msgEl.className = 'msg ok';
         if (returnToVal && data.id) {
           var sep = returnToVal.indexOf('?') !== -1 ? '&' : '?';
-          setTimeout(function() { window.location.href = returnToVal + sep + 'apiKeyRef=' + encodeURIComponent(data.id); }, 500);
+          setTimeout(function() { window.location.href = returnToVal + sep + credentialField + '=' + encodeURIComponent(data.id); }, 500);
         } else {
           setTimeout(function() { window.location.href = '/apis'; }, keyId ? 600 : 800);
         }
@@ -10540,9 +12257,11 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
                 ? "url"
                 : item.fieldType === "image"
                 ? "image"
+                : item.fieldType === "chart"
+                ? "chart"
                 : "text";
             const typeSelect = item.fieldName
-              ? `<select class="fl-type"><option value="text"${fieldTypeVal === "text" ? " selected" : ""}>Text</option><option value="markdown"${fieldTypeVal === "markdown" ? " selected" : ""}>Markdown</option><option value="url"${fieldTypeVal === "url" ? " selected" : ""}>URL</option><option value="image"${fieldTypeVal === "image" ? " selected" : ""}>Image</option></select>`
+              ? `<select class="fl-type"><option value="text"${fieldTypeVal === "text" ? " selected" : ""}>Text</option><option value="markdown"${fieldTypeVal === "markdown" ? " selected" : ""}>Markdown</option><option value="url"${fieldTypeVal === "url" ? " selected" : ""}>URL</option><option value="image"${fieldTypeVal === "image" ? " selected" : ""}>Image</option><option value="chart"${fieldTypeVal === "chart" ? " selected" : ""}>Chart</option></select>`
               : "<span class=\"sub\">—</span>";
             return `
         <tr class="field-layout-row">
@@ -10828,8 +12547,34 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
       const xv = (x != null && x !== '') ? String(x) : '';
       const yv = (y != null && y !== '') ? String(y) : '';
       const hv = (height != null && height !== '') ? String(height) : '';
-      const typeVal = (fieldType === 'markdown') ? 'markdown' : (fieldType === 'url' ? 'url' : (fieldType === 'image' ? 'image' : 'text'));
-      tr.innerHTML = '<td><input type="text" class="fl-field" placeholder="Field name or label id" value="' + (fieldName || '').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-order" min="0" value="' + (order != null ? order : n) + '"></td><td><select class="fl-type"><option value="text"' + (typeVal === 'text' ? ' selected' : '') + '>Text</option><option value="markdown"' + (typeVal === 'markdown' ? ' selected' : '') + '>Markdown</option><option value="url"' + (typeVal === 'url' ? ' selected' : '') + '>URL</option><option value="image"' + (typeVal === 'image' ? ' selected' : '') + '>Image</option></select></td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' + (width || '100%').replace(/"/g, '&quot;') + '"></td><td><input type="number" class="fl-x" step="any" placeholder="—"></td><td><input type="number" class="fl-y" step="any" placeholder="—"></td><td><input type="number" class="fl-height" step="any" placeholder="—" min="0"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
+      const typeVal =
+        fieldType === "markdown"
+          ? "markdown"
+          : fieldType === "url"
+          ? "url"
+          : fieldType === "image"
+          ? "image"
+          : fieldType === "chart"
+          ? "chart"
+          : "text";
+      tr.innerHTML =
+        '<td><input type="text" class="fl-field" placeholder="Field name or label id" value="' +
+        (fieldName || "").replace(/"/g, "&quot;") +
+        '"></td><td><input type="number" class="fl-order" min="0" value="' +
+        (order != null ? order : n) +
+        '"></td><td><select class="fl-type"><option value="text"' +
+        (typeVal === "text" ? " selected" : "") +
+        '>Text</option><option value="markdown"' +
+        (typeVal === "markdown" ? " selected" : "") +
+        '>Markdown</option><option value="url"' +
+        (typeVal === "url" ? " selected" : "") +
+        '>URL</option><option value="image"' +
+        (typeVal === "image" ? " selected" : "") +
+        '>Image</option><option value="chart"' +
+        (typeVal === "chart" ? " selected" : "") +
+        '>Chart</option></select></td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' +
+        (width || "100%").replace(/"/g, "&quot;") +
+        '"></td><td><input type="number" class="fl-x" step="any" placeholder="—"></td><td><input type="number" class="fl-y" step="any" placeholder="—"></td><td><input type="number" class="fl-height" step="any" placeholder="—" min="0"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
       tr.querySelector('.fl-x').value = xv;
       tr.querySelector('.fl-y').value = yv;
       tr.querySelector('.fl-height').value = hv;
@@ -10919,7 +12664,14 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
         if (labelIds.has(firstCol)) item.labelId = firstCol; else {
           item.fieldName = firstCol;
           const typeEl = tr.querySelector('.fl-type');
-          item.fieldType = (typeEl && (typeEl.value === 'markdown' || typeEl.value === 'url' || typeEl.value === 'image')) ? typeEl.value : 'text';
+          item.fieldType =
+            typeEl &&
+            (typeEl.value === "markdown" ||
+              typeEl.value === "url" ||
+              typeEl.value === "image" ||
+              typeEl.value === "chart")
+              ? typeEl.value
+              : "text";
         }
         return item;
       }).filter(Boolean);
@@ -11271,7 +13023,7 @@ function renderStartPage(profiles, role, appUi) {
     const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
   const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
   const thead = '<tr><th>Name</th><th>Description</th><th class="col-mobile-hidden">Creation date</th></tr>';
 
@@ -11330,7 +13082,7 @@ function renderStartPage(profiles, role, appUi) {
     ${isAdmin ? actionsAdmin : actionsUser}
     ${actionsCommon}
     <select id="nav-user-admin" class="nav-select nav-select-admin" aria-label="Administration">${userAdminOptions}</select>
-    ${isAdmin ? '<select id="nav-flow-processing" class="nav-select nav-select-flow" aria-label="Flow"><option value="" disabled selected>Flow</option><option value="/flows">Flows</option><option value="/apis">REST APIs</option><option value="/js-processing">JS Processing</option></select>' : ''}
+    ${isAdmin ? '<select id="nav-flow-processing" class="nav-select nav-select-flow" aria-label="Flow"><option value="" disabled selected>Flow</option><option value="/flows">Flows</option><option value="/timers">Timers</option><option value="/apis">REST APIs</option><option value="/js-processing">JS Processing</option></select>' : ''}
     ${isAdmin ? `<select id="nav-special" class="nav-select nav-select-special" aria-label="Special functions">${specialOptions}</select>` : ""}
   </p>
   <table>
@@ -12761,6 +14513,148 @@ function renderEditAppConfigPage(appUi, err) {
 </html>`;
 }
 
+function renderApplicationPropertiesPage(appUi, err) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  ensureAppUiTimeFields(appUi || {});
+  const mode = appUi.flowLogDisplayMode || "utc";
+  const ianaVal = typeof appUi.flowLogIana === "string" ? appUi.flowLogIana : "";
+  const utcOffVal = Number.isFinite(appUi.flowLogUtcOffsetMinutes) ? String(appUi.flowLogUtcOffsetMinutes) : "0";
+  const dockAdjVal = Number.isFinite(appUi.flowLogDockerAdjustMinutes) ? String(appUi.flowLogDockerAdjustMinutes) : "0";
+  const id = appUi && appUi._id ? String(appUi._id) : "";
+  const rev = appUi && appUi._rev ? String(appUi._rev) : "";
+  const msgErr = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+  const now = new Date();
+  const serverTz = process.env.TZ && String(process.env.TZ).trim() ? String(process.env.TZ).trim() : "(not set)";
+  const serverIso = now.toISOString();
+  const serverLocal = now.toString();
+  const previewMs = Date.now();
+  const tsPreview = new Date(previewMs).toISOString();
+  const tsDisplayPreview = computeFlowLogTsDisplay(previewMs, appUi) || "(not shown; choose IANA or fixed UTC offset below)";
+
+  const sel = (v) => (mode === v ? " selected" : "");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Application properties</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 42rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    h2 { font-weight: 600; font-size: 1.05rem; margin-top: 1.5rem; margin-bottom: 0.5rem; color: var(--app-text, #e6edf3); }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"], input[type="number"] { width: 100%; max-width: 24rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    select { width: 100%; max-width: 24rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
+    .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; margin-left: 0.5rem; border: 1px solid var(--app-table-border, #30363d); }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .actions a:hover { text-decoration: underline; }
+    .panel { background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 8px; padding: 1rem; margin-top: 1rem; font-size: 0.9rem; }
+    .panel code { word-break: break-all; font-size: 0.85em; }
+    .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
+    .msg.err { background: #3d1f1f; color: #f85149; }
+    .msg.ok { background: #1f3d2a; color: #3fb950; }
+  </style>
+</head>
+<body>
+  <div class="actions">
+    <a href="/" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem;">← Start</a>
+    <button type="submit" form="app-props-form" class="btn btn-primary" style="margin-left:1rem;">Save</button>
+    <a href="/" class="btn btn-secondary">Cancel</a>
+  </div>
+  <h1>Application properties</h1>
+  <p class="sub">Operational settings independent of theme. Flow log lines always include <code>ts</code> (UTC ISO). When configured below, a second field <code>tsDisplay</code> is added for your local or business timezone.</p>
+  ${msgErr}
+  <div class="panel">
+    <strong>Server (container) clock — reference only</strong>
+    <p class="sub" style="margin:0.5rem 0 0 0;"><code>TZ</code> env: ${escapeHtml(serverTz)}</p>
+    <p class="sub" style="margin:0.35rem 0 0 0;"><code>Date.toISOString()</code>: <code>${escapeHtml(serverIso)}</code></p>
+    <p class="sub" style="margin:0.35rem 0 0 0;"><code>Date.toString()</code> (Node default locale): <code>${escapeHtml(serverLocal)}</code></p>
+    <p class="sub" style="margin:0.75rem 0 0 0;">Timers use the server&apos;s local date/time for their start fields. For correct anchors in Docker, set <code>TZ</code> in compose or use UTC in the timer and rely on <code>tsDisplay</code> here for log readability.</p>
+  </div>
+  <h2>Flow log timestamps</h2>
+  <form id="app-props-form">
+    ${id ? `<input type="hidden" id="appPropsId" name="_id" value="${escapeHtml(id)}">` : ""}
+    ${rev ? `<input type="hidden" id="appPropsRev" name="_rev" value="${escapeHtml(rev)}">` : ""}
+    <label for="flowLogDisplayMode">Display mode (adds <code>tsDisplay</code>)</label>
+    <select id="flowLogDisplayMode" name="flowLogDisplayMode">
+      <option value="utc"${sel("utc")}>UTC only — only <code>ts</code> (default)</option>
+      <option value="iana"${sel("iana")}>IANA timezone (e.g. Europe/Berlin)</option>
+      <option value="utc_offset"${sel("utc_offset")}>Fixed offset from UTC (no DST)</option>
+    </select>
+    <label for="flowLogIana">IANA timezone name</label>
+    <input type="text" id="flowLogIana" name="flowLogIana" placeholder="Europe/Berlin" value="${escapeHtml(ianaVal)}">
+    <p class="sub" style="margin-top:0.25rem;">Used when mode is IANA. Invalid names are skipped when writing the log.</p>
+    <label for="flowLogUtcOffsetMinutes">Fixed offset from UTC (minutes)</label>
+    <input type="number" id="flowLogUtcOffsetMinutes" name="flowLogUtcOffsetMinutes" min="-840" max="840" step="15" value="${escapeHtml(utcOffVal)}">
+    <p class="sub" style="margin-top:0.25rem;">Example: <code>120</code> for UTC+2. Range −840 … +840. Used when mode is &quot;Fixed offset&quot;.</p>
+    <label for="flowLogDockerAdjustMinutes">Docker clock correction (minutes)</label>
+    <input type="number" id="flowLogDockerAdjustMinutes" name="flowLogDockerAdjustMinutes" min="-10080" max="10080" step="1" value="${escapeHtml(dockAdjVal)}">
+    <p class="sub" style="margin-top:0.25rem;">Added to the event time <em>before</em> formatting <code>tsDisplay</code> (e.g. if the container wall clock is two hours slow but you cannot change <code>TZ</code>, try <code>+120</code>). Does not change <code>ts</code>.</p>
+  </form>
+  <div class="panel">
+    <strong>Preview at save time</strong>
+    <p class="sub" style="margin:0.5rem 0 0 0;"><code>ts</code>: <code>${escapeHtml(tsPreview)}</code></p>
+    <p class="sub" style="margin:0.35rem 0 0 0;"><code>tsDisplay</code>: <code>${escapeHtml(tsDisplayPreview)}</code></p>
+  </div>
+  <div id="msg" class="msg" style="display:none;"></div>
+  <script>
+    (function() {
+      var form = document.getElementById('app-props-form');
+      var msgEl = document.getElementById('msg');
+      if (!form || !msgEl) return;
+      form.onsubmit = async function(e) {
+        e.preventDefault();
+        msgEl.style.display = 'none';
+        msgEl.textContent = '';
+        var payload = {
+          flowLogDisplayMode: document.getElementById('flowLogDisplayMode').value,
+          flowLogIana: document.getElementById('flowLogIana').value.trim(),
+          flowLogUtcOffsetMinutes: document.getElementById('flowLogUtcOffsetMinutes').value,
+          flowLogDockerAdjustMinutes: document.getElementById('flowLogDockerAdjustMinutes').value
+        };
+        var idEl = document.getElementById('appPropsId');
+        var revEl = document.getElementById('appPropsRev');
+        if (idEl && idEl.value) payload._id = idEl.value;
+        if (revEl && revEl.value) payload._rev = revEl.value;
+        try {
+          var r = await fetch('/api/application-properties', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          var data = await r.json();
+          if (!r.ok) {
+            msgEl.textContent = data.error || 'Save failed';
+            msgEl.className = 'msg err';
+            msgEl.style.display = 'block';
+            return;
+          }
+          msgEl.textContent = 'Saved. New events will use these settings for tsDisplay.';
+          msgEl.className = 'msg ok';
+          msgEl.style.display = 'block';
+          if (data.id && idEl) idEl.value = data.id;
+          if (data.rev && revEl) revEl.value = data.rev;
+        } catch (err) {
+          msgEl.textContent = err.message || 'Request failed';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+        }
+      };
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 function renderDataExportImportPage(profiles, appUi) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
@@ -13931,8 +15825,16 @@ app.use((err, req, res, next) => {
 
 async function main() {
   await initCouch();
+  await getAppUiConfig();
   startApiWorker();
   startFlowWorker();
+  startTimerWorker();
+  setTimeout(() => {
+    syncTimersFromDb().catch((e) => console.error("syncTimersFromDb (boot):", e));
+  }, 500);
+  setInterval(() => {
+    syncTimersFromDb().catch((e) => console.error("syncTimersFromDb:", e));
+  }, 5 * 60 * 1000);
   console.log(
     "Flow logging configured for",
     process.env.FLOW_LOG_FILE || path.join(__dirname, "logs", "flow.log")
