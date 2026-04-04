@@ -1032,13 +1032,26 @@ function parseTimerLocalDateTimeMs(dateStr, timeStr) {
   const ds = typeof dateStr === "string" ? dateStr.trim() : "";
   const ts = typeof timeStr === "string" ? timeStr.trim() : "";
   if (!/^\d{4}-\d{2}-\d{2}$/.test(ds)) return NaN;
-  const m = /^(\d{1,2}):(\d{2})$/.exec(ts);
+  const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(ts);
   if (!m) return NaN;
   const hh = parseInt(m[1], 10);
   const mm = parseInt(m[2], 10);
-  if (!Number.isFinite(hh) || !Number.isFinite(mm) || mm < 0 || mm > 59 || hh < 0 || hh > 23) return NaN;
-  const tnorm = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-  const inst = new Date(`${ds}T${tnorm}:00`);
+  const ss = m[3] != null ? parseInt(m[3], 10) : 0;
+  if (
+    !Number.isFinite(hh) ||
+    !Number.isFinite(mm) ||
+    !Number.isFinite(ss) ||
+    mm < 0 ||
+    mm > 59 ||
+    ss < 0 ||
+    ss > 59 ||
+    hh < 0 ||
+    hh > 23
+  ) {
+    return NaN;
+  }
+  const tnorm = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+  const inst = new Date(`${ds}T${tnorm}`);
   return inst.getTime();
 }
 
@@ -1052,7 +1065,7 @@ function timerDocumentToWorkerPayload(doc) {
   if (!flowId || !profileId) return null;
   return {
     id: doc._id,
-    active: !!(doc.active === true || doc.active === "true"),
+    active: !!(doc.active === true || doc.active === "true" || doc.active === "on"),
     anchorMs,
     intervalMs,
     flowId,
@@ -3045,6 +3058,10 @@ async function syncTimersFromDb() {
   }
 }
 
+function syncTimersFromDbSoon(reason) {
+  syncTimersFromDb().catch((e) => console.error("syncTimersFromDb (" + reason + "):", e));
+}
+
 async function handleTimerFireMessage(msg) {
   if (!msg || msg.type !== "timerFire") return;
   const timerId = msg.timerId != null ? String(msg.timerId) : "";
@@ -3058,7 +3075,7 @@ async function handleTimerFireMessage(msg) {
     return;
   }
   if (!timerDoc || timerDoc.type !== "elenko_timer") return;
-  if (!(timerDoc.active === true || timerDoc.active === "true")) return;
+  if (!(timerDoc.active === true || timerDoc.active === "true" || timerDoc.active === "on")) return;
 
   const flowRef = timerDoc.flowId != null ? String(timerDoc.flowId).trim() : "";
   const profileId = timerDoc.profileId != null ? String(timerDoc.profileId).trim() : "";
@@ -3356,6 +3373,7 @@ async function tryRestoreBootstrapFromStoredPassword() {
     writeBootstrapFile(stored);
     await initCouch({ password: stored });
     invalidateAppUiConfigCache();
+    syncTimersFromDbSoon("after-bootstrap-restore");
     return true;
   } catch (e) {
     console.error("Restore bootstrap from stored password failed:", e);
@@ -3604,7 +3622,10 @@ app.use(async (req, res, next) => {
     if (isBootstrapFileMissing()) {
       try {
         await initCouch({ password: "admin" });
-        if (db) return next();
+        if (db) {
+          syncTimersFromDbSoon("lazy-init-admin");
+          return next();
+        }
       } catch (_) {}
     }
     return res.set("Content-Type", "text/html; charset=utf-8").send(renderSetupRequiredPage());
@@ -3629,6 +3650,7 @@ app.get("/setup", async (req, res) => {
       try {
         await initCouch({ password: "admin" });
         if (db) {
+          syncTimersFromDbSoon("setup-get-admin");
           const appUi = await getAppUiConfig();
           return res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, null, null, "/setup/change-couchdb-password", true));
         }
@@ -3672,6 +3694,7 @@ app.post("/setup", async (req, res) => {
       await configDb.insert(doc);
     }
     invalidateAppUiConfigCache();
+    syncTimersFromDbSoon("setup-complete");
     return res.redirect("/login");
   } catch (err) {
     console.error("Setup error:", err);
@@ -3750,6 +3773,7 @@ app.post("/setup/change-couchdb-password", async (req, res) => {
   } catch (e) {
     console.error("Failed to update app config with new password:", e);
   }
+  syncTimersFromDbSoon("couch-password-changed");
   return res.redirect("/login");
 });
 
@@ -3953,6 +3977,7 @@ app.post("/account/couchdb-password", requireAdmin, async (req, res) => {
   } catch (e) {
     console.error("Failed to update app config with new password:", e);
   }
+  syncTimersFromDbSoon("account-couch-password");
   return res.redirect("/account/couchdb-password?ok=" + encodeURIComponent("CouchDB password updated. Bootstrap file and app config saved. You can continue using the app."));
 });
 
@@ -15829,9 +15854,7 @@ async function main() {
   startApiWorker();
   startFlowWorker();
   startTimerWorker();
-  setTimeout(() => {
-    syncTimersFromDb().catch((e) => console.error("syncTimersFromDb (boot):", e));
-  }, 500);
+  await syncTimersFromDb();
   setInterval(() => {
     syncTimersFromDb().catch((e) => console.error("syncTimersFromDb:", e));
   }, 5 * 60 * 1000);
