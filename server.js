@@ -2548,6 +2548,14 @@ async function buildConfigExport(scope, profileId) {
     ? (await db.find({ selector: { type: "elenko_profile" }, fields: ["_id"], limit: 1000 })).docs.map((p) => p._id)
     : (profileId ? [profileId] : []);
 
+  let allTimerDocs = [];
+  if (configDb && profileIds.length > 0) {
+    try {
+      const timerFind = await configDb.find({ selector: { type: "elenko_timer" }, limit: 500 });
+      allTimerDocs = Array.isArray(timerFind.docs) ? timerFind.docs : [];
+    } catch (_) {}
+  }
+
   for (const pid of profileIds) {
     let profile;
     try {
@@ -2618,6 +2626,22 @@ async function buildConfigExport(scope, profileId) {
       const resolvedProfileFlowIds = await resolveConfigDocIds(configDb, [profileInfoFlowId], "elenko_flow", "name");
       for (const rf of resolvedProfileFlowIds) flowIdSet.add(rf);
     }
+
+    const profileNameTrim = typeof profile.name === "string" ? profile.name.trim() : "";
+    const timerDocsForProfile = allTimerDocs.filter((t) => {
+      if (!t || t.type !== "elenko_timer") return false;
+      const tPid = typeof t.profileId === "string" ? t.profileId.trim() : "";
+      return tPid === pid || (profileNameTrim !== "" && tPid === profileNameTrim);
+    });
+    if (configDb) {
+      for (const t of timerDocsForProfile) {
+        const flowRef = typeof t.flowId === "string" ? t.flowId.trim() : "";
+        if (!flowRef) continue;
+        const resolvedTimerFlow = await resolveConfigDocIds(configDb, [flowRef], "elenko_flow", "name");
+        for (const rf of resolvedTimerFlow) flowIdSet.add(rf);
+      }
+    }
+
     const flowIds = [...flowIdSet];
     const flowDocs = [];
     for (const flid of flowIds) {
@@ -2627,6 +2651,8 @@ async function buildConfigExport(scope, profileId) {
       } catch (_) {}
     }
     for (const f of flowDocs) addConfig(f);
+
+    for (const t of timerDocsForProfile) addConfig(t);
 
     // APIs referenced directly from entry forms (Single step with target = "api")
     if (configDb) {
@@ -4501,6 +4527,7 @@ app.post("/api/config-import", requireAdmin, async (req, res) => {
       return res.status(400).json({ error: "Invalid export format. Use a file exported from this Export / Import configuration page." });
     }
     const result = await applyConfigImport(data, true);
+    if (result.importedConfig > 0) syncTimersFromDbSoon("config-import");
     res.json(result);
   } catch (err) {
     console.error("Config import error:", err);
@@ -8038,7 +8065,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
             return (
               `<div class="entry-response-block">` +
               `<div class="entry-response-marker">↳ Response</div>` +
-              `<table><tbody>${rows}</tbody></table>` +
+              `<table class="elenko-entry-fields-table"><tbody>${rows}</tbody></table>` +
               `</div>`
             );
           })
@@ -8161,7 +8188,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
         </tr>`;
         })
         .join("");
-    contentHtml = `<table><tbody>${rows}</tbody></table>`;
+    contentHtml = `<table class="elenko-entry-fields-table"><tbody>${rows}</tbody></table>`;
     if (linkedQueryHtml) contentHtml += linkedQueryHtml;
   }
   if (responsesHtml) contentHtml += responsesHtml;
@@ -8200,18 +8227,29 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     }
     a.entry-nav-pag:hover { text-decoration: none; background: #30363d; color: var(--entry-link, #58a6ff); }
     .entry-nav-pag.entry-nav-disabled { color: #484f58; pointer-events: none; cursor: default; background: #21262d; }
-    .topbar-links .topbar-back-link { font-size: 1.35rem; line-height: 1; }
+    /* Same button look as .entry-nav-pag / pagination; ◀ is widely supported (unlike U+2B9C). */
+    .topbar-links a.topbar-icon-btn {
+      display: inline-block;
+      padding: 0.5rem 0.75rem;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      line-height: 1;
+      border: 1px solid var(--entry-field-border, #21262d);
+      background: #21262d;
+      color: var(--entry-link, #58a6ff);
+      text-decoration: none;
+      box-sizing: border-box;
+    }
+    .topbar-links a.topbar-icon-btn:hover { text-decoration: none; background: #30363d; color: var(--entry-link, #58a6ff); }
     @media (max-width: 768px) {
-      .topbar-links .topbar-back-link {
-        font-size: 1.9rem;
-        line-height: 1;
-        padding: 0.45rem 0.65rem;
-        margin: -0.45rem 0.25rem -0.45rem -0.5rem;
+      .topbar-links a.topbar-icon-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
         min-width: 2.75rem;
         min-height: 2.75rem;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.25rem -0.45rem -0.5rem;
       }
     }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
@@ -8220,6 +8258,43 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     th, td { padding: 0.75rem 1rem; text-align: left; }
     .label { color: var(--entry-label, #8b949e); width: 40%; }
     td.value { background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 6px; }
+    @media (max-width: 768px) {
+      table.elenko-entry-fields-table,
+      table.elenko-entry-fields-table tbody {
+        display: block;
+        width: 100%;
+      }
+      table.elenko-entry-fields-table tr {
+        display: block;
+        width: 100%;
+        margin-bottom: 1.1rem;
+      }
+      table.elenko-entry-fields-table tr:last-child {
+        margin-bottom: 0;
+      }
+      table.elenko-entry-fields-table td {
+        display: block;
+        width: 100% !important;
+        max-width: 100%;
+        box-sizing: border-box;
+        border: none;
+        padding-left: 0;
+        padding-right: 0;
+      }
+      table.elenko-entry-fields-table td.label {
+        width: 100% !important;
+        padding-top: 0;
+        padding-bottom: 0.3rem;
+      }
+      table.elenko-entry-fields-table td.value {
+        padding: 0.75rem 1rem;
+      }
+      table.elenko-entry-fields-table tr.entry-label-row td {
+        padding: 0.6rem 0;
+        margin-bottom: 0.35rem;
+        border-bottom: 1px solid var(--entry-field-border, #21262d);
+      }
+    }
     .empty { color: var(--entry-label, #8b949e); font-style: italic; }
     .entry-view-stack { --entry-stack-field-max-height: 12rem; }
     .entry-view-stack .entry-field-block { margin-bottom: 1rem; min-width: 0; }
@@ -8291,7 +8366,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
 <body>
   <div class="topbar">
     <div class="topbar-main">
-      <div class="topbar-links">${isSplitEmbed ? "" : `<a href="${escapeHtml(backUrl)}" class="topbar-back-link" title="Back to database" aria-label="Back to database">⮜</a>`}${canEdit ? `<a href="${editUrl}">Edit</a>` : ""}${entryNavHtml}</div>
+      <div class="topbar-links">${isSplitEmbed ? "" : `<a href="${escapeHtml(backUrl)}" class="topbar-icon-btn" title="Back to database" aria-label="Back to database">◀</a>`}${canEdit ? `<a href="${editUrl}">Edit</a>` : ""}${entryNavHtml}</div>
       <div class="topbar-titleline">
         <h1>${title}</h1>
         ${formLabel ? `<span class="sub">Form: ${escapeHtml(formLabel)}</span>` : ""}
@@ -8573,7 +8648,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
         </tr>`;
       })
       .join("");
-    contentHtml = `<table><tbody>${rows}</tbody></table>`;
+    contentHtml = `<table class="elenko-entry-fields-table"><tbody>${rows}</tbody></table>`;
   }
 
   const orderedFieldNamesJson = JSON.stringify(orderedFieldNames);
@@ -8610,18 +8685,28 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     .topbar-links { display: inline-flex; align-items: baseline; gap: 0.75rem; }
     .topbar-links a { color: var(--entry-link, #58a6ff); text-decoration: none; }
     .topbar-links a:hover { text-decoration: underline; }
-    .topbar-links .topbar-back-link { font-size: 1.35rem; line-height: 1; }
+    .topbar-links a.topbar-icon-btn {
+      display: inline-block;
+      padding: 0.5rem 0.75rem;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      line-height: 1;
+      border: 1px solid var(--entry-field-border, #21262d);
+      background: #21262d;
+      color: var(--entry-link, #58a6ff);
+      text-decoration: none;
+      box-sizing: border-box;
+    }
+    .topbar-links a.topbar-icon-btn:hover { text-decoration: none; background: #30363d; color: var(--entry-link, #58a6ff); }
     @media (max-width: 768px) {
-      .topbar-links .topbar-back-link {
-        font-size: 1.9rem;
-        line-height: 1;
-        padding: 0.45rem 0.65rem;
-        margin: -0.45rem 0.25rem -0.45rem -0.5rem;
+      .topbar-links a.topbar-icon-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
         min-width: 2.75rem;
         min-height: 2.75rem;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.25rem -0.45rem -0.5rem;
       }
     }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
@@ -8630,6 +8715,43 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     th, td { padding: 0.4rem 0.6rem; text-align: left; }
     .label { color: var(--entry-label, #8b949e); width: 40%; }
     td.value { background: var(--entry-field-bg-edit, #161b22); border-radius: 6px; }
+    @media (max-width: 768px) {
+      table.elenko-entry-fields-table,
+      table.elenko-entry-fields-table tbody {
+        display: block;
+        width: 100%;
+      }
+      table.elenko-entry-fields-table tr {
+        display: block;
+        width: 100%;
+        margin-bottom: 1.1rem;
+      }
+      table.elenko-entry-fields-table tr:last-child {
+        margin-bottom: 0;
+      }
+      table.elenko-entry-fields-table td {
+        display: block;
+        width: 100% !important;
+        max-width: 100%;
+        box-sizing: border-box;
+        border: none;
+        padding-left: 0;
+        padding-right: 0;
+      }
+      table.elenko-entry-fields-table td.label {
+        width: 100% !important;
+        padding-top: 0;
+        padding-bottom: 0.3rem;
+      }
+      table.elenko-entry-fields-table td.value {
+        padding: 0.5rem 0.65rem;
+      }
+      table.elenko-entry-fields-table tr.entry-label-row td {
+        padding: 0.55rem 0;
+        margin-bottom: 0.35rem;
+        border-bottom: 1px solid #30363d;
+      }
+    }
     .entry-view-stack { --entry-stack-field-max-height: 12rem; }
     .entry-view-stack .entry-field-block { margin-bottom: 1rem; min-width: 0; max-width: 100%; }
     .entry-view-stack .entry-field-block .value {
@@ -8761,7 +8883,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
 <body>
   <div class="topbar">
     <div class="topbar-main">
-      <div class="topbar-links"><a href="${escapeHtml(viewUrl)}" class="topbar-back-link" title="Back to entry" aria-label="Back to entry">⮜</a></div>
+      <div class="topbar-links"><a href="${escapeHtml(viewUrl)}" class="topbar-icon-btn" title="Back to entry" aria-label="Back to entry">◀</a></div>
       <div class="topbar-titleline">
         <h1>${title}</h1>
         <span class="sub">Edit entry</span>
@@ -9144,7 +9266,20 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .topbar-links { margin: 0; display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
     .topbar-links a { color: var(--profile-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .topbar-links a:hover { text-decoration: underline; }
-    .topbar-links .topbar-back-link { font-size: 1.35rem; line-height: 1; }
+    .topbar-links a.topbar-icon-btn {
+      display: inline-block;
+      padding: 0.5rem 0.75rem;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      line-height: 1;
+      border: 1px solid var(--profile-table-border, #21262d);
+      background: var(--profile-table-header-bg, #21262d);
+      color: var(--profile-link, #58a6ff);
+      text-decoration: none;
+      box-sizing: border-box;
+      margin-right: 0.75rem;
+    }
+    .topbar-links a.topbar-icon-btn:hover { text-decoration: none; background: #30363d; color: var(--profile-link, #58a6ff); }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
     .topbar-actions { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: flex-end; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.35rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.9rem; }
@@ -9222,16 +9357,14 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       .split-list-pane { flex: 0 0 auto; min-height: 0; overflow: visible !important; }
       /* Row prev/next tie into split single-entry navigation; hide on phones. */
       .pagination .btn-pag-row { display: none !important; }
-      .topbar-links .topbar-back-link {
-        font-size: 1.9rem;
-        line-height: 1;
-        padding: 0.45rem 0.65rem;
-        margin: -0.45rem 0.5rem -0.45rem -0.5rem;
+      .topbar-links a.topbar-icon-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
         min-width: 2.75rem;
         min-height: 2.75rem;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem -0.5rem;
       }
       th.col-mobile-hidden,
       td.col-mobile-hidden { display: none; }
@@ -9249,7 +9382,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
 <body>
   <div class="topbar">
     <div class="topbar-main">
-      <div class="topbar-links"><a href="/" class="topbar-back-link" title="Profiles" aria-label="Profiles">⮜</a>${canEdit && isAdmin ? `<a href="/profile/${encodeURIComponent(doc._id)}/edit">Edit profile</a>` : ""}</div>
+      <div class="topbar-links"><a href="/" class="topbar-icon-btn" title="Profiles" aria-label="Profiles">◀</a>${canEdit && isAdmin ? `<a href="/profile/${encodeURIComponent(doc._id)}/edit">Edit profile</a>` : ""}</div>
       <div class="topbar-titleline">
         <h1>${title}</h1>
         ${description ? `<span class="sub">${description}</span>` : ""}
@@ -15206,7 +15339,7 @@ function renderConfigExportImportPage(profiles, appUi) {
         <option value="profile">One Elenko database</option>
         <option value="all">All configuration documents</option>
       </select>
-      <p class="sub" style="margin-top:0.25rem;">"One Elenko database" exports the selected profile and its linked entry forms and flows (and APIs / JS Processing used by those flows). "All" also includes the Application design document.</p>
+      <p class="sub" style="margin-top:0.25rem;">"One Elenko database" exports the selected profile, its linked entry forms and flows, timers that target this profile (and their flows), linked queries, and APIs / JS Processing used by those flows. "All" also includes the Application design document.</p>
     </div>
     <div class="section" id="export-profile-wrap">
       <label for="export-profile">Elenko database</label>
@@ -15262,7 +15395,7 @@ function renderConfigExportImportPage(profiles, appUi) {
       var msgEl = document.getElementById('msg');
 
       function summarizeExportCounts(payload) {
-        var summary = { profiles: 0, entryForms: 0, flows: 0, apis: 0, jsProcessing: 0, appConfig: 0, queries: 0 };
+        var summary = { profiles: 0, entryForms: 0, flows: 0, apis: 0, jsProcessing: 0, appConfig: 0, queries: 0, timers: 0 };
         var docs = payload && payload.documents ? payload.documents : {};
         var dbDocs = Array.isArray(docs.db) ? docs.db : [];
         var cfgDocs = Array.isArray(docs.configDb) ? docs.configDb : [];
@@ -15278,6 +15411,7 @@ function renderConfigExportImportPage(profiles, appUi) {
           if (doc.type === 'elenko_js_processing') summary.jsProcessing += 1;
           if (doc.type === 'elenko_app_config') summary.appConfig += 1;
           if (doc.type === 'elenko_query') summary.queries += 1;
+          if (doc.type === 'elenko_timer') summary.timers += 1;
         });
         return summary;
       }
@@ -15331,6 +15465,7 @@ function renderConfigExportImportPage(profiles, appUi) {
             'forms: ' + c.entryForms,
             'linked queries: ' + c.queries,
             'flows: ' + c.flows,
+            'timers: ' + c.timers,
             'APIs: ' + c.apis,
             'JS Processing: ' + c.jsProcessing
           ];
