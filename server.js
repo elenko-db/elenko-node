@@ -88,6 +88,12 @@ const entryImageUpload = multer({
   limits: { fileSize: MAX_ENTRY_IMAGE_BYTES },
 });
 
+const MAX_KEYFILE_BYTES = 4096;
+const keyFileUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_KEYFILE_BYTES },
+});
+
 /** PNG names must match files in public/ (see README-favicon.txt). Order: sized PNGs first, then .ico fallback — works reliably in Firefox + Chrome. */
 const FAVICON_LINKS =
   '<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">' +
@@ -240,6 +246,23 @@ function resolveDefaultValue(source, req) {
   return "";
 }
 
+function getSessionUsername(req) {
+  if (!req || !req.session || req.session.user == null) return "";
+  return String(req.session.user).trim();
+}
+
+/** Who created/last updated an entry (CouchDB username). Empty when no HTTP session (e.g. some flow steps). */
+function setEntryAuditOnCreate(record, req) {
+  const u = getSessionUsername(req);
+  record.createdBy = u;
+  record.updatedBy = u;
+}
+
+function setEntryAuditOnUpdate(record, req) {
+  const u = getSessionUsername(req);
+  if (u) record.updatedBy = u;
+}
+
 /** Set on records created via "Create entry" until the first successful save; allows cancel to delete the draft server-side. */
 const ELENKO_DISCARD_ON_CANCEL = "elenko_discard_on_cancel";
 
@@ -260,6 +283,7 @@ async function insertNewEntryDocument(db, profileDoc, req, values, options) {
   const now = new Date().toISOString();
   record.createdAt = now;
   record.updatedAt = now;
+  setEntryAuditOnCreate(record, req);
   const sources = Array.isArray(profileDoc.fieldDefaultSources) ? profileDoc.fieldDefaultSources : [];
   for (let i = 0; i < fieldNames.length; i++) {
     const src = sources[i];
@@ -283,8 +307,20 @@ async function insertNewEntryDocument(db, profileDoc, req, values, options) {
   } catch (e) {
     return { ok: false, error: e.message || "Primary key could not be computed.", status: 400 };
   }
-  if (record.primaryKey) {
-    const conflict = await findPrimaryKeyConflict(db, record.primaryKey, "");
+  const encAccess = await resolveProfileEncryptionAccess(req, pdoc);
+  if (isProfilePersonalEncryptionEnabled(pdoc) && !encAccess.ok) {
+    return {
+      ok: false,
+      error: encAccess.error,
+      status: encAccess.hidden ? 404 : encAccess.status || 403,
+    };
+  }
+  const pkForLookup =
+    encAccess.profileKey && record.primaryKey
+      ? computePrimaryKeyToken(encAccess.profileKey, record.primaryKey)
+      : record.primaryKey;
+  if (pkForLookup) {
+    const conflict = await findPrimaryKeyConflict(db, pkForLookup, "");
     if (conflict) {
       return {
         ok: false,
@@ -292,6 +328,9 @@ async function insertNewEntryDocument(db, profileDoc, req, values, options) {
         status: 409,
       };
     }
+  }
+  if (encAccess.profileKey) {
+    encryptRecordFieldsForStorage(record, pdoc, encAccess.profileKey, null);
   }
   if (opts.discardOnCancel) {
     record[ELENKO_DISCARD_ON_CANCEL] = true;
@@ -1156,6 +1195,59 @@ function escapeRegex(s) {
   return String(s).replace(/[\\^$.*+?()|[\]{}]/g, "\\$&");
 }
 
+/**
+ * Fold string for entry search: case-insensitive and diacritic/umlaut-insensitive
+ * (e.g. Lourié ≈ Lourie, Müller ≈ muller).
+ */
+function normalizeForSearch(s) {
+  if (s == null) return "";
+  try {
+    return String(s)
+      .replace(/\u00df/gi, "ss")
+      .replace(/\u1e9e/g, "ss")
+      .normalize("NFD")
+      .replace(/\p{M}/gu, "")
+      .toLowerCase();
+  } catch {
+    return String(s).toLowerCase();
+  }
+}
+
+function entryMatchesSearchQuery(doc, fieldNames, normalizedQuery) {
+  if (!normalizedQuery) return true;
+  if (!Array.isArray(fieldNames) || fieldNames.length === 0) return true;
+  for (const fn of fieldNames) {
+    const v = doc[fn];
+    if (v == null) continue;
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        if (normalizeForSearch(item).includes(normalizedQuery)) return true;
+      }
+    } else if (normalizeForSearch(v).includes(normalizedQuery)) return true;
+  }
+  return false;
+}
+
+/** When true, entry list search folds accents/umlauts (slower on large profiles). Default off. */
+function isProfileSearchAccentFoldingEnabled(profileDoc) {
+  return !!(profileDoc && profileDoc.searchAccentFolding === true);
+}
+
+function buildProfileEntrySearchSelector(profileId, fieldNames, searchQuery, useAccentFolding) {
+  const selector = { type: "elenko_record", profileId };
+  if (
+    searchQuery &&
+    Array.isArray(fieldNames) &&
+    fieldNames.length > 0 &&
+    !useAccentFolding
+  ) {
+    // Inline (?i): CouchDB Mango here rejects { $regex, $options } ("Invalid operator: $options").
+    const pattern = "(?i).*" + escapeRegex(searchQuery) + ".*";
+    selector.$or = fieldNames.map((fn) => ({ [fn]: { $regex: pattern } }));
+  }
+  return selector;
+}
+
 /** One semicolon-separated CSV line; supports "quoted" fields and doubled quotes (""). */
 function splitSemicolonCsvLine(line) {
   const out = [];
@@ -1211,6 +1303,24 @@ function parseSemicolonCsvText(text) {
 function csvDataRowIsEmpty(row) {
   if (!row || !row.length) return true;
   return row.every((c) => String(c).trim() === "");
+}
+
+/** Escape one CSV cell for semicolon-separated export (RFC-style quoted fields). */
+function formatSemicolonCsvField(value) {
+  const s = value == null ? "" : String(value);
+  if (/[;"\r\n]/.test(s) || /^\s|\s$/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function formatSemicolonCsvRow(cells) {
+  return cells.map(formatSemicolonCsvField).join(";");
+}
+
+/** Build CSV text from rows (array of string arrays). Uses CRLF line endings. */
+function buildSemicolonCsvText(rows) {
+  return rows.map(formatSemicolonCsvRow).join("\r\n");
 }
 
 const MAX_CSV_IMPORT_ROWS = 50000;
@@ -1472,6 +1582,28 @@ async function getAdjacentEntryIdsForProfile(dbInstance, profileDoc, currentEntr
   }
 }
 
+/** All profile entries for CSV export, sorted like the database list view. */
+async function loadProfileRecordsForExport(dbInstance, profileDoc) {
+  const profileId = profileDoc && profileDoc._id;
+  const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  if (!profileId) return { fieldNames, docs: [] };
+  const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
+  const sortDirection = profileDoc.sortDirection === "desc" ? "desc" : "asc";
+  const fieldsForFind = fieldNames.length ? ["_id", "sortKey", ...fieldNames] : ["_id", "sortKey"];
+  const sortResult = await dbInstance.find({
+    selector: { type: "elenko_record", profileId },
+    fields: fieldsForFind,
+    limit: MAX_CSV_IMPORT_ROWS,
+  });
+  let docs = sortResult.docs || [];
+  if (sortKeyFields.length > 0) {
+    docs.sort((a, b) => compareRecordsByProfileSort(a, b, sortDirection));
+  } else {
+    docs.sort((a, b) => String(a._id).localeCompare(String(b._id)));
+  }
+  return { fieldNames, docs };
+}
+
 function normalizeProfileNameForDbCode(name) {
   return String(name || "")
     .replace(/\s+/g, "")
@@ -1570,10 +1702,8 @@ function computePrimaryKeyForRecord(record, profileDoc) {
         ? maxLen
         : 32;
     const raw = record[fn] != null ? String(record[fn]) : "";
-    if (raw.length > segLen) {
-      return { error: "Field \"" + fn + "\" exceeds primary key segment length (" + segLen + ")." };
-    }
-    str += raw + " ".repeat(segLen - raw.length);
+    const segment = raw.length > segLen ? raw.slice(0, segLen) : raw;
+    str += segment + " ".repeat(segLen - segment.length);
   }
   return { value: str };
 }
@@ -1676,6 +1806,7 @@ async function buildInitialRecordForPictureImport(dbInstance, profileDoc, req, f
   const now = new Date().toISOString();
   record.createdAt = now;
   record.updatedAt = now;
+  setEntryAuditOnCreate(record, req);
   const sources = Array.isArray(profileDoc.fieldDefaultSources) ? profileDoc.fieldDefaultSources : [];
   for (let i = 0; i < fieldNames.length; i++) {
     const src = sources[i];
@@ -1750,6 +1881,7 @@ async function createEntryInProfileFromContext(dbInstance, context, targetProfil
   const now = new Date().toISOString();
   record.createdAt = now;
   record.updatedAt = now;
+  setEntryAuditOnCreate(record, context && context.req);
   const sources = Array.isArray(targetProfile.fieldDefaultSources) ? targetProfile.fieldDefaultSources : [];
   const req = context && context.req;
   for (let i = 0; i < fieldNames.length; i++) {
@@ -1764,6 +1896,9 @@ async function createEntryInProfileFromContext(dbInstance, context, targetProfil
   const profileFormIds = getProfileEntryFormIds(targetProfile);
   if (profileFormIds.length > 0) {
     record.entryFormId = profileFormIds[0];
+  }
+  if (isProfilePersonalEncryptionEnabled(targetProfile)) {
+    throw new Error("Cannot create entries in an encrypted profile via flows or pipelines.");
   }
   try {
     applyPrimaryKeyToRecord(record, targetProfile);
@@ -1788,6 +1923,7 @@ async function createEntryInProfileFromContext(dbInstance, context, targetProfil
         parentDoc.hasResponses = existingIds.length > 0;
         parentDoc.responseDocIds = existingIds;
         parentDoc.updatedAt = new Date().toISOString();
+        setEntryAuditOnUpdate(parentDoc, context && context.req);
         await dbInstance.insert(parentDoc);
         clearProfileListCache(parentDoc.profileId);
       }
@@ -1827,7 +1963,10 @@ async function updateCurrentEntryFromDataset(dbInstance, context) {
   const patch = { ...dataset };
   // Do not persist helper fields used only inside the pipeline
   delete patch._lastCreatedId;
+  delete patch.createdBy;
+  delete patch.updatedBy;
   const updated = { ...existing, ...patch };
+  setEntryAuditOnUpdate(updated, context && context.req);
   await dbInstance.insert(updated);
   clearProfileListCache(profileId);
 }
@@ -2132,10 +2271,20 @@ async function runPipeline(context, flowDoc) {
         context.dataset = { ...(context.dataset || {}), ...scriptOutput };
         if (createManyRaw && context.profileId && db) {
           let createdCount = 0;
-          for (const row of createManyRaw) {
+          for (let rowIndex = 0; rowIndex < createManyRaw.length; rowIndex++) {
+            const row = createManyRaw[rowIndex];
             if (!row || typeof row !== "object") continue;
-            await createEntryInProfileFromContext(db, { dataset: row }, context.profileId);
-            createdCount++;
+            try {
+              await createEntryInProfileFromContext(db, { dataset: row }, context.profileId);
+              createdCount++;
+            } catch (err) {
+              console.error("REST API import _createMany row failed:", {
+                profileId: context.profileId,
+                stepIndex: i,
+                rowIndex,
+                message: err && err.message ? err.message : String(err),
+              });
+            }
           }
           context.dataset._lastCreatedCount = createdCount;
           hasExplicitPersistStep = true;
@@ -2544,6 +2693,22 @@ async function buildConfigExport(scope, profileId) {
     if (appDoc) addConfig(appDoc);
   }
 
+  /** UI pseudo-profile "Elenko App Design" — not an elenko_profile _id in the main DB. */
+  if (scope === "profile" && profileId === "__app__") {
+    if (configDb) {
+      const appResult = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+      const appDoc = appResult.docs && appResult.docs[0];
+      if (appDoc) addConfig(appDoc);
+    }
+    return {
+      version: CONFIG_EXPORT_VERSION,
+      scope: "profile",
+      profileId: "__app__",
+      exportedAt: new Date().toISOString(),
+      documents: { db: docsDb, configDb: docsConfig },
+    };
+  }
+
   const profileIds = scope === "all"
     ? (await db.find({ selector: { type: "elenko_profile" }, fields: ["_id"], limit: 1000 })).docs.map((p) => p._id)
     : (profileId ? [profileId] : []);
@@ -2705,6 +2870,65 @@ async function buildConfigExport(scope, profileId) {
   };
 }
 
+/**
+ * There must be only one elenko_app_config; getAppUiConfig uses find(..., limit: 1).
+ * Exports carry the source CouchDB _id, so a plain get+insert creates a second doc and
+ * the UI keeps showing the old one. Merge into the existing server doc (by _id match or
+ * stable first doc) and remove any extra app_config documents.
+ */
+async function upsertAppConfigFromImport(rawDoc, overwrite) {
+  if (!configDb) return 0;
+  if (!overwrite) return 0;
+  const incoming = { ...rawDoc };
+  delete incoming._rev;
+  const incomingId = incoming._id != null ? String(incoming._id) : "";
+
+  const listRes = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 100 });
+  let existingList = Array.isArray(listRes.docs) ? listRes.docs.slice() : [];
+  existingList.sort((a, b) => String(a._id || "").localeCompare(String(b._id || "")));
+
+  let canonical = null;
+  if (incomingId && existingList.some((d) => d && d._id === incomingId)) {
+    canonical = existingList.find((d) => d && d._id === incomingId);
+  } else if (existingList.length > 0) {
+    canonical = existingList[0];
+  }
+
+  const incomingPw =
+    incoming.couchdbPassword != null && String(incoming.couchdbPassword).trim() !== ""
+      ? String(incoming.couchdbPassword)
+      : "";
+
+  let keepId = null;
+
+  if (!canonical) {
+    const ins = await configDb.insert({ ...incoming });
+    keepId = ins.id || incomingId || null;
+  } else {
+    const preservePassword =
+      typeof canonical.couchdbPassword === "string" && canonical.couchdbPassword.trim() !== "";
+    const merged = { ...canonical, ...incoming };
+    merged._id = canonical._id;
+    merged._rev = canonical._rev;
+    if (!incomingPw && preservePassword) merged.couchdbPassword = canonical.couchdbPassword;
+    await configDb.insert(merged);
+    keepId = canonical._id;
+  }
+
+  if (keepId) {
+    const dupRes = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 100 });
+    for (const d of dupRes.docs || []) {
+      if (d && d._id && d._id !== keepId) {
+        try {
+          await configDb.destroy(d._id, d._rev);
+        } catch (_) {}
+      }
+    }
+  }
+
+  return 1;
+}
+
 async function applyConfigImport(data, overwrite) {
   const errors = [];
   let importedDb = 0;
@@ -2758,6 +2982,11 @@ async function applyConfigImport(data, overwrite) {
     try {
       if (!configDb) {
         errors.push({ id: id || "(new)", type: doc.type, message: "Config store not available" });
+        continue;
+      }
+      if (toInsert.type === "elenko_app_config") {
+        await upsertAppConfigFromImport(doc, overwrite);
+        importedConfig++;
         continue;
       }
       if (id) {
@@ -3220,6 +3449,580 @@ function hashPassword(password, salt) {
 function verifyPassword(password, storedHash, storedSalt) {
   const { hash } = hashPassword(password, Buffer.from(storedSalt, "hex"));
   return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(storedHash, "hex"));
+}
+
+const ELNK_MAGIC = Buffer.from("ELNK", "ascii");
+const ELNK_VERSION_V1 = Buffer.from("0001", "ascii");
+const ELNK_HEADER_LEN = 12;
+const ELNK_MASTER_KEY_LEN = 32;
+const ELNK_PAYLOAD_V1_LEN = ELNK_MASTER_KEY_LEN;
+const KEYFILE_DOWNLOAD_TTL_MS = 5 * 60 * 1000;
+
+/** sessionId → { masterKey: Buffer, expiresAt: number } — never persisted to CouchDB or session store */
+const inMemoryUserKeys = new Map();
+/** one-time admin download tokens after key generation */
+const keyFileDownloadTokens = new Map();
+
+function sanitizeUsernameForFilename(username) {
+  return String(username || "user")
+    .replace(/[^\w.-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 64) || "user";
+}
+
+function keyFileDownloadFilename(username) {
+  return `elenko-${sanitizeUsernameForFilename(username)}.key`;
+}
+
+function userKeyFileRegistered(userDoc) {
+  return !!(userDoc && userDoc.keyFile && userDoc.keyFile.registered === true);
+}
+
+function userEnforceKeyLogin(userDoc) {
+  return !!(userDoc && userDoc.enforceKeyLogin === true);
+}
+
+function buildElnkKeyBlob(masterKey) {
+  if (!Buffer.isBuffer(masterKey) || masterKey.length !== ELNK_MASTER_KEY_LEN) {
+    throw new Error("Master key must be 32 bytes");
+  }
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32BE(ELNK_PAYLOAD_V1_LEN, 0);
+  return Buffer.concat([ELNK_MAGIC, ELNK_VERSION_V1, lenBuf, masterKey]);
+}
+
+function parseElnkKeyBlob(buffer) {
+  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+  if (buf.length < ELNK_HEADER_LEN) {
+    throw new Error("Key file is too short");
+  }
+  if (!buf.subarray(0, 4).equals(ELNK_MAGIC)) {
+    throw new Error('Key file must start with "ELNK"');
+  }
+  const version = buf.subarray(4, 8).toString("ascii");
+  if (version !== "0001") {
+    throw new Error(`Unsupported key file version: ${version}`);
+  }
+  const payloadLen = buf.readUInt32BE(8);
+  const payload = buf.subarray(ELNK_HEADER_LEN, ELNK_HEADER_LEN + payloadLen);
+  if (payload.length !== payloadLen) {
+    throw new Error("Key file length does not match header");
+  }
+  if (buf.length !== ELNK_HEADER_LEN + payloadLen) {
+    throw new Error("Key file contains trailing data");
+  }
+  if (version === "0001" && payloadLen !== ELNK_PAYLOAD_V1_LEN) {
+    throw new Error("Invalid v1 key payload length");
+  }
+  return { version, payload, masterKey: payload.subarray(0, ELNK_MASTER_KEY_LEN) };
+}
+
+function hashKeyFilePayload(payloadBytes, saltHex) {
+  const salt = Buffer.from(saltHex, "hex");
+  const payload = Buffer.isBuffer(payloadBytes) ? payloadBytes : Buffer.from(payloadBytes || []);
+  return crypto.createHash("sha256").update(Buffer.concat([salt, payload])).digest("hex");
+}
+
+function buildKeyFileRegistrationFromBlob(buffer) {
+  const parsed = parseElnkKeyBlob(buffer);
+  const salt = crypto.randomBytes(SALT_LEN).toString("hex");
+  const hash = hashKeyFilePayload(parsed.payload, salt);
+  const now = new Date().toISOString();
+  return {
+    keyFile: {
+      registered: true,
+      blobVersion: parsed.version,
+      salt,
+      hash,
+      payloadLength: parsed.payload.length,
+      createdAt: now,
+      lastUsedAt: null,
+    },
+  };
+}
+
+function buildKeyFileRegistrationFromMasterKey(masterKey) {
+  const blob = buildElnkKeyBlob(masterKey);
+  const built = buildKeyFileRegistrationFromBlob(blob);
+  return { blob, keyFile: built.keyFile };
+}
+
+/** Admin upload: file name must be elenko-<sanitized-username>.key */
+function validateKeyFileUploadFilename(originalName, username) {
+  const base = path.basename(String(originalName || "").trim());
+  if (!base) return { ok: false, error: "Missing file name." };
+  const m = /^elenko-([\w.-]+)\.key$/i.exec(base);
+  if (!m) {
+    return { ok: false, error: "File name must be elenko-<username>.key (e.g. elenko-admin.key)." };
+  }
+  const expected = sanitizeUsernameForFilename(username);
+  if (m[1].toLowerCase() !== expected.toLowerCase()) {
+    return { ok: false, error: `File name must be elenko-${expected}.key for user "${username}".` };
+  }
+  return { ok: true, filename: base };
+}
+
+function verifyKeyFileBlob(buffer, keyFileDoc) {
+  if (!keyFileDoc || keyFileDoc.registered !== true) {
+    return { ok: false, error: "No key file registered for this user" };
+  }
+  try {
+    const parsed = parseElnkKeyBlob(buffer);
+    if (parsed.payload.length !== keyFileDoc.payloadLength) {
+      return { ok: false, error: "Key file payload length mismatch" };
+    }
+    const expected = keyFileDoc.hash;
+    const actual = hashKeyFilePayload(parsed.payload, keyFileDoc.salt);
+    const a = Buffer.from(actual, "hex");
+    const b = Buffer.from(expected, "hex");
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return { ok: false, error: "Invalid key file" };
+    }
+    return { ok: true, masterKey: parsed.masterKey, payload: parsed.payload };
+  } catch (e) {
+    return { ok: false, error: e && e.message ? String(e.message) : "Invalid key file" };
+  }
+}
+
+function setUserMasterKey(sessionId, masterKey) {
+  if (!sessionId || !Buffer.isBuffer(masterKey)) return;
+  inMemoryUserKeys.set(sessionId, {
+    masterKey: Buffer.from(masterKey),
+    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+  });
+}
+
+function getUserMasterKey(sessionId) {
+  if (!sessionId) return null;
+  const entry = inMemoryUserKeys.get(sessionId);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    inMemoryUserKeys.delete(sessionId);
+    return null;
+  }
+  return entry.masterKey;
+}
+
+function clearUserMasterKey(sessionId) {
+  if (sessionId) inMemoryUserKeys.delete(sessionId);
+}
+
+const ELENKO_ENC_PREFIX = "elenkoenc:v1:";
+const ELENKO_ENC_ATTACH_MAGIC = Buffer.from("ELNKENC1", "ascii");
+const PROFILE_KEY_HKDF_INFO = Buffer.from("elenko-db-v1", "utf8");
+
+function isEncryptedFieldValue(value) {
+  return typeof value === "string" && value.startsWith(ELENKO_ENC_PREFIX);
+}
+
+function isProfilePersonalEncryptionEnabled(profileDoc) {
+  return !!(
+    profileDoc &&
+    profileDoc.encryption &&
+    profileDoc.encryption.enabled === true &&
+    profileDoc.encryption.mode === "personal"
+  );
+}
+
+function getProfileEncryptionOwnerUsername(profileDoc) {
+  if (!isProfilePersonalEncryptionEnabled(profileDoc)) return null;
+  const u = profileDoc.encryption.ownerUsername;
+  return typeof u === "string" && u.trim() ? u.trim() : null;
+}
+
+function isSessionUserAdmin(req) {
+  return (req.session && req.session.role) === "admin";
+}
+
+/** Personal encrypted profiles appear only for the encryption owner and admins. */
+function canUserSeePersonalEncryptedProfile(req, profileDoc) {
+  if (!isProfilePersonalEncryptionEnabled(profileDoc)) return true;
+  if (isSessionUserAdmin(req)) return true;
+  return getSessionUsername(req) === getProfileEncryptionOwnerUsername(profileDoc);
+}
+
+function filterProfilesVisibleToUser(req, profiles) {
+  return (profiles || []).filter((p) => canUserSeePersonalEncryptedProfile(req, p));
+}
+
+function respondEncryptionAccessDenied(res, encAccess, format = "json") {
+  if (encAccess && encAccess.hidden) {
+    if (format === "html") return res.status(404).send(renderErrorPage("Profile not found"));
+    if (format === "empty") return res.status(404).end();
+    return res.status(404).json({ error: "Profile not found" });
+  }
+  const status = (encAccess && encAccess.status) || 403;
+  const message = (encAccess && encAccess.error) || "Access denied";
+  if (format === "html") return res.status(status).send(renderErrorPage(message));
+  if (format === "empty") return res.status(status).end();
+  return res.status(status).json({ error: message });
+}
+
+function deriveProfileKey(masterKey, profileId) {
+  if (!Buffer.isBuffer(masterKey) || masterKey.length !== ELNK_MASTER_KEY_LEN) {
+    throw new Error("Invalid master key");
+  }
+  return crypto.hkdfSync(
+    "sha256",
+    masterKey,
+    Buffer.from(String(profileId), "utf8"),
+    PROFILE_KEY_HKDF_INFO,
+    ELNK_MASTER_KEY_LEN
+  );
+}
+
+function encryptFieldValue(profileKey, plaintext) {
+  const text = plaintext != null ? String(plaintext) : "";
+  if (text === "") return "";
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", profileKey, iv);
+  const enc = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return ELENKO_ENC_PREFIX + Buffer.concat([iv, tag, enc]).toString("base64url");
+}
+
+function decryptFieldValue(profileKey, stored) {
+  if (stored == null || stored === "") return "";
+  const s = String(stored);
+  if (!s.startsWith(ELENKO_ENC_PREFIX)) return s;
+  const buf = Buffer.from(s.slice(ELENKO_ENC_PREFIX.length), "base64url");
+  if (buf.length < 28) throw new Error("Invalid encrypted field");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const data = buf.subarray(28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", profileKey, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
+}
+
+function computePrimaryKeyToken(profileKey, primaryKeyPlaintext) {
+  return crypto.createHmac("sha256", profileKey).update(String(primaryKeyPlaintext), "utf8").digest("hex");
+}
+
+function encryptAttachmentBuffer(profileKey, buffer) {
+  const data = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", profileKey, iv);
+  const enc = Buffer.concat([cipher.update(data), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([ELENKO_ENC_ATTACH_MAGIC, iv, tag, enc]);
+}
+
+function decryptAttachmentBuffer(profileKey, buffer) {
+  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+  if (buf.length < ELENKO_ENC_ATTACH_MAGIC.length + 28) return buf;
+  if (!buf.subarray(0, ELENKO_ENC_ATTACH_MAGIC.length).equals(ELENKO_ENC_ATTACH_MAGIC)) {
+    return buf;
+  }
+  const base = ELENKO_ENC_ATTACH_MAGIC.length;
+  const iv = buf.subarray(base, base + 12);
+  const tag = buf.subarray(base + 12, base + 28);
+  const data = buf.subarray(base + 28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", profileKey, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(data), decipher.final()]);
+}
+
+function getNonEncryptableFieldSet(profileDoc, formDoc) {
+  return getAttachmentBackedFieldNames(profileDoc, formDoc);
+}
+
+function encryptRecordFieldsForStorage(record, profileDoc, profileKey, formDoc) {
+  const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const skip = getNonEncryptableFieldSet(profileDoc, formDoc);
+  if (record.primaryKey) {
+    record.primaryKey = computePrimaryKeyToken(profileKey, record.primaryKey);
+  }
+  record.sortKey = [record.createdAt || "", record._id || ""];
+  for (const fn of fieldNames) {
+    if (skip.has(fn)) continue;
+    const v = record[fn] != null ? String(record[fn]) : "";
+    record[fn] = v === "" ? "" : encryptFieldValue(profileKey, v);
+  }
+  record.encrypted = true;
+  return record;
+}
+
+function decryptRecordFieldsInPlace(record, profileDoc, profileKey, formDoc) {
+  if (!record || !profileKey) return record;
+  const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const skip = getNonEncryptableFieldSet(profileDoc, formDoc);
+  for (const fn of fieldNames) {
+    if (skip.has(fn)) continue;
+    if (record[fn] != null && isEncryptedFieldValue(record[fn])) {
+      record[fn] = decryptFieldValue(profileKey, record[fn]);
+    }
+  }
+  return record;
+}
+
+function decryptRecordsForProfile(records, profileDoc, profileKey, formDoc) {
+  return (records || []).map((rec) => {
+    const copy = { ...rec };
+    decryptRecordFieldsInPlace(copy, profileDoc, profileKey, formDoc);
+    return copy;
+  });
+}
+
+async function resolveProfileEncryptionAccess(req, profileDoc) {
+  if (!isProfilePersonalEncryptionEnabled(profileDoc)) {
+    return { ok: true, profileKey: null };
+  }
+  const owner = getProfileEncryptionOwnerUsername(profileDoc);
+  if (!owner) {
+    return {
+      ok: false,
+      status: 403,
+      error: "This encrypted database has no encryption owner configured.",
+      needKeyUnlock: false,
+    };
+  }
+  const sessionUser = getSessionUsername(req);
+  if (sessionUser !== owner) {
+    if (isSessionUserAdmin(req)) {
+      return {
+        ok: false,
+        status: 403,
+        error: `This database is encrypted for personal use. Only ${owner} can access its entries.`,
+        needKeyUnlock: false,
+      };
+    }
+    return {
+      ok: false,
+      status: 404,
+      error: "Profile not found",
+      hidden: true,
+      needKeyUnlock: false,
+    };
+  }
+  const masterKey = getUserMasterKey(req.sessionID);
+  if (!masterKey) {
+    return {
+      ok: false,
+      status: 403,
+      error: "Unlock your key file to access this encrypted database.",
+      needKeyUnlock: true,
+    };
+  }
+  return { ok: true, profileKey: deriveProfileKey(masterKey, profileDoc._id), owner };
+}
+
+async function loadUsersWithRegisteredKeyFiles(dbInstance) {
+  try {
+    const result = await dbInstance.find({
+      selector: { type: "elenko_user" },
+      fields: ["_id", "username", "keyFile"],
+      limit: 500,
+    });
+    return (result.docs || [])
+      .filter((u) => userKeyFileRegistered(u))
+      .sort((a, b) => String(a.username).localeCompare(String(b.username)));
+  } catch (_) {
+    return [];
+  }
+}
+
+async function userHasRegisteredKeyFile(dbInstance, username) {
+  const u = String(username || "").trim();
+  if (!u) return false;
+  try {
+    const result = await dbInstance.find({ selector: { type: "elenko_user", username: u }, limit: 1 });
+    return userKeyFileRegistered(result.docs && result.docs[0]);
+  } catch (_) {
+    return false;
+  }
+}
+
+function entryMatchesSearchQueryCaseInsensitive(record, fieldNames, query) {
+  const q = String(query || "").toLowerCase();
+  if (!q) return true;
+  for (const fn of fieldNames) {
+    const v = record[fn] != null ? String(record[fn]).toLowerCase() : "";
+    if (v.includes(q)) return true;
+  }
+  return false;
+}
+
+async function loadEncryptedProfileEntryList(dbInstance, profileDoc, profileKey, opts) {
+  const profileId = profileDoc._id;
+  const fieldNames = opts.fieldNames || [];
+  const page = Math.max(1, opts.page || 1);
+  const pageSize = opts.profileEntriesPageSize || ENTRIES_PAGE_SIZE;
+  const searchQuery = (opts.searchQuery || "").trim();
+  const useAccentFolding = !!opts.useAccentFolding;
+  const normalizedSearch = opts.normalizedSearch || "";
+  const sortKeyFields = Array.isArray(opts.sortKeyFields) ? opts.sortKeyFields : [];
+  const sortDirection = opts.sortDirection === "desc" ? "desc" : "asc";
+  const skip = (page - 1) * pageSize;
+  const SORT_FETCH_LIMIT = 50000;
+  const fieldsForFind = fieldNames.length
+    ? ["_id", "_rev", "sortKey", "isResponse", "createdAt", ...fieldNames]
+    : ["_id", "_rev", "sortKey", "isResponse", "createdAt"];
+  const sortResult = await dbInstance.find({
+    selector: { type: "elenko_record", profileId },
+    fields: fieldsForFind,
+    limit: SORT_FETCH_LIMIT,
+  });
+  let fullDocs = sortResult.docs || [];
+  for (const d of fullDocs) {
+    decryptRecordFieldsInPlace(d, profileDoc, profileKey, null);
+  }
+  if (searchQuery) {
+    if (useAccentFolding) {
+      fullDocs =
+        searchQuery && !normalizedSearch
+          ? []
+          : fullDocs.filter((d) => entryMatchesSearchQuery(d, fieldNames, normalizedSearch));
+    } else {
+      fullDocs = fullDocs.filter((d) => entryMatchesSearchQueryCaseInsensitive(d, fieldNames, searchQuery));
+    }
+  }
+  if (sortKeyFields.length > 0) {
+    for (const d of fullDocs) {
+      d.sortKey = buildSortKey(d, sortKeyFields);
+    }
+    fullDocs.sort((a, b) => compareRecordsByProfileSort(a, b, sortDirection));
+  } else {
+    fullDocs.sort((a, b) => String(a._id).localeCompare(String(b._id)));
+  }
+  const totalPages = Math.max(1, Math.ceil(fullDocs.length / pageSize));
+  const pageDocs = fullDocs.slice(skip, skip + pageSize + 1);
+  return {
+    records: pageDocs.slice(0, pageSize),
+    pagination: { totalPages, hasNext: pageDocs.length > pageSize, hasPrev: page > 1 },
+  };
+}
+
+async function profileHasUnencryptedEntries(dbInstance, profileId) {
+  try {
+    const result = await dbInstance.find({
+      selector: { type: "elenko_record", profileId },
+      fields: ["_id", "encrypted"],
+      limit: 50000,
+    });
+    return (result.docs || []).some((d) => d && d.encrypted !== true);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function migrateProfileRecordsToEncryption(dbInstance, profileDoc, profileKey) {
+  const profileId = profileDoc._id;
+  const result = await dbInstance.find({
+    selector: { type: "elenko_record", profileId },
+    limit: 50000,
+  });
+  const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
+  const now = new Date().toISOString();
+  for (const rec of result.docs || []) {
+    if (rec.encrypted === true) continue;
+    rec.sortKey = buildSortKey(rec, sortKeyFields);
+    try {
+      applyPrimaryKeyToRecord(rec, profileDoc);
+    } catch (_) {
+      delete rec.primaryKey;
+    }
+    encryptRecordFieldsForStorage(rec, profileDoc, profileKey, null);
+    rec.updatedAt = now;
+    await dbInstance.insert(rec);
+  }
+}
+
+async function recomputeEncryptedPrimaryKeysForProfile(dbInstance, profileDoc, profileKey) {
+  const profileId = profileDoc._id;
+  const result = await dbInstance.find({
+    selector: { type: "elenko_record", profileId },
+    limit: 50000,
+  });
+  const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
+  const now = new Date().toISOString();
+  for (const rec of result.docs || []) {
+    if (rec.encrypted === true) {
+      decryptRecordFieldsInPlace(rec, profileDoc, profileKey, null);
+    }
+    rec.sortKey = buildSortKey(rec, sortKeyFields);
+    try {
+      applyPrimaryKeyToRecord(rec, profileDoc);
+    } catch (_) {
+      delete rec.primaryKey;
+    }
+    encryptRecordFieldsForStorage(rec, profileDoc, profileKey, null);
+    rec.updatedAt = now;
+    await dbInstance.insert(rec);
+  }
+}
+
+function storeKeyFileDownloadToken(username, blob) {
+  const token = crypto.randomBytes(24).toString("hex");
+  keyFileDownloadTokens.set(token, {
+    username,
+    blob: Buffer.from(blob),
+    filename: keyFileDownloadFilename(username),
+    expiresAt: Date.now() + KEYFILE_DOWNLOAD_TTL_MS,
+  });
+  return token;
+}
+
+function consumeKeyFileDownloadToken(token) {
+  if (!token) return null;
+  const entry = keyFileDownloadTokens.get(token);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    keyFileDownloadTokens.delete(token);
+    return null;
+  }
+  keyFileDownloadTokens.delete(token);
+  return entry;
+}
+
+function peekKeyFileDownloadToken(token) {
+  if (!token) return null;
+  const entry = keyFileDownloadTokens.get(token);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    keyFileDownloadTokens.delete(token);
+    return null;
+  }
+  return entry;
+}
+
+function loginKeyFileParser(req, res, next) {
+  const ct = req.get("content-type") || "";
+  if (ct.includes("multipart/form-data")) {
+    return keyFileUpload.single("keyFile")(req, res, next);
+  }
+  next();
+}
+
+function applyKeyFileToSession(req, userDoc, uploadedBuffer) {
+  const registered = userKeyFileRegistered(userDoc);
+  const enforce = userEnforceKeyLogin(userDoc);
+  req.session.keyFileRegistered = registered;
+  req.session.enforceKeyLogin = enforce;
+  req.session.keyFileUnlocked = false;
+  clearUserMasterKey(req.sessionID);
+
+  if (!registered) {
+    if (uploadedBuffer && uploadedBuffer.length > 0) {
+      return { ok: false, error: "This user has no registered key file" };
+    }
+    return { ok: true };
+  }
+
+  if (!uploadedBuffer || uploadedBuffer.length === 0) {
+    if (enforce) {
+      return { ok: false, error: "Key file is required for this account" };
+    }
+    return { ok: true, keyFileMissing: true };
+  }
+
+  const verified = verifyKeyFileBlob(uploadedBuffer, userDoc.keyFile);
+  if (!verified.ok) {
+    return { ok: false, error: verified.error || "Invalid key file" };
+  }
+  setUserMasterKey(req.sessionID, verified.masterKey);
+  req.session.keyFileUnlocked = true;
+  return { ok: true, keyFileUnlocked: true };
 }
 
 /** API routes should return JSON so fetch().json() does not fail on HTML error pages. */
@@ -3809,10 +4612,11 @@ app.get("/login", async (req, res) => {
   res.set("Content-Type", "text/html; charset=utf-8").send(renderLoginPage(null, appUi));
 });
 
-app.post("/login", async (req, res) => {
+app.post("/login", loginKeyFileParser, async (req, res) => {
   const appUi = await getAppUiConfig();
   const username = String((req.body && req.body.username) || "").trim();
   const password = (req.body && req.body.password) || "";
+  const uploadedKey = req.file && req.file.buffer ? req.file.buffer : null;
   if (!username) {
     return res
       .set("Content-Type", "text/html; charset=utf-8")
@@ -3829,9 +4633,27 @@ app.post("/login", async (req, res) => {
         .set("Content-Type", "text/html; charset=utf-8")
         .send(renderLoginPage("Invalid username or password.", appUi));
     }
+    const keyResult = applyKeyFileToSession(req, user, uploadedKey);
+    if (!keyResult.ok) {
+      return res
+        .set("Content-Type", "text/html; charset=utf-8")
+        .send(renderLoginPage(keyResult.error || "Invalid key file.", appUi));
+    }
     req.session.user = user.username;
     req.session.role = (user.role === "user" ? "editor" : user.role) || "editor";
-    sendFlowMessage("auth.login", { username: user.username, role: req.session.role });
+    if (keyResult.keyFileUnlocked && user.keyFile) {
+      try {
+        user.keyFile.lastUsedAt = new Date().toISOString();
+        await db.insert(user);
+      } catch (e) {
+        console.warn("Failed to update keyFile.lastUsedAt:", e.message || e);
+      }
+    }
+    sendFlowMessage("auth.login", {
+      username: user.username,
+      role: req.session.role,
+      keyFileUnlocked: !!req.session.keyFileUnlocked,
+    });
     return res.redirect("/");
   } catch (err) {
     console.error("Login error:", err);
@@ -3842,8 +4664,71 @@ app.post("/login", async (req, res) => {
 });
 
 app.get("/logout", (req, res) => {
+  clearUserMasterKey(req.sessionID);
   req.session.destroy(() => {});
   res.redirect("/login");
+});
+
+app.get("/account/unlock-keyfile", async (req, res) => {
+  if (!req.session || !req.session.user) return res.redirect("/login");
+  const appUi = await getAppUiConfig();
+  res.set("Content-Type", "text/html; charset=utf-8").send(renderUnlockKeyFilePage(null, appUi, req.session));
+});
+
+app.post("/account/unlock-keyfile", loginKeyFileParser, async (req, res) => {
+  if (!req.session || !req.session.user) return res.redirect("/login");
+  const appUi = await getAppUiConfig();
+  const username = req.session.user;
+  const uploadedKey = req.file && req.file.buffer ? req.file.buffer : null;
+  if (!uploadedKey || uploadedKey.length === 0) {
+    return res
+      .set("Content-Type", "text/html; charset=utf-8")
+      .send(renderUnlockKeyFilePage("Choose your key file.", appUi, req.session));
+  }
+  try {
+    const result = await db.find({ selector: { type: "elenko_user", username }, limit: 1 });
+    const user = result.docs && result.docs[0];
+    if (!user) {
+      return res
+        .set("Content-Type", "text/html; charset=utf-8")
+        .send(renderUnlockKeyFilePage("User not found.", appUi, req.session));
+    }
+    if (!userKeyFileRegistered(user)) {
+      return res
+        .set("Content-Type", "text/html; charset=utf-8")
+        .send(renderUnlockKeyFilePage("No key file is registered for your account.", appUi, req.session));
+    }
+    const verified = verifyKeyFileBlob(uploadedKey, user.keyFile);
+    if (!verified.ok) {
+      return res
+        .set("Content-Type", "text/html; charset=utf-8")
+        .send(renderUnlockKeyFilePage(verified.error || "Invalid key file.", appUi, req.session));
+    }
+    setUserMasterKey(req.sessionID, verified.masterKey);
+    req.session.keyFileRegistered = true;
+    req.session.keyFileUnlocked = true;
+    try {
+      user.keyFile.lastUsedAt = new Date().toISOString();
+      await db.insert(user);
+    } catch (e) {
+      console.warn("Failed to update keyFile.lastUsedAt:", e.message || e);
+    }
+    return res.redirect("/");
+  } catch (err) {
+    console.error("Unlock key file error:", err);
+    return res
+      .set("Content-Type", "text/html; charset=utf-8")
+      .send(renderUnlockKeyFilePage("Could not verify key file.", appUi, req.session));
+  }
+});
+
+app.get("/api/account/keyfile-status", requireAuth, (req, res) => {
+  res.json({
+    registered: !!(req.session && req.session.keyFileRegistered),
+    unlocked: !!(req.session && req.session.keyFileUnlocked),
+    enforceKeyLogin: !!(req.session && req.session.enforceKeyLogin),
+    hasMasterKey: !!getUserMasterKey(req.sessionID),
+  });
 });
 
 /** Favicon: correct Content-Type + cache; legacy redirects for old misspelled PNG URLs (404 broke Firefox tab icons). */
@@ -3867,18 +4752,42 @@ app.get("/favicon32.png", (_req, res) => res.redirect(301, "/favicon-32x32.png")
 app.use(express.static(path.join(__dirname, "public")));
 app.use(requireAuth);
 
+async function hydrateKeyFileSession(req, res, next) {
+  if (!req.session || !req.session.user || !db) return next();
+  if (typeof req.session.keyFileRegistered === "boolean") return next();
+  try {
+    const result = await db.find({
+      selector: { type: "elenko_user", username: req.session.user },
+      limit: 1,
+    });
+    const user = result.docs && result.docs[0];
+    req.session.keyFileRegistered = userKeyFileRegistered(user);
+    req.session.enforceKeyLogin = userEnforceKeyLogin(user);
+    req.session.keyFileUnlocked = !!getUserMasterKey(req.sessionID);
+  } catch (_) {}
+  next();
+}
+
+app.use(hydrateKeyFileSession);
+
+function buildKeyFileNoticeHtml(session) {
+  if (!session || !session.keyFileRegistered || session.keyFileUnlocked) return "";
+  return `<p class="keyfile-banner" style="background:#3d2e00;color:#f0c040;padding:0.75rem 1rem;border-radius:6px;margin:0 0 1rem;">Your key file is not loaded. <a href="/account/unlock-keyfile" style="color:#ffe066;">Provide key file</a> for encrypted database access (when enabled).</p>`;
+}
+
 app.get("/", async (req, res) => {
   try {
     const result = await db.find({
       selector: { type: "elenko_profile" },
-      fields: ["_id", "_rev", "name", "description", "createdAt"],
+      fields: ["_id", "_rev", "name", "description", "createdAt", "encryption"],
       sort: [{ name: "asc" }],
     });
-    const profiles = result.docs || [];
+    const profiles = filterProfilesVisibleToUser(req, result.docs || []);
     const appUi = await getAppUiConfig();
     const role = (req.session && req.session.role) || "editor";
+    const keyFileNotice = buildKeyFileNoticeHtml(req.session);
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderStartPage(profiles, role, appUi));
+    res.send(renderStartPage(profiles, role, appUi, keyFileNotice));
   } catch (err) {
     console.error("Error loading profiles:", err);
     res.status(500).send(renderErrorPage(err.message));
@@ -4140,6 +5049,10 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
     if (!profileDoc || profileDoc.type !== "elenko_profile") {
       return res.status(404).json({ error: "Profile not found" });
     }
+    const encAccess = await resolveProfileEncryptionAccess(req, profileDoc);
+    if (isProfilePersonalEncryptionEnabled(profileDoc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "json");
+    }
     const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
     if (fieldNames.length === 0) {
       return res.status(400).json({ error: "This profile has no field names defined." });
@@ -4239,6 +5152,7 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
         }
         record.createdAt = now;
         record.updatedAt = now;
+        setEntryAuditOnCreate(record, req);
         record.sortKey = buildSortKey(record, sortKeyFields);
         try {
           applyPrimaryKeyToRecord(record, profileDoc);
@@ -4249,8 +5163,12 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
           }
           continue;
         }
-        if (record.primaryKey) {
-          const conflict = await findPrimaryKeyConflict(db, record.primaryKey, "");
+        const pkForLookup =
+          encAccess.profileKey && record.primaryKey
+            ? computePrimaryKeyToken(encAccess.profileKey, record.primaryKey)
+            : record.primaryKey;
+        if (pkForLookup) {
+          const conflict = await findPrimaryKeyConflict(db, pkForLookup, "");
           if (conflict) {
             if (importPolicy === "overwrite") {
               if (conflict.profileId !== profileId) {
@@ -4263,10 +5181,14 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
                 continue;
               }
               const updated = { ...conflict };
+              if (encAccess.profileKey) {
+                decryptRecordFieldsInPlace(updated, profileDoc, encAccess.profileKey, null);
+              }
               for (const fn of fieldNames) {
                 updated[fn] = record[fn];
               }
               updated.updatedAt = now;
+              setEntryAuditOnUpdate(updated, req);
               updated.sortKey = buildSortKey(updated, sortKeyFields);
               try {
                 applyPrimaryKeyToRecord(updated, profileDoc);
@@ -4277,6 +5199,9 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
                 }
                 continue;
               }
+              if (encAccess.profileKey) {
+                encryptRecordFieldsForStorage(updated, profileDoc, encAccess.profileKey, null);
+              }
               await db.insert(updated);
               overwritten++;
             } else {
@@ -4284,6 +5209,9 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
             }
             continue;
           }
+        }
+        if (encAccess.profileKey) {
+          encryptRecordFieldsForStorage(record, profileDoc, encAccess.profileKey, null);
         }
         await db.insert(record);
         imported++;
@@ -4324,6 +5252,51 @@ app.post("/api/profiles/:id/import-data", requireAdmin, async (req, res) => {
       contentLength: req.get("content-length"),
     });
     res.status(500).json({ error: err.message || "Import failed" });
+  }
+});
+
+app.get("/api/profiles/:id/export-data", requireAdmin, async (req, res) => {
+  const profileId = req.params.id;
+  try {
+    let profileDoc;
+    try {
+      profileDoc = await db.get(profileId);
+    } catch (e) {
+      if (e.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
+      throw e;
+    }
+    if (!profileDoc || profileDoc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const encAccess = await resolveProfileEncryptionAccess(req, profileDoc);
+    if (isProfilePersonalEncryptionEnabled(profileDoc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "json");
+    }
+    const { fieldNames, docs } = await loadProfileRecordsForExport(db, profileDoc);
+    if (fieldNames.length === 0) {
+      return res.status(400).json({ error: "This profile has no field names defined." });
+    }
+    const exportDocs =
+      encAccess.profileKey
+        ? decryptRecordsForProfile(docs, profileDoc, encAccess.profileKey, null)
+        : docs;
+    const rows = [fieldNames.slice()];
+    for (const docRow of exportDocs) {
+      rows.push(fieldNames.map((fn) => (docRow[fn] != null ? String(docRow[fn]) : "")));
+    }
+    const csvText = "\uFEFF" + buildSemicolonCsvText(rows);
+    const safeName = String(profileDoc.name || profileId)
+      .replace(/[^\w\-]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 60) || "profile";
+    const date = new Date().toISOString().slice(0, 10);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="elenko-export-${safeName}-${date}.csv"`);
+    console.log("[export-data] success", { profileId, rowCount: docs.length, fieldCount: fieldNames.length });
+    res.send(csvText);
+  } catch (err) {
+    console.error("[export-data] error", { profileId, message: err && err.message });
+    res.status(500).json({ error: err.message || "Export failed" });
   }
 });
 
@@ -4384,6 +5357,10 @@ app.post(
       if (!profileDoc || profileDoc.type !== "elenko_profile") {
         return res.status(404).json({ error: "Profile not found" });
       }
+      const encAccess = await resolveProfileEncryptionAccess(req, profileDoc);
+      if (isProfilePersonalEncryptionEnabled(profileDoc) && !encAccess.ok) {
+        return respondEncryptionAccessDenied(res, encAccess, "json");
+      }
       if (!isProfileFileField(profileDoc, fieldName)) {
         return res.status(400).json({ error: "Choose a profile field whose type is File." });
       }
@@ -4414,6 +5391,10 @@ app.post(
             continue;
           }
           const { outBuffer, outMime, safeName } = prep;
+          const attachBytes =
+            encAccess.profileKey ? encryptAttachmentBuffer(encAccess.profileKey, outBuffer) : outBuffer;
+          const attachMime =
+            encAccess.profileKey ? "application/vnd.elenko.encrypted" : outMime;
           let record;
           let pdoc;
           try {
@@ -4427,30 +5408,42 @@ app.post(
             }
             continue;
           }
-          if (record.primaryKey) {
-            const conflict = await findPrimaryKeyConflict(db, record.primaryKey, "");
+          const pkForLookup =
+            encAccess.profileKey && record.primaryKey
+              ? computePrimaryKeyToken(encAccess.profileKey, record.primaryKey)
+              : record.primaryKey;
+          if (pkForLookup) {
+            const conflict = await findPrimaryKeyConflict(db, pkForLookup, "");
             if (conflict) {
               if (importPolicy === "overwrite" && conflict.profileId === profileId) {
                 try {
                   let updated = await db.get(conflict._id);
+                  if (encAccess.profileKey) {
+                    decryptRecordFieldsInPlace(updated, pdoc, encAccess.profileKey, formDoc);
+                  }
                   const oldFile = updated[fieldName] != null ? String(updated[fieldName]).trim() : "";
                   if (oldFile && updated._attachments && updated._attachments[oldFile]) {
                     await db.attachment.destroy(conflict._id, oldFile, { rev: updated._rev });
                     updated = await db.get(conflict._id);
                   }
-                  await db.attachment.insert(conflict._id, safeName, outBuffer, outMime, {
+                  await db.attachment.insert(conflict._id, safeName, attachBytes, attachMime, {
                     rev: updated._rev,
                   });
                   updated = await db.get(conflict._id);
                   updated[fieldName] = safeName;
                   updated.updatedAt = now;
+                  setEntryAuditOnUpdate(updated, req);
                   updated.sortKey = buildSortKey(
                     updated,
                     Array.isArray(pdoc.sortKeyFields) ? pdoc.sortKeyFields : []
                   );
                   applyPrimaryKeyToRecord(updated, pdoc);
-                  if (updated.primaryKey) {
-                    const other = await findPrimaryKeyConflict(db, updated.primaryKey, updated._id);
+                  const pkStored =
+                    encAccess.profileKey && updated.primaryKey
+                      ? computePrimaryKeyToken(encAccess.profileKey, updated.primaryKey)
+                      : updated.primaryKey;
+                  if (pkStored) {
+                    const other = await findPrimaryKeyConflict(db, pkStored, updated._id);
                     if (other) {
                       if (rowErrors.length < 50) {
                         rowErrors.push({
@@ -4460,6 +5453,9 @@ app.post(
                       }
                       continue;
                     }
+                  }
+                  if (encAccess.profileKey) {
+                    encryptRecordFieldsForStorage(updated, pdoc, encAccess.profileKey, formDoc);
                   }
                   await db.insert(updated);
                   overwritten++;
@@ -4474,8 +5470,11 @@ app.post(
               continue;
             }
           }
+          if (encAccess.profileKey) {
+            encryptRecordFieldsForStorage(record, pdoc, encAccess.profileKey, formDoc);
+          }
           const ins = await db.insert(record);
-          await db.attachment.insert(ins.id, safeName, outBuffer, outMime, { rev: ins.rev });
+          await db.attachment.insert(ins.id, safeName, attachBytes, attachMime, { rev: ins.rev });
           imported++;
         } catch (e) {
           if (rowErrors.length < 50) {
@@ -4615,14 +5614,36 @@ app.post("/api/app-config", requireAdmin, async (req, res) => {
 app.get("/account/users/create", requireAdmin, async (req, res) => {
   const appUi = await getAppUiConfig();
   const created = req.query.created === "1";
-  res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage(null, created, appUi));
+  const keyfileToken = typeof req.query.keyfileToken === "string" ? req.query.keyfileToken.trim() : "";
+  res
+    .set("Content-Type", "text/html; charset=utf-8")
+    .send(renderCreateUserPage(null, created, appUi, keyfileToken));
+});
+
+app.get("/account/users/keyfile-download", requireAdmin, (req, res) => {
+  const token = typeof req.query.token === "string" ? req.query.token.trim() : "";
+  const download = req.query.download === "1";
+  const entry = download ? consumeKeyFileDownloadToken(token) : peekKeyFileDownloadToken(token);
+  if (!entry) {
+    return res.status(404).set("Content-Type", "text/html; charset=utf-8").send(renderErrorPage("Download link expired or invalid."));
+  }
+  if (download) {
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Disposition", `attachment; filename="${entry.filename}"`);
+    return res.send(entry.blob);
+  }
+  res
+    .set("Content-Type", "text/html; charset=utf-8")
+    .send(renderKeyFileDownloadPage(entry.filename, token));
 });
 
 app.post("/account/users/create", requireAdmin, async (req, res) => {
   const username = String((req.body && req.body.username) || "").trim();
   const password = (req.body && req.body.password) || "";
   const roleRaw = (req.body && req.body.role) || "editor";
-    const role = roleRaw === "admin" || roleRaw === "reader" ? roleRaw : "editor";
+  const role = roleRaw === "admin" || roleRaw === "reader" ? roleRaw : "editor";
+  const generateKeyFile = !!(req.body && (req.body.generateKeyFile === "1" || req.body.generateKeyFile === "on" || req.body.generateKeyFile === true));
+  const enforceKeyLogin = !!(req.body && (req.body.enforceKeyLogin === "1" || req.body.enforceKeyLogin === "on" || req.body.enforceKeyLogin === true));
   const appUi = await getAppUiConfig();
   if (!username) {
     return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username is required.", false, appUi));
@@ -4636,13 +5657,25 @@ app.post("/account/users/create", requireAdmin, async (req, res) => {
       return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username already exists.", false, appUi));
     }
     const { hash, salt } = hashPassword(password);
-    await db.insert({
+    const userDoc = {
       type: "elenko_user",
       username,
       passwordHash: hash,
       salt,
       role,
-    });
+      enforceKeyLogin,
+    };
+    let keyfileToken = "";
+    if (generateKeyFile) {
+      const masterKey = crypto.randomBytes(ELNK_MASTER_KEY_LEN);
+      const built = buildKeyFileRegistrationFromMasterKey(masterKey);
+      userDoc.keyFile = built.keyFile;
+      keyfileToken = storeKeyFileDownloadToken(username, built.blob);
+    }
+    await db.insert(userDoc);
+    if (keyfileToken) {
+      return res.redirect(`/account/users/create?created=1&keyfileToken=${encodeURIComponent(keyfileToken)}`);
+    }
     res.redirect("/account/users/create?created=1");
   } catch (err) {
     console.error("Create user error:", err);
@@ -4655,7 +5688,7 @@ app.get("/account/users", requireAdmin, async (req, res) => {
     const appUi = await getAppUiConfig();
     const result = await db.find({
       selector: { type: "elenko_user" },
-      fields: ["_id", "_rev", "username", "role"],
+      fields: ["_id", "_rev", "username", "role", "keyFile", "enforceKeyLogin"],
       sort: [{ username: "asc" }],
     });
     const users = result.docs || [];
@@ -4678,6 +5711,9 @@ app.put("/api/account/users/:id", requireAdmin, async (req, res) => {
     if (roleRaw !== undefined) {
       doc.role = roleRaw === "admin" || roleRaw === "reader" ? roleRaw : "editor";
     }
+    if (req.body && req.body.enforceKeyLogin !== undefined) {
+      doc.enforceKeyLogin = !!req.body.enforceKeyLogin;
+    }
     if (typeof newPassword === "string" && newPassword.length > 0) {
       const { hash, salt } = hashPassword(newPassword);
       doc.passwordHash = hash;
@@ -4690,6 +5726,123 @@ app.put("/api/account/users/:id", requireAdmin, async (req, res) => {
     res.status(500).json({ error: err.message || "Update failed" });
   }
 });
+
+app.post("/api/account/users/:id/generate-keyfile", requireAdmin, async (req, res) => {
+  try {
+    const doc = await db.get(req.params.id);
+    if (!doc || doc.type !== "elenko_user") {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (userKeyFileRegistered(doc)) {
+      return res.status(400).json({ error: "User already has a key file. Use regenerate instead." });
+    }
+    const masterKey = crypto.randomBytes(ELNK_MASTER_KEY_LEN);
+    const built = buildKeyFileRegistrationFromMasterKey(masterKey);
+    doc.keyFile = built.keyFile;
+    await db.insert(doc);
+    const token = storeKeyFileDownloadToken(doc.username, built.blob);
+    res.json({
+      ok: true,
+      downloadUrl: `/account/users/keyfile-download?token=${encodeURIComponent(token)}`,
+      filename: keyFileDownloadFilename(doc.username),
+    });
+  } catch (err) {
+    console.error("Generate key file error:", err);
+    res.status(500).json({ error: err.message || "Generate failed" });
+  }
+});
+
+app.post("/api/account/users/:id/regenerate-keyfile", requireAdmin, async (req, res) => {
+  try {
+    const doc = await db.get(req.params.id);
+    if (!doc || doc.type !== "elenko_user") {
+      return res.status(404).json({ error: "User not found" });
+    }
+    const masterKey = crypto.randomBytes(ELNK_MASTER_KEY_LEN);
+    const built = buildKeyFileRegistrationFromMasterKey(masterKey);
+    doc.keyFile = built.keyFile;
+    await db.insert(doc);
+    const token = storeKeyFileDownloadToken(doc.username, built.blob);
+    res.json({
+      ok: true,
+      downloadUrl: `/account/users/keyfile-download?token=${encodeURIComponent(token)}`,
+      filename: keyFileDownloadFilename(doc.username),
+      warning: "Previous key file no longer works. Encrypted databases will need re-wrapping (future step).",
+    });
+  } catch (err) {
+    console.error("Regenerate key file error:", err);
+    res.status(500).json({ error: err.message || "Regenerate failed" });
+  }
+});
+
+app.delete("/api/account/users/:id/keyfile", requireAdmin, async (req, res) => {
+  try {
+    const doc = await db.get(req.params.id);
+    if (!doc || doc.type !== "elenko_user") {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (!userKeyFileRegistered(doc)) {
+      return res.status(400).json({ error: "User has no registered key file." });
+    }
+    delete doc.keyFile;
+    await db.insert(doc);
+    res.json({
+      ok: true,
+      message:
+        "Key registration removed. Upload the previous elenko-<username>.key file if you need to restore access. Encrypted databases (future) remain locked until the correct key is registered again.",
+    });
+  } catch (err) {
+    console.error("Remove key file error:", err);
+    res.status(500).json({ error: err.message || "Remove failed" });
+  }
+});
+
+app.post(
+  "/api/account/users/:id/upload-keyfile",
+  requireAdmin,
+  keyFileUpload.single("keyFile"),
+  async (req, res) => {
+    try {
+      const doc = await db.get(req.params.id);
+      if (!doc || doc.type !== "elenko_user") {
+        return res.status(404).json({ error: "User not found" });
+      }
+      const replacing = userKeyFileRegistered(doc);
+      const file = req.file;
+      if (!file || !file.buffer || file.buffer.length === 0) {
+        return res.status(400).json({ error: "Choose a key file to upload." });
+      }
+      const nameCheck = validateKeyFileUploadFilename(file.originalname, doc.username);
+      if (!nameCheck.ok) {
+        return res.status(400).json({ error: nameCheck.error || "Invalid file name." });
+      }
+      let built;
+      try {
+        built = buildKeyFileRegistrationFromBlob(file.buffer);
+      } catch (e) {
+        return res.status(400).json({ error: e && e.message ? String(e.message) : "Invalid key file format." });
+      }
+      const verify = verifyKeyFileBlob(file.buffer, built.keyFile);
+      if (!verify.ok) {
+        return res.status(400).json({ error: verify.error || "Key file verification failed." });
+      }
+      doc.keyFile = built.keyFile;
+      await db.insert(doc);
+      res.json({
+        ok: true,
+        filename: nameCheck.filename,
+        blobVersion: built.keyFile.blobVersion,
+        replaced: replacing,
+        message: replacing
+          ? "Key file replaced from upload. The previous registration no longer works on this instance."
+          : "Key file registered from upload. The same file can be used on other instances for this username.",
+      });
+    } catch (err) {
+      console.error("Upload key file error:", err);
+      res.status(500).json({ error: err.message || "Upload failed" });
+    }
+  }
+);
 
 app.delete("/api/account/users/:id", requireAdmin, async (req, res) => {
   try {
@@ -4714,10 +5867,10 @@ app.get("/api/profiles", async (req, res) => {
   try {
     const result = await db.find({
       selector: { type: "elenko_profile" },
-      fields: ["_id", "_rev", "name", "description", "createdAt"],
+      fields: ["_id", "_rev", "name", "description", "createdAt", "encryption"],
       sort: [{ name: "asc" }],
     });
-    res.json({ profiles: result.docs || [] });
+    res.json({ profiles: filterProfilesVisibleToUser(req, result.docs || []) });
   } catch (err) {
     console.error("Error loading profiles:", err);
     res.status(500).json({ error: err.message });
@@ -6205,6 +7358,7 @@ app.post("/api/import-profile", requireAdmin, async (req, res) => {
       const now = new Date().toISOString();
       entry.createdAt = now;
       entry.updatedAt = now;
+      setEntryAuditOnCreate(entry, req);
       const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
       entry.sortKey = buildSortKey(entry, sortKeyFields);
       const profileFormIds = getProfileEntryFormIds(profileDoc);
@@ -6256,8 +7410,9 @@ app.get("/profile/:id/edit", requireAdmin, async (req, res) => {
       forms = result.docs || [];
     } catch (e) {}
     const appUi = await getAppUiConfig();
+    const keyFileUsers = await loadUsersWithRegisteredKeyFiles(db);
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditProfilePage(doc, forms, appUi));
+    res.send(renderEditProfilePage(doc, forms, appUi, keyFileUsers));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Profile not found"));
     console.error("Error loading profile:", err);
@@ -6286,9 +7441,11 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       guardianFlowId,
       sortKeyFields: rawSortKeyFields,
       sortDirection,
+      searchAccentFolding,
       primaryKeyFields: rawPrimaryKeyFields,
       primaryKeySegmentLengths: rawPrimaryKeySegmentLengths,
       primaryKeyImportPolicy: rawPrimaryKeyImportPolicy,
+      encryption: rawEncryption,
     } = req.body || {};
     if (!_rev || !name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name and _rev are required" });
@@ -6388,6 +7545,8 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       : [];
     doc.sortKeyFields = sortKeyFields;
     doc.sortDirection = sortDirection === "desc" ? "desc" : "asc";
+    doc.searchAccentFolding =
+      searchAccentFolding === true || searchAccentFolding === "true" ? true : false;
     const pkNorm = normalizePrimaryKeyFieldsFromBody(fields, rawPrimaryKeyFields, rawPrimaryKeySegmentLengths);
     doc.primaryKeyFields = pkNorm.primaryKeyFields;
     doc.primaryKeySegmentLengths = pkNorm.primaryKeySegmentLengths;
@@ -6396,23 +7555,86 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
         ? rawPrimaryKeyImportPolicy.trim()
         : "";
     doc.primaryKeyImportPolicy = pip;
+    const prevEncEnabled = isProfilePersonalEncryptionEnabled(doc);
+    const prevEncOwner = getProfileEncryptionOwnerUsername(doc);
+    const encBody = rawEncryption && typeof rawEncryption === "object" ? rawEncryption : {};
+    const wantEncEnabled = encBody.enabled === true || encBody.enabled === "true";
+    const wantEncOwner =
+      typeof encBody.ownerUsername === "string" && encBody.ownerUsername.trim()
+        ? encBody.ownerUsername.trim()
+        : "";
+    if (prevEncEnabled && wantEncEnabled && prevEncOwner && wantEncOwner && wantEncOwner !== prevEncOwner) {
+      return res.status(400).json({ error: "Change the encryption owner only after disabling encryption." });
+    }
+    let migrationProfileKey = null;
+    if (wantEncEnabled) {
+      if (!wantEncOwner) {
+        return res.status(400).json({ error: "Select an encryption owner when enabling personal-use encryption." });
+      }
+      if (!(await userHasRegisteredKeyFile(db, wantEncOwner))) {
+        return res.status(400).json({
+          error: `User "${wantEncOwner}" has no registered key file. Register a key file for that user first.`,
+        });
+      }
+      doc.encryption = {
+        mode: "personal",
+        enabled: true,
+        ownerUsername: wantEncOwner,
+        version: 1,
+      };
+      if (!prevEncEnabled) {
+        const encAccess = await resolveProfileEncryptionAccess(req, doc);
+        if (encAccess.ok && encAccess.profileKey) {
+          migrationProfileKey = encAccess.profileKey;
+        }
+      }
+    } else {
+      doc.encryption = {
+        mode: "personal",
+        enabled: false,
+        ownerUsername: wantEncOwner || prevEncOwner || "",
+        version: 1,
+      };
+    }
     const nameNormChanged =
       normalizeProfileNameForDbCode(previousName) !== normalizeProfileNameForDbCode(doc.name);
     if (!doc.dbCode8 || nameNormChanged) {
       doc.dbCode8 = await assignDbCode8(db, doc.name, doc._id);
     }
     const result = await db.insert(doc);
+    const latest = await db.get(id);
+    const encNewlyEnabled = !prevEncEnabled && isProfilePersonalEncryptionEnabled(latest);
+    if (encNewlyEnabled && migrationProfileKey) {
+      await migrateProfileRecordsToEncryption(db, latest, migrationProfileKey);
+    } else if (isProfilePersonalEncryptionEnabled(latest)) {
+      const encAccess = await resolveProfileEncryptionAccess(req, latest);
+      if (encAccess.ok && encAccess.profileKey && (await profileHasUnencryptedEntries(db, id))) {
+        await migrateProfileRecordsToEncryption(db, latest, encAccess.profileKey);
+      }
+    }
     // primaryKeyImportPolicy affects CSV and picture bulk import; it does not change how keys are computed on entries.
     const pkChanged =
-      prevDbCode8 !== doc.dbCode8 ||
-      prevPk !== JSON.stringify(doc.primaryKeyFields || []) ||
-      prevPkLen !== JSON.stringify(doc.primaryKeySegmentLengths || []);
+      prevDbCode8 !== latest.dbCode8 ||
+      prevPk !== JSON.stringify(latest.primaryKeyFields || []) ||
+      prevPkLen !== JSON.stringify(latest.primaryKeySegmentLengths || []);
     if (pkChanged) {
-      const latest = await db.get(id);
-      await recomputePrimaryKeysForProfileRecords(db, latest);
+      const profileAfter = await db.get(id);
+      if (isProfilePersonalEncryptionEnabled(profileAfter)) {
+        const encAccess = await resolveProfileEncryptionAccess(req, profileAfter);
+        if (encAccess.ok && encAccess.profileKey) {
+          await recomputeEncryptedPrimaryKeysForProfile(db, profileAfter, encAccess.profileKey);
+        }
+      } else {
+        await recomputePrimaryKeysForProfileRecords(db, profileAfter);
+      }
     }
     clearProfileListCache(id);
-    res.json({ ok: true, id: result.id, rev: result.rev });
+    res.json({
+      ok: true,
+      id: result.id,
+      rev: result.rev,
+      encryptionMigrationPending: encNewlyEnabled && !migrationProfileKey,
+    });
   } catch (err) {
     if (err?.statusCode === 409) return res.status(409).json({ error: "Conflict; refresh and try again" });
     if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
@@ -6478,23 +7700,34 @@ app.post("/api/profiles/:id/rebuild-sort-keys", requireAdmin, async (req, res) =
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).json({ error: "Profile not found" });
     }
+    const encAccess = await resolveProfileEncryptionAccess(req, doc);
+    if (isProfilePersonalEncryptionEnabled(doc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "json");
+    }
     const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
-    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
     const result = await db.find({
       selector: { type: "elenko_record", profileId: id },
       limit: 50000,
     });
     const docs = result.docs || [];
     const now = new Date().toISOString();
+    const rebuildAuditUser = getSessionUsername(req);
     let updated = 0;
     for (const rec of docs) {
       if (!rec.createdAt) rec.createdAt = now;
       rec.updatedAt = now;
+      if (rebuildAuditUser) rec.updatedBy = rebuildAuditUser;
+      if (encAccess.profileKey && rec.encrypted === true) {
+        decryptRecordFieldsInPlace(rec, doc, encAccess.profileKey, null);
+      }
       rec.sortKey = buildSortKey(rec, sortKeyFields);
       try {
         applyPrimaryKeyToRecord(rec, doc);
       } catch (_) {
         delete rec.primaryKey;
+      }
+      if (encAccess.profileKey) {
+        encryptRecordFieldsForStorage(rec, doc, encAccess.profileKey, null);
       }
       await db.insert(rec);
       updated++;
@@ -6529,11 +7762,13 @@ app.post("/api/profiles/:id/reassign-entries", requireAdmin, async (req, res) =>
     });
     const docs = result.docs || [];
     const now = new Date().toISOString();
+    const reassignAuditUser = getSessionUsername(req);
     let reassigned = 0;
     for (const rec of docs) {
       rec.profileId = id;
       if (!rec.createdAt) rec.createdAt = now;
       rec.updatedAt = now;
+      if (reassignAuditUser) rec.updatedBy = reassignAuditUser;
       rec.sortKey = buildSortKey(rec, sortKeyFields);
       try {
         applyPrimaryKeyToRecord(rec, doc);
@@ -6737,6 +7972,10 @@ app.get("/profile/:id/entry/:entryId", async (req, res) => {
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).send(renderErrorPage("Profile not found"));
     }
+    const encAccess = await resolveProfileEncryptionAccess(req, doc);
+    if (isProfilePersonalEncryptionEnabled(doc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "html");
+    }
     const record = await db.get(entryId);
     if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
       return res.status(404).send(renderErrorPage("Entry not found"));
@@ -6764,6 +8003,9 @@ app.get("/profile/:id/entry/:entryId", async (req, res) => {
         // form missing or not found – use default
       }
     }
+    if (encAccess.profileKey) {
+      decryptRecordFieldsInPlace(record, doc, encAccess.profileKey, formDoc);
+    }
     const role = (req.session && req.session.role) || "editor";
     const returnQuery = { q: req.query.q, page: req.query.page, split: req.query.split };
     res.set("Content-Type", "text/html; charset=utf-8");
@@ -6782,6 +8024,10 @@ app.get("/api/profile/:id/entry/:entryId/linked-query", async (req, res) => {
     const doc = await db.get(profileId);
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).json({ error: "Profile not found" });
+    }
+    const encAccess = await resolveProfileEncryptionAccess(req, doc);
+    if (isProfilePersonalEncryptionEnabled(doc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "json");
     }
     const record = await db.get(entryId);
     if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
@@ -6809,6 +8055,9 @@ app.get("/api/profile/:id/entry/:entryId/linked-query", async (req, res) => {
         if (loaded && loaded.type === "elenko_entry_form") formDoc = loaded;
       } catch (_) {}
     }
+    if (encAccess.profileKey) {
+      decryptRecordFieldsInPlace(record, doc, encAccess.profileKey, formDoc);
+    }
     const layout = formDoc && (formDoc.layout === "grid" || formDoc.layout === "stack") ? formDoc.layout : "table";
     const html = await buildLinkedQueryHtmlForEntry(doc, record, formDoc, layout, { forceLoad: true });
     return res.json({ ok: true, html: html || "" });
@@ -6826,6 +8075,10 @@ app.get("/profile/:id/entry/:entryId/edit", requireEditor, async (req, res) => {
     const doc = await db.get(profileId);
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).send(renderErrorPage("Profile not found"));
+    }
+    const encAccess = await resolveProfileEncryptionAccess(req, doc);
+    if (isProfilePersonalEncryptionEnabled(doc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "html");
     }
     const record = await db.get(entryId);
     if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
@@ -6859,6 +8112,9 @@ app.get("/profile/:id/entry/:entryId/edit", requireEditor, async (req, res) => {
           }
         } catch (_) {}
       }
+    }
+    if (encAccess.profileKey) {
+      decryptRecordFieldsInPlace(record, doc, encAccess.profileKey, formDoc);
     }
     const formChoices = [];
     const seenIds = new Set();
@@ -6897,6 +8153,10 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     const doc = await db.get(profileId);
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).json({ error: "Profile not found" });
+    }
+    const encAccess = await resolveProfileEncryptionAccess(req, doc);
+    if (isProfilePersonalEncryptionEnabled(doc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "json");
     }
     let record = await db.get(entryId);
     if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
@@ -6945,6 +8205,7 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     const now = new Date().toISOString();
     record.updatedAt = now;
     if (!record.createdAt) record.createdAt = now;
+    setEntryAuditOnUpdate(record, req);
     let profileDoc = doc;
     profileDoc = await ensureProfileDbCode8(db, profileDoc);
     const sortKeyFields = Array.isArray(profileDoc.sortKeyFields) ? profileDoc.sortKeyFields : [];
@@ -6954,11 +8215,18 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     } catch (e) {
       return res.status(400).json({ error: e.message || "Primary key could not be computed." });
     }
-    if (record.primaryKey) {
-      const conflict = await findPrimaryKeyConflict(db, record.primaryKey, entryId);
+    const pkForLookup =
+      encAccess.profileKey && record.primaryKey
+        ? computePrimaryKeyToken(encAccess.profileKey, record.primaryKey)
+        : record.primaryKey;
+    if (pkForLookup) {
+      const conflict = await findPrimaryKeyConflict(db, pkForLookup, entryId);
       if (conflict) {
         return res.status(409).json({ error: "Duplicate primary key: another entry already uses this composite key." });
       }
+    }
+    if (encAccess.profileKey) {
+      encryptRecordFieldsForStorage(record, profileDoc, encAccess.profileKey, formDoc);
     }
     if (Object.prototype.hasOwnProperty.call(record, ELENKO_DISCARD_ON_CANCEL)) {
       delete record[ELENKO_DISCARD_ON_CANCEL];
@@ -7022,6 +8290,10 @@ app.post(
       const profileDoc = await db.get(profileId);
       if (!profileDoc || profileDoc.type !== "elenko_profile") {
         return res.status(404).json({ error: "Profile not found" });
+      }
+      const encAccess = await resolveProfileEncryptionAccess(req, profileDoc);
+      if (isProfilePersonalEncryptionEnabled(profileDoc) && !encAccess.ok) {
+        return respondEncryptionAccessDenied(res, encAccess, "json");
       }
       const profileFieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
       if (!profileFieldNames.includes(fieldName)) {
@@ -7152,24 +8424,39 @@ app.post(
         }
       }
 
-      await db.attachment.insert(entryId, safeName, outBuffer, outMime, { rev: record._rev });
+      const attachBytes =
+        encAccess.profileKey ? encryptAttachmentBuffer(encAccess.profileKey, outBuffer) : outBuffer;
+      const attachMime =
+        encAccess.profileKey ? "application/vnd.elenko.encrypted" : outMime;
+      await db.attachment.insert(entryId, safeName, attachBytes, attachMime, { rev: record._rev });
       record = await db.get(entryId);
       record[fieldName] = safeName;
       record.updatedAt = new Date().toISOString();
+      setEntryAuditOnUpdate(record, req);
       let pdoc = profileDoc;
       pdoc = await ensureProfileDbCode8(db, pdoc);
       const sortKeyFields = Array.isArray(pdoc.sortKeyFields) ? pdoc.sortKeyFields : [];
+      if (encAccess.profileKey) {
+        decryptRecordFieldsInPlace(record, pdoc, encAccess.profileKey, formDoc);
+      }
       record.sortKey = buildSortKey(record, sortKeyFields);
       try {
         applyPrimaryKeyToRecord(record, pdoc);
       } catch (e) {
         return res.status(400).json({ error: e.message || "Primary key could not be computed." });
       }
-      if (record.primaryKey) {
-        const conflict = await findPrimaryKeyConflict(db, record.primaryKey, entryId);
+      const pkForLookup =
+        encAccess.profileKey && record.primaryKey
+          ? computePrimaryKeyToken(encAccess.profileKey, record.primaryKey)
+          : record.primaryKey;
+      if (pkForLookup) {
+        const conflict = await findPrimaryKeyConflict(db, pkForLookup, entryId);
         if (conflict) {
           return res.status(409).json({ error: "Duplicate primary key after upload." });
         }
+      }
+      if (encAccess.profileKey) {
+        encryptRecordFieldsForStorage(record, pdoc, encAccess.profileKey, formDoc);
       }
       const ins = await db.insert(record);
       clearProfileListCache(profileId);
@@ -7196,6 +8483,10 @@ app.get("/api/profiles/:profileId/entries/:entryId/attachments/:filename", requi
 
     const profileDoc = await db.get(profileId);
     if (!profileDoc || profileDoc.type !== "elenko_profile") return res.status(404).end();
+    const encAccess = await resolveProfileEncryptionAccess(req, profileDoc);
+    if (isProfilePersonalEncryptionEnabled(profileDoc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "empty");
+    }
     const record = await db.get(entryId);
     if (!record || record.type !== "elenko_record" || record.profileId !== profileId) return res.status(404).end();
 
@@ -7215,9 +8506,28 @@ app.get("/api/profiles/:profileId/entries/:entryId/attachments/:filename", requi
     const wantMax = Number.isFinite(maxRaw) && maxRaw > 0;
     const maxEdge = wantMax ? Math.min(Math.floor(maxRaw), MAX_IMAGE_DISPLAY_EDGE) : 0;
 
-    const buf = await db.attachment.get(entryId, filename);
+    let buf = await db.attachment.get(entryId, filename);
+    const wasEncryptedAttachment =
+      encAccess.profileKey &&
+      String(contentType).toLowerCase() === "application/vnd.elenko.encrypted";
+    if (encAccess.profileKey) {
+      buf = decryptAttachmentBuffer(encAccess.profileKey, buf);
+    }
 
-    const isImageCt = String(contentType).toLowerCase().startsWith("image/");
+    let effectiveCt = contentType;
+    if (wasEncryptedAttachment) {
+      try {
+        const meta = await sharp(buf, { failOn: "truncated" }).metadata();
+        if (meta && meta.format) {
+          effectiveCt = meta.format === "jpeg" ? "image/jpeg" : `image/${meta.format}`;
+        } else {
+          effectiveCt = "application/octet-stream";
+        }
+      } catch (_) {
+        effectiveCt = "application/octet-stream";
+      }
+    }
+    const isImageCt = String(effectiveCt).toLowerCase().startsWith("image/");
     if (maxEdge > 0 && isImageCt) {
       try {
         const out = await sharp(buf)
@@ -7234,7 +8544,7 @@ app.get("/api/profiles/:profileId/entries/:entryId/attachments/:filename", requi
       }
     }
     /** @type {string} */
-    const ct = contentType;
+    const ct = effectiveCt;
     res.set("Cache-Control", "private, max-age=86400");
     res.type(ct);
     res.send(buf);
@@ -7252,6 +8562,10 @@ app.delete("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res)
     const doc = await db.get(profileId);
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).json({ error: "Profile not found" });
+    }
+    const encAccess = await resolveProfileEncryptionAccess(req, doc);
+    if (isProfilePersonalEncryptionEnabled(doc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "json");
     }
     const record = await db.get(entryId);
     if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
@@ -7406,6 +8720,9 @@ app.get("/profile/:id", async (req, res) => {
     if (!doc || doc.type !== "elenko_profile") {
       return res.status(404).send(renderErrorPage("Profile not found"));
     }
+    if (!canUserSeePersonalEncryptedProfile(req, doc)) {
+      return res.status(404).send(renderErrorPage("Profile not found"));
+    }
     const profileId = doc._id;
     if (req.query.clearSearch) {
       clearSearchListCache(profileId);
@@ -7422,17 +8739,61 @@ app.get("/profile/:id", async (req, res) => {
         : ENTRIES_PAGE_SIZE;
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const searchQuery = (req.query.q || "").trim();
+    const useAccentFolding = isProfileSearchAccentFoldingEnabled(doc);
+    const normalizedSearch =
+      searchQuery && useAccentFolding ? normalizeForSearch(searchQuery) : "";
     const skip = (page - 1) * profileEntriesPageSize;
 
-    const selector = { type: "elenko_record", profileId };
-    if (searchQuery && fieldNames.length > 0) {
-      const pattern = ".*" + escapeRegex(searchQuery) + ".*";
-      selector.$or = fieldNames.map((fn) => ({ [fn]: { $regex: pattern } }));
+    const encAccess = await resolveProfileEncryptionAccess(req, doc);
+    const profileEncrypted = isProfilePersonalEncryptionEnabled(doc);
+    if (profileEncrypted && !encAccess.ok) {
+      const role = (req.session && req.session.role) || "editor";
+      res.set("Content-Type", "text/html; charset=utf-8");
+      res.send(
+        renderElenkoDatabasePage(doc, [], role, {
+          page: 1,
+          totalPages: 0,
+          hasNext: false,
+          hasPrev: false,
+          searchQuery,
+          encryptionLock: encAccess,
+        })
+      );
+      return;
     }
 
     const sortKeyFields = Array.isArray(doc.sortKeyFields) ? doc.sortKeyFields : [];
-    const useSortKey = sortKeyFields.length > 0;
     const sortDirection = doc.sortDirection === "desc" ? "desc" : "asc";
+    if (profileEncrypted && encAccess.profileKey) {
+      const encList = await loadEncryptedProfileEntryList(db, doc, encAccess.profileKey, {
+        page,
+        profileEntriesPageSize,
+        searchQuery,
+        useAccentFolding,
+        normalizedSearch,
+        fieldNames,
+        sortKeyFields,
+        sortDirection,
+      });
+      const role = (req.session && req.session.role) || "editor";
+      res.set("Content-Type", "text/html; charset=utf-8");
+      res.send(
+        renderElenkoDatabasePage(doc, encList.records, role, {
+          page,
+          totalPages: encList.pagination.totalPages,
+          hasNext: encList.pagination.hasNext,
+          hasPrev: encList.pagination.hasPrev,
+          searchQuery,
+          encryptionEnabled: true,
+          encryptionOwner: encAccess.owner,
+        })
+      );
+      return;
+    }
+
+    const selector = buildProfileEntrySearchSelector(profileId, fieldNames, searchQuery, useAccentFolding);
+
+    const useSortKey = sortKeyFields.length > 0;
     // Fetch only one utility field used for row icon decoration.
     // It is not rendered as a visible table column.
     const fieldsForFind = fieldNames.length ? ["_id", "_rev", "sortKey", "isResponse", ...fieldNames] : ["_id", "_rev", "sortKey", "isResponse"];
@@ -7484,7 +8845,9 @@ app.get("/profile/:id", async (req, res) => {
     } else if (useSortKey && searchQuery) {
       // Search with sort-key profile: use cached sorted docs or fetch, sort, cache, then paginate
       const sortConfig = JSON.stringify({ sortKeyFields, sortDirection });
-      const searchCacheKey = profileId + SEARCH_CACHE_KEY_SEP + sortConfig + SEARCH_CACHE_KEY_SEP + searchQuery;
+      const acfKey = useAccentFolding ? "acf1" : "acf0";
+      const searchCacheKey =
+        profileId + SEARCH_CACHE_KEY_SEP + sortConfig + SEARCH_CACHE_KEY_SEP + acfKey + SEARCH_CACHE_KEY_SEP + searchQuery;
       const cached = searchListCache.get(searchCacheKey);
       if (cached && Array.isArray(cached.docs)) {
         totalPages = Math.max(1, Math.ceil(cached.docs.length / profileEntriesPageSize));
@@ -7495,7 +8858,14 @@ app.get("/profile/:id", async (req, res) => {
           fields: fieldsForFind,
           limit: SORT_FETCH_LIMIT,
         });
-        const fullDocs = sortResult.docs || [];
+        let fullDocs = sortResult.docs || [];
+        if (useAccentFolding) {
+          if (searchQuery && !normalizedSearch) {
+            fullDocs = [];
+          } else if (normalizedSearch) {
+            fullDocs = fullDocs.filter((d) => entryMatchesSearchQuery(d, fieldNames, normalizedSearch));
+          }
+        }
         const cmp = (a, b) => {
           const sa = Array.isArray(a.sortKey) ? a.sortKey : [];
           const sb = Array.isArray(b.sortKey) ? b.sortKey : [];
@@ -7513,15 +8883,46 @@ app.get("/profile/:id", async (req, res) => {
         allDocs = fullDocs.slice(skip, skip + profileEntriesPageSize + 1);
       }
     } else {
-      const recordsResult = await db.find({
-        selector,
-        fields: fieldsForFind,
-        sort: [{ _id: "asc" }],
-        limit: profileEntriesPageSize + 1,
-        skip,
-      });
-      allDocs = recordsResult.docs || [];
-      if (searchQuery && allDocs.length > 0) totalPages = null; // unknown total for search without sort key
+      if (searchQuery && fieldNames.length > 0) {
+        if (useAccentFolding) {
+          const recordsResult = await db.find({
+            selector: { type: "elenko_record", profileId },
+            fields: fieldsForFind,
+            sort: [{ _id: "asc" }],
+            limit: SORT_FETCH_LIMIT,
+          });
+          let filtered;
+          if (searchQuery && !normalizedSearch) {
+            filtered = [];
+          } else {
+            filtered = (recordsResult.docs || []).filter((d) =>
+              entryMatchesSearchQuery(d, fieldNames, normalizedSearch)
+            );
+          }
+          totalPages = Math.max(1, Math.ceil(filtered.length / profileEntriesPageSize));
+          allDocs = filtered.slice(skip, skip + profileEntriesPageSize + 1);
+        } else {
+          const recordsResult = await db.find({
+            selector,
+            fields: fieldsForFind,
+            sort: [{ _id: "asc" }],
+            limit: profileEntriesPageSize + 1,
+            skip,
+          });
+          allDocs = recordsResult.docs || [];
+          if (searchQuery && allDocs.length > 0) totalPages = null; // unknown total for search without sort key
+        }
+      } else {
+        const recordsResult = await db.find({
+          selector,
+          fields: fieldsForFind,
+          sort: [{ _id: "asc" }],
+          limit: profileEntriesPageSize + 1,
+          skip,
+        });
+        allDocs = recordsResult.docs || [];
+        if (searchQuery && allDocs.length > 0) totalPages = null; // unknown total for search without sort key
+      }
     }
     const records = allDocs.slice(0, profileEntriesPageSize);
     const hasNext = allDocs.length > profileEntriesPageSize;
@@ -7661,6 +9062,19 @@ function fieldLayoutImageValueHeightConstraints(o, profileDoc, forEdit) {
       n +
       "em;min-height:0;overflow:auto;display:flex;flex-direction:column;align-items:flex-start;justify-content:flex-start;",
   };
+}
+
+/**
+ * Stack layout (single-entry view): `.entry-view-stack .value` is capped at 12rem by default CSS.
+ * When the form sets Height (em) on a non-image field, apply that as max-height so markdown/text matches the designer setting.
+ */
+function stackLayoutViewValueMaxHeightStyle(o, gImg) {
+  if (gImg && gImg.style) return "";
+  if (!o || o.type !== "field") return "";
+  if (o.height == null || o.height === "") return "";
+  const n = Number(o.height);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  return "max-height:" + n + "em;";
 }
 
 function linkedQueryBlockStyleForLayout(layout, cfg) {
@@ -8106,7 +9520,9 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
               : o.fieldType === "chart"
               ? " value entry-value-chart"
               : " value") + gImg.className;
-          const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
+          const stackMaxH = stackLayoutViewValueMaxHeightStyle(o, gImg);
+          const valueBoxStyleStr = (gImg.style || "") + stackMaxH;
+          const valueBoxStyle = valueBoxStyleStr ? ' style="' + escapeHtml(valueBoxStyleStr) + '"' : "";
           return `
         <div class="entry-field-block"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
@@ -8220,13 +9636,23 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       font-size: 0.875rem;
       line-height: 1;
       border: 1px solid var(--entry-field-border, #21262d);
-      background: #21262d;
+      background: var(--entry-field-bg, #161b22);
       color: var(--entry-link, #58a6ff);
       text-decoration: none;
       box-sizing: border-box;
     }
-    a.entry-nav-pag:hover { text-decoration: none; background: #30363d; color: var(--entry-link, #58a6ff); }
-    .entry-nav-pag.entry-nav-disabled { color: #484f58; pointer-events: none; cursor: default; background: #21262d; }
+    a.entry-nav-pag:hover {
+      text-decoration: none;
+      background: color-mix(in srgb, var(--entry-field-bg, #161b22) 78%, var(--entry-link, #58a6ff) 22%);
+      color: var(--entry-link, #58a6ff);
+    }
+    .entry-nav-pag.entry-nav-disabled {
+      color: var(--entry-label, #8b949e);
+      pointer-events: none;
+      cursor: default;
+      background: var(--entry-field-bg, #161b22);
+      opacity: 0.65;
+    }
     /* Same button look as .entry-nav-pag / pagination; ◀ is widely supported (unlike U+2B9C). */
     .topbar-links a.topbar-icon-btn {
       display: inline-block;
@@ -8235,12 +9661,16 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       font-size: 0.875rem;
       line-height: 1;
       border: 1px solid var(--entry-field-border, #21262d);
-      background: #21262d;
+      background: var(--entry-field-bg, #161b22);
       color: var(--entry-link, #58a6ff);
       text-decoration: none;
       box-sizing: border-box;
     }
-    .topbar-links a.topbar-icon-btn:hover { text-decoration: none; background: #30363d; color: var(--entry-link, #58a6ff); }
+    .topbar-links a.topbar-icon-btn:hover {
+      text-decoration: none;
+      background: color-mix(in srgb, var(--entry-field-bg, #161b22) 78%, var(--entry-link, #58a6ff) 22%);
+      color: var(--entry-link, #58a6ff);
+    }
     @media (max-width: 768px) {
       .topbar-links a.topbar-icon-btn {
         display: inline-flex;
@@ -8296,6 +9726,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       }
     }
     .empty { color: var(--entry-label, #8b949e); font-style: italic; }
+    /* Default scroll cap for long values; overridden by inline max-height when the form sets Stack Height (em). */
     .entry-view-stack { --entry-stack-field-max-height: 12rem; }
     .entry-view-stack .entry-field-block { margin-bottom: 1rem; min-width: 0; }
     .entry-view-stack .label { display: block; margin-bottom: 0.25rem; }
@@ -8321,6 +9752,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .entry-value-markdown h2 { font-size: 1.1rem; }
     .entry-value-markdown h3 { font-size: 1rem; }
     .entry-value-markdown a { color: var(--entry-link, #58a6ff); }
+    .value:not(.entry-value-markdown):not(.entry-value-chart):not(.entry-value-image) { white-space: pre-wrap; overflow-wrap: break-word; }
     .entry-value-url a { color: var(--entry-link, #58a6ff); word-break: break-all; }
     .entry-profile-file-dl a { color: var(--entry-link, #58a6ff); word-break: break-all; }
     .entry-value-image { min-height: 0; }
@@ -8450,6 +9882,10 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   const labelColor = theme.label || DEFAULT_ENTRY_VIEW_THEME.label;
   const linkColor = theme.link || DEFAULT_ENTRY_VIEW_THEME.link;
   const fieldBgEdit = theme.fieldBackgroundEdit != null ? theme.fieldBackgroundEdit : DEFAULT_ENTRY_VIEW_THEME.fieldBackgroundEdit;
+  const fieldBorder =
+    theme.fieldBorder != null && String(theme.fieldBorder).trim()
+      ? String(theme.fieldBorder).trim()
+      : DEFAULT_ENTRY_VIEW_THEME.fieldBorder;
   const textEdit = theme.textEdit != null ? theme.textEdit : DEFAULT_ENTRY_VIEW_THEME.textEdit;
   const layout = formDoc && (formDoc.layout === "grid" || formDoc.layout === "stack") ? formDoc.layout : "table";
 
@@ -8462,6 +9898,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       --entry-text: ${escapeHtml(text)};
       --entry-label: ${escapeHtml(labelColor)};
       --entry-link: ${escapeHtml(linkColor)};
+      --entry-field-border: ${escapeHtml(fieldBorder)};
       --entry-field-bg-edit: ${escapeHtml(fieldBgEdit)};
       --entry-text-edit: ${escapeHtml(textEdit)};
     }`;
@@ -8692,12 +10129,16 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       font-size: 0.875rem;
       line-height: 1;
       border: 1px solid var(--entry-field-border, #21262d);
-      background: #21262d;
+      background: var(--entry-field-bg-edit, #161b22);
       color: var(--entry-link, #58a6ff);
       text-decoration: none;
       box-sizing: border-box;
     }
-    .topbar-links a.topbar-icon-btn:hover { text-decoration: none; background: #30363d; color: var(--entry-link, #58a6ff); }
+    .topbar-links a.topbar-icon-btn:hover {
+      text-decoration: none;
+      background: color-mix(in srgb, var(--entry-field-bg-edit, #161b22) 78%, var(--entry-link, #58a6ff) 22%);
+      color: var(--entry-link, #58a6ff);
+    }
     @media (max-width: 768px) {
       .topbar-links a.topbar-icon-btn {
         display: inline-flex;
@@ -9125,8 +10566,27 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
   const customCss = doc.customCss || "";
   const theme = normalizeProfileTheme(doc.theme);
-  const { page = 1, totalPages = null, hasNext = false, hasPrev = false, searchQuery = "" } = pagination;
+  const {
+    page = 1,
+    totalPages = null,
+    hasNext = false,
+    hasPrev = false,
+    searchQuery = "",
+    encryptionLock = null,
+    encryptionEnabled = false,
+    encryptionOwner = "",
+  } = pagination;
   const profileBase = "/profile/" + encodeURIComponent(doc._id);
+  const encryptionBanner = encryptionLock
+    ? `<div class="encryption-notice" style="margin:0.75rem 0;padding:0.75rem 1rem;border:1px solid var(--profile-table-border, #30363d);border-radius:8px;background:var(--profile-table-header-bg, #21262d);color:var(--profile-text, #e6edf3);">
+        <strong>Encrypted database.</strong> ${escapeHtml(encryptionLock.error || "Access denied.")}
+        ${encryptionLock.needKeyUnlock ? ' <a href="/account/unlock-keyfile">Unlock key file</a>' : ""}
+      </div>`
+    : encryptionEnabled
+      ? `<div class="encryption-notice" style="margin:0.75rem 0;padding:0.5rem 0.75rem;border:1px solid var(--profile-table-border, #30363d);border-radius:8px;color:var(--profile-label, #8b949e);font-size:0.875rem;">
+          Encrypted for personal use${encryptionOwner ? ` (${escapeHtml(encryptionOwner)})` : ""}. Search and sort run in memory after decryption.
+        </div>`
+      : "";
   const qParam = searchQuery ? "&q=" + encodeURIComponent(searchQuery) : "";
   const prevUrl = hasPrev ? profileBase + "?page=" + (page - 1) + qParam : null;
   const nextUrl = hasNext ? profileBase + "?page=" + (page + 1) + qParam : null;
@@ -9245,7 +10705,15 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
 
   const emptyRow =
     fieldNames.length > 0 && records.length === 0
-      ? '\n        <tr><td colspan="' + fieldNames.length + '" class="empty">' + (searchQuery ? "No entries match your search." : "No entries yet.") + "</td></tr>"
+      ? '\n        <tr><td colspan="' +
+        fieldNames.length +
+        '" class="empty">' +
+        (encryptionLock
+          ? escapeHtml(encryptionLock.error || "This encrypted database is locked.")
+          : searchQuery
+            ? "No entries match your search."
+            : "No entries yet.") +
+        "</td></tr>"
       : "";
 
   return `<!DOCTYPE html>
@@ -9388,8 +10856,9 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
         ${description ? `<span class="sub">${description}</span>` : ""}
       </div>
     </div>
-    <div class="topbar-actions">${canEdit ? `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn">Create entry</a>` : ""}</div>
+    <div class="topbar-actions">${canEdit && !encryptionLock ? `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn">Create entry</a>` : ""}</div>
   </div>
+  ${encryptionBanner}
   ${splitViewEnabled && splitViewOrientation !== "horizontal" ? `<div class="split-view-wrap split-${splitViewOrientation}" data-orientation="${splitViewOrientation}"><div class="split-list-pane">` : ""}
   <div class="top-tools">
     <form method="get" action="${profileBase}" class="search-bar">
@@ -9739,7 +11208,7 @@ function renderEntryFormsListPage(forms, appUi) {
           .map(
             (f) => `
         <tr>
-          <td>${escapeHtml(f.name || f._id)}</td>
+          <td><a class="form-name-link" href="/entry-forms/${encodeURIComponent(f._id)}/edit">${escapeHtml(f.name || f._id)}</a></td>
           <td class="row-actions"><a href="/entry-forms/${encodeURIComponent(f._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action" data-id="${escapeHtml(f._id)}" aria-label="Copy" title="Copy">⧉</button><a href="/entry-forms/${encodeURIComponent(f._id)}/delete" class="delete-link icon-action" aria-label="Delete" title="Delete">✕</a></td>
         </tr>`
           )
@@ -9790,6 +11259,8 @@ function renderEntryFormsListPage(forms, appUi) {
     th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
+    .form-name-link { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .form-name-link:hover { text-decoration: underline; }
     .row-actions { white-space: nowrap; }
     .row-actions .icon-action {
       display: inline-flex;
@@ -12463,7 +13934,7 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
     body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 48rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
     .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); font-weight: 600; }
     input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
     input:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     select { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
@@ -13140,7 +14611,8 @@ function renderAllDocumentsPage(docs, appUi) {
 </html>`;
 }
 
-function renderStartPage(profiles, role, appUi) {
+function renderStartPage(profiles, role, appUi, keyFileNotice) {
+  const keyFileBanner = keyFileNotice ? String(keyFileNotice) : "";
   const isAdmin = role === "admin";
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const logoUrl = appUi && appUi.logoUrl ? appUi.logoUrl : "";
@@ -13180,7 +14652,7 @@ function renderStartPage(profiles, role, appUi) {
 
     const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
-  const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
+  const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option><option value="/account/unlock-keyfile">Provide key file</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
   const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
   const thead = '<tr><th>Name</th><th>Description</th><th class="col-mobile-hidden">Creation date</th></tr>';
@@ -13236,6 +14708,7 @@ function renderStartPage(profiles, role, appUi) {
 <body>
   ${logoHtml}
   ${titleHtml}
+  ${keyFileBanner}
   <p class="nav-bar">
     ${isAdmin ? actionsAdmin : actionsUser}
     ${actionsCommon}
@@ -13277,7 +14750,7 @@ function toHex6(hex) {
   return "#" + s;
 }
 
-function renderEditProfilePage(doc, forms = [], appUi) {
+function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
   const appTheme = normalizeAppTheme(appUi && appUi.theme);
   const appThemeVars = getAppThemeVars(appTheme);
   const name = escapeHtml(doc.name || "");
@@ -13359,6 +14832,18 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     entriesPageSizeRaw <= ENTRIES_PAGE_SIZE_MAX
       ? Math.floor(entriesPageSizeRaw)
       : ENTRIES_PAGE_SIZE;
+  const searchAccentFoldingChecked = isProfileSearchAccentFoldingEnabled(doc);
+  const encryptionEnabledChecked = isProfilePersonalEncryptionEnabled(doc);
+  const encryptionOwnerUsername =
+    getProfileEncryptionOwnerUsername(doc) ||
+    (doc.encryption && typeof doc.encryption.ownerUsername === "string" ? doc.encryption.ownerUsername.trim() : "");
+  const keyFileUserOptions = (Array.isArray(keyFileUsers) ? keyFileUsers : [])
+    .map((u) => {
+      const un = u && u.username ? String(u.username) : "";
+      if (!un) return "";
+      return `<option value="${escapeHtml(un)}"${encryptionOwnerUsername === un ? " selected" : ""}>${escapeHtml(un)}</option>`;
+    })
+    .join("");
   const splitViewCfgEdit = doc && doc.splitView && typeof doc.splitView === "object" ? doc.splitView : null;
   const splitViewEnabled = !!(splitViewCfgEdit && splitViewCfgEdit.enabled);
   const splitViewOrientation = splitViewCfgEdit && splitViewCfgEdit.orientation === "horizontal" ? "horizontal" : "vertical";
@@ -13400,7 +14885,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 58rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
     .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); font-weight: 600; }
     input[type="text"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
     input[type="text"]:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     textarea { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; font-family: inherit; min-height: 4rem; resize: vertical; }
@@ -13577,6 +15062,14 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     <label for="entriesPageSize" style="margin-top:0.75rem;">Entries per page</label>
     <p class="sub" style="margin-top:0.25rem;">Rows shown in the database list pagination. Default is 25.</p>
     <input type="number" id="entriesPageSize" name="entriesPageSize" min="${ENTRIES_PAGE_SIZE_MIN}" max="${ENTRIES_PAGE_SIZE_MAX}" step="1" value="${escapeHtml(String(entriesPageSize))}">
+    <label style="margin-top:1rem;">Entry search: fold accents and umlauts</label>
+    <p class="sub" style="margin-top:0.25rem;">When enabled, the database list search treats letters as equal if they differ only by accents or case (for example Lourié matches Lourie; Müller matches Muller). <strong>Performance:</strong> with this on, each search may load and scan up to many thousand entry rows on the server before paginating, which can be slow or memory-heavy for very large databases. When off (default), search is faster and uses the database index, but spelling must match stored text except for letter case. Do not select password or similar secret fields for search indexing — use identifiers such as site or account names instead.</p>
+    <label style="display:flex;align-items:flex-start;gap:0.5rem;margin-top:0.35rem;">
+      <input type="checkbox" id="searchAccentFolding" name="searchAccentFolding" style="width:auto;margin-top:0.2rem;" ${
+        searchAccentFoldingChecked ? "checked" : ""
+      }>
+      <span>Enable accent folding for search</span>
+    </label>
     <label style="margin-top:1.5rem;">Split view (database + single entry)</label>
     <p class="sub" style="margin-top:0.25rem;">Show the database list and selected single-entry view on the same screen. Clicking the first-column link loads the entry in the split pane instead of full-screen navigation.</p>
     <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.25rem;">
@@ -13599,8 +15092,22 @@ function renderEditProfilePage(doc, forms = [], appUi) {
     </div>
     <p class="sub" style="margin-top:1.5rem;margin-bottom:0.25rem;"><strong>Database code (8 characters):</strong> <code id="dbCode8-display">${escapeHtml(dbCode8Display)}</code></p>
     <p class="sub" style="margin-top:0;">First segment of the business primary key. Saving assigns a code; renaming the profile may allocate a new code and recompute keys on entries.</p>
+    <label style="margin-top:1.5rem;">Encrypted for personal use</label>
+    <p class="sub" style="margin-top:0.25rem;">When enabled, all entry field values are encrypted in CouchDB. Only the selected user (with an unlocked key file at login) can read or edit entries. Attachment file names stay readable; attachment bytes are encrypted.</p>
+    <label style="display:flex;align-items:flex-start;gap:0.5rem;margin-top:0.35rem;">
+      <input type="checkbox" id="encryptionEnabled" name="encryptionEnabled" style="width:auto;margin-top:0.2rem;" ${
+        encryptionEnabledChecked ? "checked" : ""
+      }>
+      <span>Encrypt all entry data for personal use</span>
+    </label>
+    <label for="encryptionOwnerUsername" style="margin-top:0.75rem;">Encryption owner</label>
+    <p class="sub" style="margin-top:0.25rem;">Must be a user with a registered key file. Log in as this user with the key file unlocked before enabling encryption or importing data.</p>
+    <select id="encryptionOwnerUsername" name="encryptionOwnerUsername">
+      <option value="">— Select user —</option>
+      ${keyFileUserOptions}
+    </select>
     <label style="margin-top:1rem;">Primary key segments (up to 3 profile fields)</label>
-    <p class="sub" style="margin-top:0.25rem;">Optional. Full key = database code plus space-padded field values (per segment length). Uniqueness is enforced when saving entries.</p>
+    <p class="sub" style="margin-top:0.25rem;">Optional. Full key = database code plus truncated and space-padded field values (per segment length). Uniqueness is enforced when saving entries. Do not select password or similar secret fields — use an identifier such as a site or account name instead.</p>
     <p class="sub" style="margin-top:0.35rem;">When you save, if the database code or primary key settings changed, the server writes the computed <code>primaryKey</code> on <strong>every existing entry</strong> in this profile. Enabling or changing the primary key can make that save noticeably slower when there are many entries.</p>
     <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:flex-end;margin-top:0.5rem;">
       <div><label for="primaryKeyField1" style="margin:0;font-size:0.875rem;">1</label><br>${pkSelect1}<label for="primaryKeyLen1" style="display:block;margin-top:0.35rem;font-size:0.8rem;">Length</label><input type="number" id="primaryKeyLen1" min="${PRIMARY_KEY_SEGMENT_LEN_MIN}" max="${PRIMARY_KEY_SEGMENT_LEN_MAX}" step="1" value="${escapeHtml(pkLen0)}" style="max-width:6rem;padding:0.35rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);"></div>
@@ -13615,7 +15122,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
       <option value="overwrite"${primaryKeyImportPolicyVal === "overwrite" ? " selected" : ""}>Overwrite existing</option>
     </select>
     <label style="margin-top:1.5rem;">Sort key fields (up to 3)</label>
-    <p class="sub" style="margin-top:0.25rem;">Entry list is sorted by these fields in order (CouchDB index). Use profile fields or Creation/Update date.</p>
+    <p class="sub" style="margin-top:0.25rem;">Entry list is sorted by these fields in order (CouchDB index). Use profile fields or Creation/Update date. Do not select password or similar secret fields. On encrypted profiles, sorting runs in memory after decryption and may be slower on large databases.</p>
     <div style="display:flex;flex-wrap:wrap;gap:0.75rem 1rem;align-items:center;margin-top:0.5rem;">
       <div><label for="sortKeyField1" style="margin:0;font-size:0.875rem;">1</label><br>${sortKeySelect1}</div>
       <div><label for="sortKeyField2" style="margin:0;font-size:0.875rem;">2</label><br>${sortKeySelect2}</div>
@@ -13933,6 +15440,7 @@ function renderEditProfilePage(doc, forms = [], appUi) {
             infoImportFlowId: (document.getElementById('infoImportFlowId') && document.getElementById('infoImportFlowId').value.trim()) || '',
             infoImportButtonTitle: (document.getElementById('infoImportButtonTitle') && document.getElementById('infoImportButtonTitle').value.trim()) || '',
             entriesPageSize: (document.getElementById('entriesPageSize') && document.getElementById('entriesPageSize').value) || '${ENTRIES_PAGE_SIZE}',
+            searchAccentFolding: !!(document.getElementById('searchAccentFolding') && document.getElementById('searchAccentFolding').checked),
             splitView: {
               enabled: !!(document.getElementById('splitViewEnabled') && document.getElementById('splitViewEnabled').checked),
               orientation: (document.getElementById('splitViewOrientation') && document.getElementById('splitViewOrientation').value === 'horizontal') ? 'horizontal' : 'vertical'
@@ -13967,13 +15475,19 @@ function renderEditProfilePage(doc, forms = [], appUi) {
               }
               return lengths;
             })(),
-            primaryKeyImportPolicy: (document.getElementById('primaryKeyImportPolicy') && document.getElementById('primaryKeyImportPolicy').value) || ''
+            primaryKeyImportPolicy: (document.getElementById('primaryKeyImportPolicy') && document.getElementById('primaryKeyImportPolicy').value) || '',
+            encryption: {
+              enabled: !!(document.getElementById('encryptionEnabled') && document.getElementById('encryptionEnabled').checked),
+              ownerUsername: (document.getElementById('encryptionOwnerUsername') && document.getElementById('encryptionOwnerUsername').value) || ''
+            }
           })
         });
         const data = await r.json();
         if (!r.ok) { msgEl.textContent = data.error || 'Failed'; msgEl.className = 'msg err'; return; }
         document.getElementById('rev').value = data.rev;
-        msgEl.textContent = 'Profile saved.';
+        msgEl.textContent = data.encryptionMigrationPending
+          ? 'Profile saved. Log in as the encryption owner with key file unlocked and save again to encrypt existing entries.'
+          : 'Profile saved.';
         msgEl.className = 'msg ok';
         setTimeout(() => { window.location.href = '/'; }, 800);
       } catch (err) {
@@ -14262,11 +15776,12 @@ function renderLoginPage(errorMessage, appUi) {
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
     .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
     label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
-    input[type="text"], input[type="password"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    input[type="text"], input[type="password"], input[type="file"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
     input:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
     .btn:hover { background: #2ea043; }
     .login-err { color: #f85149; margin-top: 1rem; }
+    .login-hint { color: var(--app-label, #8b949e); font-size: 0.875rem; margin-top: 0.35rem; }
     .login-markdown { line-height: 1.5; margin: 1rem 0; }
     .login-markdown p { margin: 0 0 0.5rem 0; }
     .login-markdown p:last-child { margin-bottom: 0; }
@@ -14281,11 +15796,14 @@ function renderLoginPage(errorMessage, appUi) {
     <p class="sub">Log in to continue</p>
     ${loginTextAboveHtml ? `<div class="login-markdown">${loginTextAboveHtml}</div>` : ""}
     ${err}
-    <form method="post" action="/login">
+    <form method="post" action="/login" enctype="multipart/form-data">
       <label for="username">Username</label>
       <input type="text" id="username" name="username" required autofocus>
       <label for="password">Password</label>
       <input type="password" id="password" name="password" required>
+      <label for="keyFile">Key file (optional)</label>
+      <input type="file" id="keyFile" name="keyFile" accept=".key,application/octet-stream">
+      <p class="login-hint">Upload your <code>elenko-username.key</code> file if you have one. Required when &quot;Enforce key-based login&quot; is enabled for your account.</p>
       <button type="submit" class="btn">Log in</button>
     </form>
     ${loginTextBelowHtml ? `<div class="login-markdown">${loginTextBelowHtml}</div>` : ""}
@@ -14897,8 +16415,8 @@ function renderDataExportImportPage(profiles, appUi) {
   </div>
 
   <div id="export-data-section" class="section">
-    <button type="button" id="export-data-btn" class="btn btn-primary" disabled title="Not available yet">Export data</button>
-    <p class="sub" style="margin-top:0.75rem;">Export to file will be added in a later step.</p>
+    <button type="button" id="export-data-btn" class="btn btn-primary" disabled title="Select an Elenko database first">Export data</button>
+    <p class="sub" style="margin-top:0.75rem;">Downloads a semicolon-separated CSV file. The first row lists profile field names (same format as import with header matching enabled).</p>
   </div>
 
   <div id="import-data-section" class="section" style="display:none;">
@@ -14921,7 +16439,7 @@ function renderDataExportImportPage(profiles, appUi) {
       <select id="import-picture-field-select" aria-describedby="import-pictures-summary"></select>
       <label for="import-picture-files" style="margin-top:0.75rem;">Pictures</label>
       <input type="file" id="import-picture-files" accept="image/jpeg,image/png,image/webp,image/gif,.jpg,.jpeg,.png,.webp,.gif" multiple>
-      <p class="sub" style="margin-top:0.35rem;">JPEG, PNG, WebP, or GIF. Each file becomes one entry; other fields use profile prefill defaults where set. If the business primary key includes this file field, the stored filename (after sanitising) must fit the segment length. When the key already exists: <em>Skip duplicate</em> ignores the file; <em>Overwrite existing</em> replaces that entry’s attachment and field (profile setting under primary key).</p>
+      <p class="sub" style="margin-top:0.35rem;">JPEG, PNG, WebP, or GIF. Each file becomes one entry; other fields use profile prefill defaults where set. If the business primary key includes this file field, the key uses the filename truncated to the configured segment length. When the key already exists: <em>Skip duplicate</em> ignores the file; <em>Overwrite existing</em> replaces that entry’s attachment and field (profile setting under primary key).</p>
       <button type="button" id="import-pictures-btn" class="btn btn-primary" style="margin-top:0.75rem;">Import pictures</button>
     </div>
   </div>
@@ -14932,6 +16450,7 @@ function renderDataExportImportPage(profiles, appUi) {
     (function() {
       var exportSection = document.getElementById('export-data-section');
       var importSection = document.getElementById('import-data-section');
+      var exportBtn = document.getElementById('export-data-btn');
       var msgEl = document.getElementById('data-import-msg');
       var importBtn = document.getElementById('import-data-btn');
       var fileInput = document.getElementById('import-csv-file');
@@ -14953,6 +16472,13 @@ function renderDataExportImportPage(profiles, appUi) {
           .replace(/&/g, '&amp;')
           .replace(/</g, '&lt;')
           .replace(/>/g, '&gt;');
+      }
+
+      function refreshExportBtn() {
+        if (!exportBtn) return;
+        var pid = profileSel && profileSel.value ? profileSel.value.trim() : '';
+        exportBtn.disabled = !pid;
+        exportBtn.title = pid ? '' : 'Select an Elenko database first';
       }
 
       function refreshImportMeta() {
@@ -15014,6 +16540,7 @@ function renderDataExportImportPage(profiles, appUi) {
         if (exportSection) exportSection.style.display = isImport ? 'none' : 'block';
         if (importSection) importSection.style.display = isImport ? 'block' : 'none';
         if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+        refreshExportBtn();
         refreshImportMeta();
       }
       document.querySelectorAll('input[name="dataMode"]').forEach(function(r) {
@@ -15021,7 +16548,80 @@ function renderDataExportImportPage(profiles, appUi) {
           setMode(r.value === 'import');
         });
       });
-      if (profileSel) profileSel.addEventListener('change', refreshImportMeta);
+      if (profileSel) {
+        profileSel.addEventListener('change', function() {
+          refreshExportBtn();
+          refreshImportMeta();
+        });
+      }
+      refreshExportBtn();
+
+      if (exportBtn) {
+        exportBtn.addEventListener('click', function() {
+          var pid = profileSel && profileSel.value ? profileSel.value.trim() : '';
+          if (!pid) {
+            if (msgEl) {
+              msgEl.style.display = 'block';
+              msgEl.style.color = '#f85149';
+              msgEl.textContent = 'Select an Elenko database first.';
+            }
+            return;
+          }
+          exportBtn.disabled = true;
+          if (msgEl) {
+            msgEl.style.display = 'block';
+            msgEl.style.color = 'var(--app-label, #8b949e)';
+            msgEl.textContent = 'Exporting…';
+          }
+          fetch('/api/profiles/' + encodeURIComponent(pid) + '/export-data')
+            .then(function(r) {
+              var ct = r.headers.get('content-type') || '';
+              if (!r.ok) {
+                return r.text().then(function(t) {
+                  var d = null;
+                  try { d = t && t.length ? JSON.parse(t) : null; } catch (_) {}
+                  return Promise.reject(new Error((d && d.error) ? d.error : ('Export failed (HTTP ' + r.status + ')')));
+                });
+              }
+              if (ct.indexOf('json') >= 0) {
+                return r.json().then(function(d) {
+                  return Promise.reject(new Error((d && d.error) ? d.error : 'Export failed'));
+                });
+              }
+              var disp = r.headers.get('Content-Disposition') || '';
+              var fnMatch = /filename=\"?([^\";]+)\"?/i.exec(disp);
+              var filename = fnMatch ? fnMatch[1] : 'elenko-export.csv';
+              return r.blob().then(function(blob) {
+                return { blob: blob, filename: filename };
+              });
+            })
+            .then(function(o) {
+              var url = URL.createObjectURL(o.blob);
+              var a = document.createElement('a');
+              a.href = url;
+              a.download = o.filename;
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+              if (msgEl) {
+                msgEl.style.display = 'block';
+                msgEl.style.color = '#7ee787';
+                msgEl.textContent = 'Export downloaded: ' + o.filename;
+              }
+            })
+            .catch(function(e) {
+              if (msgEl) {
+                msgEl.style.display = 'block';
+                msgEl.style.color = '#f85149';
+                msgEl.textContent = e.message || 'Export failed';
+              }
+            })
+            .finally(function() {
+              refreshExportBtn();
+            });
+        });
+      }
 
       if (importBtn) {
         importBtn.addEventListener('click', function() {
@@ -15609,16 +17209,30 @@ function renderManageUsersPage(users, currentUsername, appUi) {
             const role = (u.role === "admin" || u.role === "reader" ? u.role : "editor");
             const isSelf = u.username === currentUsername;
             const roleOptions = ["admin", "editor", "reader"].map((r) => `<option value="${escapeHtml(r)}"${r === role ? " selected" : ""}>${escapeHtml(r)}</option>`).join("");
+            const hasKey = !!(u.keyFile && u.keyFile.registered === true);
+            const keyStatus = hasKey ? '<span class="key-ok">Registered</span>' : '<span class="muted">None</span>';
+            const expectedKeyName = escapeHtml(keyFileDownloadFilename(u.username || "user"));
+            const keyActions = hasKey
+              ? `<button type="button" class="btn-regen-key">Regenerate key</button>
+                 <button type="button" class="btn-remove-key">Remove key</button>
+                 <input type="file" class="user-keyfile-upload" accept=".key,application/octet-stream" hidden aria-hidden="true">
+                 <button type="button" class="btn-upload-key" title="Upload ${expectedKeyName}">Replace from file</button>`
+              : `<button type="button" class="btn-gen-key">Generate key</button>
+                 <input type="file" class="user-keyfile-upload" accept=".key,application/octet-stream" hidden aria-hidden="true">
+                 <button type="button" class="btn-upload-key" title="Upload ${expectedKeyName}">Upload existing key</button>`;
+            const enforceChecked = u.enforceKeyLogin === true ? " checked" : "";
             return `
-        <tr data-id="${id}" data-rev="${rev}" data-username="${escapeHtml(u.username || "")}">
+        <tr data-id="${id}" data-rev="${rev}" data-username="${escapeHtml(u.username || "")}" data-has-key="${hasKey ? "1" : "0"}">
           <td><strong>${username}</strong></td>
           <td><select class="user-role-select" aria-label="Role">${roleOptions}</select></td>
+          <td>${keyStatus}<br>${keyActions}</td>
+          <td><label class="enforce-label"><input type="checkbox" class="user-enforce-key"${enforceChecked}> Enforce</label></td>
           <td><input type="password" class="user-new-password" placeholder="New password" autocomplete="new-password" style="max-width:12rem;"> <button type="button" class="btn-set-password">Set password</button></td>
           <td>${isSelf ? '<span class="muted">(you)</span>' : `<button type="button" class="btn-delete-user">Delete</button>`}</td>
         </tr>`;
           })
           .join("")
-      : `<tr><td colspan="4" class="empty">No users yet. <a href="/account/users/create">Create user</a></td></tr>`;
+      : `<tr><td colspan="6" class="empty">No users yet. <a href="/account/users/create">Create user</a></td></tr>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -15642,11 +17256,20 @@ function renderManageUsersPage(users, currentUsername, appUi) {
     .muted { color: var(--app-label, #8b949e); font-size: 0.9em; }
     select { padding: 0.35rem 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
     input[type="password"] { padding: 0.35rem 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
-    .btn-set-password, .btn-delete-user { padding: 0.35rem 0.75rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }
-    .btn-set-password { background: #238636; color: #fff; }
-    .btn-set-password:hover { background: #2ea043; }
+    .btn-set-password, .btn-delete-user, .btn-gen-key, .btn-regen-key, .btn-upload-key, .btn-remove-key { padding: 0.35rem 0.75rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; margin-top: 0.35rem; }
+    .btn-set-password, .btn-gen-key { background: #238636; color: #fff; }
+    .btn-set-password:hover, .btn-gen-key:hover { background: #2ea043; }
+    .btn-upload-key { background: #1f6feb; color: #fff; }
+    .btn-upload-key:hover { background: #388bfd; }
+    .btn-regen-key { background: #9e6a03; color: #fff; }
+    .btn-regen-key:hover { background: #bb8009; }
+    .btn-remove-key { background: #21262d; color: #e6edf3; border: 1px solid #484f58; }
+    .btn-remove-key:hover { background: #30363d; }
     .btn-delete-user { background: #da3633; color: #fff; }
     .btn-delete-user:hover { background: #f85149; }
+    .key-ok { color: #3fb950; font-size: 0.875rem; }
+    .enforce-label { display: flex; align-items: center; gap: 0.35rem; cursor: pointer; font-weight: normal; color: var(--app-text, #e6edf3); }
+    .enforce-label input { margin: 0; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
@@ -15679,12 +17302,14 @@ function renderManageUsersPage(users, currentUsername, appUi) {
 <body>
   <div class="actions"><a href="/">← Profiles</a> <a href="/account/users/create" class="btn">Create user</a></div>
   <h1>Manage users</h1>
-  <p class="sub">Change role, set password, or delete users.</p>
+  <p class="sub">Change role, key file, enforce key login, set password, or delete users. Upload an existing <code>elenko-&lt;username&gt;.key</code> file to register the same key on this instance (user must have no key yet).</p>
   <table>
     <thead>
       <tr>
         <th>Username</th>
         <th>Role</th>
+        <th>Key file</th>
+        <th>Enforce key login</th>
         <th>Set password</th>
         <th>Actions</th>
       </tr>
@@ -15709,6 +17334,134 @@ function renderManageUsersPage(users, currentUsername, appUi) {
           if (!r.ok) { showMsg(data.error || 'Update failed', true); return; }
           showMsg('Role updated.');
         } catch (e) { showMsg(e.message || 'Request failed', true); }
+      });
+    });
+
+    document.querySelectorAll('.user-enforce-key').forEach(chk => {
+      chk.addEventListener('change', async function() {
+        const row = this.closest('tr');
+        if (!row || row.querySelector('.empty')) return;
+        const id = row.getAttribute('data-id');
+        try {
+          const r = await fetch('/api/account/users/' + encodeURIComponent(id), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enforceKeyLogin: this.checked }) });
+          const data = await r.json();
+          if (!r.ok) { showMsg(data.error || 'Update failed', true); this.checked = !this.checked; return; }
+          showMsg('Enforce key login updated.');
+        } catch (e) { showMsg(e.message || 'Request failed', true); this.checked = !this.checked; }
+      });
+    });
+
+    document.querySelectorAll('.btn-gen-key').forEach(btn => {
+      btn.addEventListener('click', async function() {
+        const row = this.closest('tr');
+        if (!row) return;
+        const id = row.getAttribute('data-id');
+        this.disabled = true;
+        try {
+          const r = await fetch('/api/account/users/' + encodeURIComponent(id) + '/generate-keyfile', { method: 'POST' });
+          const data = await r.json();
+          if (!r.ok) { showMsg(data.error || 'Generate failed', true); return; }
+          if (data.downloadUrl) window.location.href = data.downloadUrl;
+          else showMsg('Key file generated.');
+        } catch (e) { showMsg(e.message || 'Request failed', true); }
+        finally { this.disabled = false; }
+      });
+    });
+
+    document.querySelectorAll('.btn-upload-key').forEach(btn => {
+      btn.addEventListener('click', function() {
+        const row = this.closest('tr');
+        if (!row) return;
+        const input = row.querySelector('.user-keyfile-upload');
+        if (input) input.click();
+      });
+    });
+
+    document.querySelectorAll('.user-keyfile-upload').forEach(input => {
+      input.addEventListener('change', async function() {
+        const file = this.files && this.files[0];
+        if (!file) return;
+        const row = this.closest('tr');
+        if (!row) return;
+        const id = row.getAttribute('data-id');
+        const username = row.getAttribute('data-username') || '';
+        const hasKey = row.getAttribute('data-has-key') === '1';
+        let namePart = username.replace(/[^\\w.-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 64);
+        if (!namePart) namePart = 'user';
+        const expected = 'elenko-' + namePart + '.key';
+        if (file.name.toLowerCase() !== expected.toLowerCase()) {
+          showMsg('File name must be ' + expected + ' for this user.', true);
+          this.value = '';
+          return;
+        }
+        if (hasKey && !window.confirm(
+          'Replace the registered key with ' + expected + '?\\n\\n' +
+          'The currently registered key will stop working on this instance. Use this to restore a previously saved key file.'
+        )) {
+          this.value = '';
+          return;
+        }
+        const uploadBtn = row.querySelector('.btn-upload-key');
+        if (uploadBtn) uploadBtn.disabled = true;
+        const fd = new FormData();
+        fd.append('keyFile', file);
+        try {
+          const r = await fetch('/api/account/users/' + encodeURIComponent(id) + '/upload-keyfile', { method: 'POST', body: fd });
+          const data = await r.json();
+          if (!r.ok) { showMsg(data.error || 'Upload failed', true); return; }
+          showMsg(data.message || 'Key file registered.');
+          setTimeout(function() { window.location.reload(); }, 800);
+        } catch (e) {
+          showMsg(e.message || 'Request failed', true);
+        } finally {
+          this.value = '';
+          if (uploadBtn) uploadBtn.disabled = false;
+        }
+      });
+    });
+
+    document.querySelectorAll('.btn-regen-key').forEach(btn => {
+      btn.addEventListener('click', async function() {
+        const row = this.closest('tr');
+        if (!row) return;
+        if (!window.confirm(
+          'Regenerate key file?\\n\\n' +
+          '• The previous key file will stop working on this instance immediately.\\n' +
+          '• When database encryption is enabled (future), data encrypted with the old key will become inaccessible unless you still have that old .key file.\\n\\n' +
+          'Continue?'
+        )) return;
+        const id = row.getAttribute('data-id');
+        this.disabled = true;
+        try {
+          const r = await fetch('/api/account/users/' + encodeURIComponent(id) + '/regenerate-keyfile', { method: 'POST' });
+          const data = await r.json();
+          if (!r.ok) { showMsg(data.error || 'Regenerate failed', true); return; }
+          if (data.downloadUrl) window.location.href = data.downloadUrl;
+          else showMsg('Key file regenerated.');
+        } catch (e) { showMsg(e.message || 'Request failed', true); }
+        finally { this.disabled = false; }
+      });
+    });
+
+    document.querySelectorAll('.btn-remove-key').forEach(btn => {
+      btn.addEventListener('click', async function() {
+        const row = this.closest('tr');
+        if (!row) return;
+        if (!window.confirm(
+          'Remove key registration for this user?\\n\\n' +
+          'Login will no longer accept the current key file until you generate a new one or upload a .key file.\\n' +
+          'Use this to restore a previously saved key file via Upload / Replace from file.'
+        )) return;
+        const id = row.getAttribute('data-id');
+        this.disabled = true;
+        try {
+          const r = await fetch('/api/account/users/' + encodeURIComponent(id) + '/keyfile', { method: 'DELETE' });
+          const data = await r.json();
+          if (!r.ok) { showMsg(data.error || 'Remove failed', true); return; }
+          showMsg(data.message || 'Key registration removed.');
+          setTimeout(function() { window.location.reload(); }, 800);
+        } catch (e) { showMsg(e.message || 'Request failed', true); }
+        finally { this.disabled = false; }
       });
     });
 
@@ -15748,11 +17501,92 @@ function renderManageUsersPage(users, currentUsername, appUi) {
 </html>`;
 }
 
-function renderCreateUserPage(errorMessage, created, appUi) {
+function renderKeyFileDownloadPage(filename, token) {
+  const safeName = escapeHtml(filename || "elenko-user.key");
+  const safeToken = escapeHtml(token || "");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Download key file</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 32rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; font-size: 1.25rem; }
+    .warn { background: #3d2e00; color: #f0c040; padding: 0.75rem 1rem; border-radius: 6px; margin: 1rem 0; line-height: 1.5; }
+    .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; background: #238636; color: #fff; text-decoration: none; margin-top: 0.5rem; }
+    .btn:hover { background: #2ea043; }
+    a.muted { color: #58a6ff; }
+  </style>
+</head>
+<body>
+  <h1>Download key file</h1>
+  <p>File: <strong>${safeName}</strong></p>
+  <div class="warn">Store this file in a safe place. It cannot be recovered if lost. Anyone with this file and your password can access encrypted databases (when enabled). Regenerating a key invalidates the previous file on this instance; encrypted databases (future) need the key that was used to encrypt them.</div>
+  <p><a class="btn" href="/account/users/keyfile-download?token=${safeToken}&amp;download=1">Download ${safeName}</a></p>
+  <p><a class="muted" href="/account/users">← Manage users</a></p>
+</body>
+</html>`;
+}
+
+function renderUnlockKeyFilePage(errorMessage, appUi, session) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const err = errorMessage ? `<p class="login-err">${escapeHtml(errorMessage)}</p>` : "";
+  const registered = session && session.keyFileRegistered;
+  const unlocked = session && session.keyFileUnlocked;
+  const status = unlocked
+    ? '<p class="msg ok">Key file is loaded for this session.</p>'
+    : registered
+    ? '<p class="sub">Upload your key file to load it into this session.</p>'
+    : '<p class="sub">No key file is registered for your account.</p>';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Provide key file</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 24rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="file"] { width: 100%; color: var(--app-label, #8b949e); }
+    .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
+    .btn-secondary { display: inline-block; margin-top: 0.5rem; background: #21262d; color: #e6edf3; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; }
+    .login-err { color: #f85149; margin-top: 1rem; }
+    .msg.ok { color: #3fb950; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Provide key file</h1>
+  ${status}
+  ${err}
+  ${registered && !unlocked ? `<form method="post" action="/account/unlock-keyfile" enctype="multipart/form-data">
+    <label for="keyFile">Key file</label>
+    <input type="file" id="keyFile" name="keyFile" accept=".key,application/octet-stream" required>
+    <button type="submit" class="btn">Load key file</button>
+  </form>` : ""}
+  <a href="/" class="btn-secondary">Back to start</a>
+</body>
+</html>`;
+}
+
+function renderCreateUserPage(errorMessage, created, appUi, keyfileToken) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const err = errorMessage ? `<p class="login-err">${escapeHtml(errorMessage)}</p>` : "";
   const createdMsg = created ? '<p class="msg ok">User created.</p>' : "";
+  const token = typeof keyfileToken === "string" ? keyfileToken.trim() : "";
+  const keyDownloadMsg =
+    created && token
+      ? `<p class="msg ok">Key file generated. <a href="/account/users/keyfile-download?token=${escapeHtml(token)}" style="color:#7ee787;">Download key file</a> (link expires in a few minutes).</p>`
+      : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -15776,12 +17610,16 @@ function renderCreateUserPage(errorMessage, created, appUi) {
     .btn-secondary:hover { background: #30363d; }
     .login-err { color: #f85149; margin-top: 1rem; }
     .msg.ok { color: #3fb950; margin-top: 1rem; }
+    .checkbox-row { margin-top: 1rem; }
+    .checkbox-row label { display: flex; align-items: flex-start; gap: 0.5rem; cursor: pointer; color: var(--app-text, #e6edf3); font-weight: normal; }
+    .checkbox-row .hint { color: var(--app-label, #8b949e); font-size: 0.875rem; margin-top: 0.25rem; margin-left: 1.5rem; }
   </style>
 </head>
 <body>
   <h1>Elenko</h1>
   <p class="sub">Create new user</p>
   ${createdMsg}
+  ${keyDownloadMsg}
   ${err}
   <form method="post" action="/account/users/create">
     <label for="username">Username</label>
@@ -15794,6 +17632,14 @@ function renderCreateUserPage(errorMessage, created, appUi) {
       <option value="reader">reader</option>
       <option value="admin">admin</option>
     </select>
+    <div class="checkbox-row">
+      <label><input type="checkbox" name="generateKeyFile" value="1" checked> Generate key file</label>
+      <p class="hint">Creates <code>elenko-username.key</code> for download after save. Only a hash is stored on the server.</p>
+    </div>
+    <div class="checkbox-row">
+      <label><input type="checkbox" name="enforceKeyLogin" value="1"> Enforce key-based login</label>
+      <p class="hint">When enabled and a key file is registered, login requires a valid key file upload.</p>
+    </div>
     <button type="submit" class="btn">Create user</button>
   </form>
   <a href="/" class="btn-secondary">Back to start</a>
