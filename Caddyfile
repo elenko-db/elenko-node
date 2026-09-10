@@ -1,0 +1,19 @@
+# --- Public hostname + Let's Encrypt (HTTPS) ---
+# If this machine is only used on a LAN by IP, comment out this entire block — otherwise
+# Let's Encrypt cannot validate the name and Caddy may fail or retry forever.
+server.elenko.eu {
+	reverse_proxy app:3000
+}
+
+# --- LAN / IP-only: http://192.168.x.x/ or http://<ip>/ ---
+# No TLS; works without DNS. This is the usual setup for a Raspberry Pi on a home network.
+:80 {
+	reverse_proxy app:3000
+}
+
+# --- Optional: https://<ip>/ with a self-signed cert (browser warning) ---
+# Uncomment if you truly need HTTPS to the IP. Not needed for most LAN use.
+# :443 {
+# 	tls internal
+# 	reverse_proxy app:3000
+# }

@@ -11,9 +11,13 @@
     "node": ">=18"
   },
   "dependencies": {
+    "dotenv": "^17.3.1",
     "express": "^4.21.0",
     "express-session": "^1.18.0",
     "iconv-lite": "^0.6.3",
-    "nano": "^11.0.4"
+    "marked": "^15.0.4",
+    "multer": "^2.1.1",
+    "nano": "^11.0.4",
+    "sharp": "^0.34.5"
   }
 }

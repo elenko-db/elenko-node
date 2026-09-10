@@ -11,11 +11,37 @@ docker compose up --build
 - **App (start page):** `http://localhost:3000`
 - **CouchDB:** `http://localhost:5984` (user: `admin`, password: `admin`)
 
+### Optional: HTTPS with Caddy (server.elenko.eu)
+
+For a public server with the DNS name `server.elenko.eu` pointing to your host:
+
+1. Ensure ports **80** and **443** are open on the host (firewall / security groups).
+2. Create a `Caddyfile` next to `docker-compose.yml`:
+
+   ```caddy
+   server.elenko.eu {
+       reverse_proxy app:3000
+   }
+   ```
+
+3. Use the optional `docker-compose.caddy.yml` file to run Caddy as a reverse proxy with automatic Let's Encrypt certificates:
+
+   ```bash
+   # Without HTTPS (dev/local)
+   docker compose up --build
+
+   # With HTTPS via Caddy (server)
+   docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d --build
+   ```
+
+When Caddy is enabled, you can access the app at `https://server.elenko.eu`. The app itself continues to listen on port 3000 inside Docker; Caddy terminates TLS and proxies requests to `app:3000`.
+
 ## Project layout
 
 | Path               | Purpose                                                      |
 | ------------------ | ------------------------------------------------------------ |
 | `docker-compose.yml` | CouchDB + Node.js app services                             |
+| `docker-compose.caddy.yml` | Optional Caddy reverse proxy (HTTPS)                |
 | `Dockerfile`       | Node.js app image                                            |
 | `server.js`        | Express web server; creates DB, indexes, auth, and serves UI |
 | `package.json`     | Dependencies: `express`, `express-session`, `nano` (CouchDB client) |

@@ -96,10 +96,8 @@ function computePrimaryKeyForRecord(record, profileDoc) {
         ? maxLen
         : 32;
     const raw = record[fn] != null ? String(record[fn]) : "";
-    if (raw.length > segLen) {
-      return { error: "Field \"" + fn + "\" exceeds primary key segment length (" + segLen + ")." };
-    }
-    str += raw + " ".repeat(segLen - raw.length);
+    const segment = raw.length > segLen ? raw.slice(0, segLen) : raw;
+    str += segment + " ".repeat(segLen - segment.length);
   }
   return { value: str };
 }
