@@ -1,20 +1,188 @@
 const { parentPort } = require("worker_threads");
 const crypto = require("crypto");
 
-if (!parentPort) {
-  throw new Error("API worker must be started as a worker thread.");
+/** Profile repeat scalar storage: plain text or { version: 1, rows: ["...", ...] }. */
+function parseRepeatScalarRows(stored) {
+  const storedStr = stored == null ? "" : String(stored);
+  if (storedStr.trim() === "") return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(storedStr);
+  } catch (_) {
+    return [storedStr];
+  }
+  if (typeof parsed === "string") return [parsed];
+  if (Array.isArray(parsed)) {
+    return parsed.map((r) => (r != null ? String(r) : ""));
+  }
+  if (parsed && typeof parsed === "object" && Array.isArray(parsed.rows)) {
+    return parsed.rows.map((r) => {
+      if (r != null && typeof r === "object") {
+        const vals = Object.values(r).filter((v) => v != null && String(v).trim() !== "");
+        return vals.length > 0 ? String(vals[0]) : "";
+      }
+      return r != null ? String(r) : "";
+    });
+  }
+  return [storedStr];
 }
 
-/** Replace #fieldName# in template with dataset[fieldName]; unknown fields become empty string. Double quotes in values are replaced with single quotes to avoid breaking JSON/query strings. */
+function resolveRepeatScalarModifier(rows, modifier) {
+  const list = Array.isArray(rows) ? rows : [];
+  const modRaw = String(modifier || "").trim();
+  const mod = modRaw.toUpperCase();
+  if (mod === "FIRST") return list.length > 0 ? String(list[0]) : "";
+  if (mod === "LAST") return list.length > 0 ? String(list[list.length - 1]) : "";
+  if (mod === "ALL") {
+    return list
+      .map((r) => (r != null ? String(r) : ""))
+      .filter((s) => s.trim() !== "")
+      .join("\n\n");
+  }
+  if (/^\d+$/.test(modRaw)) {
+    const idx = parseInt(modRaw, 10) - 1;
+    if (idx >= 0 && idx < list.length) return list[idx] != null ? String(list[idx]) : "";
+    return "";
+  }
+  return "";
+}
+
+/** Parse #PROMPT# or #PROMPT(LAST)# / #PROMPT(2)# token (without surrounding #). */
+function parseFieldTemplateToken(token) {
+  const raw = String(token || "").trim();
+  if (!raw) return { fieldName: "", modifier: null };
+  const m = raw.match(/^([^(]+)\((FIRST|LAST|ALL|\d+)\)$/i);
+  if (m) {
+    const modPart = m[2];
+    const modifier = /^\d+$/.test(modPart) ? modPart : modPart.toUpperCase();
+    return { fieldName: m[1].trim(), modifier };
+  }
+  return { fieldName: raw, modifier: null };
+}
+
+const DATASET_SKIP_KEYS = new Set([
+  "_id",
+  "_rev",
+  "type",
+  "profileId",
+  "sortKey",
+  "createdAt",
+  "updatedAt",
+  "entryFormId",
+  "sourceDocId",
+  "lastApiResponse",
+  "createdBy",
+  "updatedBy",
+]);
+
+function isRepeatScalarFieldValue(v) {
+  if (v == null) return false;
+  if (typeof v !== "string") return false;
+  const s = v.trim();
+  if (!s.startsWith("{")) return false;
+  try {
+    const p = JSON.parse(s);
+    return !!(p && typeof p === "object" && Array.isArray(p.rows));
+  } catch (_) {
+    return false;
+  }
+}
+
+/** Row count from profile repeat JSON fields only (PROMPT / RESPONSE), not plain text columns. */
+function dialogRowCount(dataset) {
+  if (!dataset || typeof dataset !== "object") return 0;
+  let max = 0;
+  for (const [k, v] of Object.entries(dataset)) {
+    if (!k || k.startsWith("_") || DATASET_SKIP_KEYS.has(k)) continue;
+    if (!isRepeatScalarFieldValue(v)) continue;
+    max = Math.max(max, parseRepeatScalarRows(v).length);
+  }
+  return max;
+}
+
+function getRepeatScalarRowAt(dataset, fieldName, oneBasedIndex) {
+  if (!dataset || typeof dataset !== "object") return "";
+  const rows = parseRepeatScalarRows(dataset[fieldName]);
+  const idx = oneBasedIndex - 1;
+  if (idx < 0 || idx >= rows.length) return "";
+  return rows[idx] != null ? String(rows[idx]) : "";
+}
+
+/** Field placeholder on the assistant line in a REPEAT block (e.g. #RESPONSE(N)#). */
+function assistantReplyFieldInRepeatInner(inner, varName) {
+  const re = new RegExp(
+    '"role"\\s*:\\s*"assistant"[\\s\\S]*?#\\s*([A-Za-z_][A-Za-z0-9_]*)\\(\\s*' +
+      varName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+      "\\s*\\)\\s*#",
+    "i"
+  );
+  const m = inner.match(re);
+  return m ? m[1] : "RESPONSE";
+}
+
+function shouldSkipHistoryIteration(inner, varName, dataset, oneBasedIndex) {
+  const replyField = assistantReplyFieldInRepeatInner(inner, varName);
+  const reply = getRepeatScalarRowAt(dataset, replyField, oneBasedIndex);
+  return !String(reply || "").trim();
+}
+
+/** Expand #REPEAT(N)# ... #END REPEAT(N)# (iterates 1 .. rowCount-1; N is loop variable for #FIELD(N)#). */
+function expandRepeatBlocks(template, dataset) {
+  if (typeof template !== "string" || !template) return "";
+  if (!dataset || typeof dataset !== "object") return template;
+  const blockRe = /#REPEAT\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*#([\s\S]*?)#\s*END\s+REPEAT\s*\(\s*\1\s*\)\s*#/gi;
+  return template.replace(blockRe, (match, varName, inner) => {
+    void match;
+    const total = dialogRowCount(dataset);
+    if (total <= 1) return "";
+    const varRe = new RegExp(
+      "#\\s*([^#\\(][^(#]*?)\\(\\s*" + varName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\)\\s*#",
+      "gi"
+    );
+    let out = "";
+    for (let i = 1; i < total; i++) {
+      if (shouldSkipHistoryIteration(inner, varName, dataset, i)) continue;
+      let chunk = inner;
+      chunk = chunk.replace(varRe, (_, fieldPart) => {
+        const fieldName = String(fieldPart).trim();
+        return escapeTemplateValue(getRepeatScalarRowAt(dataset, fieldName, i));
+      });
+      out += chunk;
+    }
+    return out;
+  });
+}
+
+/** Escape for embedding inside a JSON double-quoted string in the request template. */
+function escapeTemplateValue(raw) {
+  const s = String(raw != null ? raw : "");
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n")
+    .replace(/\t/g, "\\t");
+}
+
+function resolveTemplateFieldValue(fieldName, modifier, dataset) {
+  const key = String(fieldName || "").trim();
+  if (!key || !dataset || typeof dataset !== "object") return "";
+  const v = dataset[key];
+  if (modifier) return resolveRepeatScalarModifier(parseRepeatScalarRows(v), modifier);
+  return v != null ? String(v) : "";
+}
+
+const FIELD_PLACEHOLDER_RE = /#([A-Za-z_][A-Za-z0-9_]*(?:\((?:FIRST|LAST|ALL|\d+)\))?)\#/g;
+
+/** Replace #REPEAT(N)# blocks, then #fieldName# / #fieldName(FIRST|LAST|ALL|n)# placeholders. */
 function applyTemplate(template, dataset) {
   if (typeof template !== "string" || !template) return "";
   if (!dataset || typeof dataset !== "object") return template;
-  return template.replace(/#([^#]+)#/g, (_, fieldName) => {
-    const key = String(fieldName).trim();
-    if (key === "") return "";
-    const v = dataset[key];
-    const raw = v != null ? String(v) : "";
-    return raw.replace(/"/g, "'");
+  const expanded = expandRepeatBlocks(template, dataset);
+  return expanded.replace(FIELD_PLACEHOLDER_RE, (_, token) => {
+    const { fieldName, modifier } = parseFieldTemplateToken(token);
+    if (!fieldName) return "";
+    return escapeTemplateValue(resolveTemplateFieldValue(fieldName, modifier, dataset));
   });
 }
 
@@ -381,7 +549,7 @@ async function fetchWithElenkoAuth(finalUrl, method, bodyPayload, authType, apiK
   return fetch(finalUrl, { method, headers: Object.assign({}, baseHeaders), body: bodyPayload });
 }
 
-parentPort.on("message", (msg) => {
+if (parentPort) parentPort.on("message", (msg) => {
   if (msg.type !== "apiRequest") return;
   const { apiDoc, dataset, entryId, profileId, requestId } = msg;
   const authTypeRaw = msg.authType != null ? String(msg.authType).trim().toLowerCase() : "";
@@ -505,3 +673,13 @@ parentPort.on("message", (msg) => {
     }
   })();
 });
+
+module.exports = {
+  applyTemplate,
+  expandRepeatBlocks,
+  parseFieldTemplateToken,
+  resolveTemplateFieldValue,
+  parseRepeatScalarRows,
+  dialogRowCount,
+  escapeTemplateValue,
+};

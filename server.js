@@ -139,7 +139,7 @@ function normalizeFieldDisplay(fieldNames, raw) {
   return result;
 }
 
-/** Stored parallel to fieldNames: "text" (default) or "file" (attachment + filename on entries). */
+/** Stored parallel to fieldNames: "text" (default), "file", or "repeat" (scalar rows JSON per field). */
 function normalizeFieldKinds(fieldNames, raw) {
   const len = Array.isArray(fieldNames) ? fieldNames.length : 0;
   const arr = Array.isArray(raw) ? raw : [];
@@ -147,9 +147,22 @@ function normalizeFieldKinds(fieldNames, raw) {
   for (let i = 0; i < len; i++) {
     const v = arr[i];
     const s = typeof v === "string" ? v.trim().toLowerCase() : "";
-    result.push(s === "file" ? "file" : "text");
+    if (s === "file") result.push("file");
+    else if (s === "repeat") result.push("repeat");
+    else result.push("text");
   }
   return result;
+}
+
+function isProfileRepeatField(profileDoc, fieldName) {
+  if (!profileDoc || !fieldName || typeof fieldName !== "string") return false;
+  const fn = fieldName.trim();
+  if (!fn) return false;
+  const names = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const idx = names.indexOf(fn);
+  if (idx < 0) return false;
+  const kinds = normalizeFieldKinds(names, profileDoc.fieldKinds);
+  return kinds[idx] === "repeat";
 }
 
 function isProfileFileField(profileDoc, fieldName) {
@@ -413,7 +426,887 @@ function normalizeEntryFieldType(raw) {
   if (s === "url") return "url";
   if (s === "image") return "image";
   if (s === "chart") return "chart";
+  if (s === "repeat") return "repeat";
   return "text";
+}
+
+function normalizeRepeatSubFieldType(raw) {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (s === "markdown" || s === "url") return s;
+  return "text";
+}
+
+function normalizeRepeatColumn(item) {
+  if (!item || typeof item !== "object") return null;
+  const key = typeof item.key === "string" ? item.key.trim() : "";
+  if (!key || !/^[\w.-]+$/.test(key)) return null;
+  const label = typeof item.label === "string" && item.label.trim() ? item.label.trim() : key;
+  return { key, label, fieldType: normalizeRepeatSubFieldType(item.fieldType) };
+}
+
+function normalizeRepeatColumns(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(normalizeRepeatColumn).filter(Boolean);
+}
+
+function normalizeRepeatMode(raw) {
+  return raw === "stack" ? "stack" : "table";
+}
+
+const DEFAULT_REPEAT_COLUMNS_QA = [
+  { key: "question", label: "Question", fieldType: "text" },
+  { key: "answer", label: "Answer", fieldType: "text" },
+];
+
+function defaultRepeatColumnsForField(fieldName) {
+  void fieldName;
+  return DEFAULT_REPEAT_COLUMNS_QA.map((c) => ({ ...c }));
+}
+
+/** Per-profile-field repeat storage: { version: 1, rows: ["scalar", ...] } */
+function parseProfileRepeatScalarValue(stored) {
+  const storedStr = stored == null ? "" : String(stored);
+  if (storedStr.trim() === "") {
+    return { ok: true, rows: [] };
+  }
+  if (isEncryptedFieldValue(storedStr)) {
+    return { ok: false, error: "Repeat field value is encrypted.", rows: [] };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(storedStr);
+  } catch (_) {
+    return { ok: true, rows: [storedStr] };
+  }
+  if (typeof parsed === "string") {
+    return { ok: true, rows: [parsed] };
+  }
+  if (Array.isArray(parsed)) {
+    return { ok: true, rows: parsed.map((r) => (r != null ? String(r) : "")) };
+  }
+  if (parsed && typeof parsed === "object" && Array.isArray(parsed.rows)) {
+    return {
+      ok: true,
+      rows: parsed.rows.map((r) => {
+        if (r != null && typeof r === "object") {
+          const vals = Object.values(r).filter((v) => v != null && String(v).trim() !== "");
+          return vals.length > 0 ? String(vals[0]) : "";
+        }
+        return r != null ? String(r) : "";
+      }),
+    };
+  }
+  return { ok: true, rows: [storedStr] };
+}
+
+function serializeProfileRepeatScalarValue(rows) {
+  const list = Array.isArray(rows) ? rows.map((r) => (r != null ? String(r) : "")) : [];
+  return JSON.stringify({ version: 1, rows: list });
+}
+
+function getProfileRepeatFieldNames(profileDoc) {
+  const names = Array.isArray(profileDoc && profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const kinds = normalizeFieldKinds(names, profileDoc && profileDoc.fieldKinds);
+  return names.filter((fn, idx) => kinds[idx] === "repeat");
+}
+
+/** Repeat fields from profile kinds, or inferred from stored repeat JSON on the entry. */
+function profileDialogRepeatFieldNames(profileDoc, record) {
+  const fromKinds = getProfileRepeatFieldNames(profileDoc);
+  if (fromKinds.length > 0) return fromKinds;
+  const names = Array.isArray(profileDoc && profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const inferred = names.filter((fn) => isProfileRepeatScalarJson(record && record[fn]));
+  return inferred.length > 0 ? inferred : fromKinds;
+}
+
+function maxRepeatScalarRowCount(record, profileDoc) {
+  let max = 0;
+  for (const fn of profileDialogRepeatFieldNames(profileDoc, record)) {
+    const parsed = parseProfileRepeatScalarValue(record && record[fn]);
+    if (parsed.ok) max = Math.max(max, parsed.rows.length);
+  }
+  return max;
+}
+
+/** Row index for API response: last row with content in sibling repeat fields (e.g. last PROMPT). */
+function resolveCorrespondingRepeatRowIndex(record, profileDoc, targetFieldName) {
+  let bestIndex = -1;
+  for (const fn of profileDialogRepeatFieldNames(profileDoc, record)) {
+    if (fn === targetFieldName) continue;
+    const parsed = parseProfileRepeatScalarValue(record && record[fn]);
+    if (!parsed.ok) continue;
+    for (let i = parsed.rows.length - 1; i >= 0; i--) {
+      if (String(parsed.rows[i] || "").trim() !== "") {
+        bestIndex = Math.max(bestIndex, i);
+        break;
+      }
+    }
+  }
+  if (bestIndex >= 0) return bestIndex;
+  const maxRows = maxRepeatScalarRowCount(record, profileDoc);
+  if (maxRows > 0) return maxRows - 1;
+  const parsed = parseProfileRepeatScalarValue(record && record[targetFieldName]);
+  if (parsed.ok && parsed.rows.length > 0) return parsed.rows.length - 1;
+  return 0;
+}
+
+function shouldMergePlainTextIntoRepeatField(value) {
+  const s = String(value ?? "").trim();
+  if (!s) return true;
+  return !isProfileRepeatScalarJson(s);
+}
+
+function shouldApplyRepeatScalarCellWrite(profileDoc, record, fieldName, incomingValue) {
+  if (!shouldMergePlainTextIntoRepeatField(incomingValue)) return false;
+  if (isProfileRepeatField(profileDoc, fieldName)) return true;
+  const dialogFields = profileDialogRepeatFieldNames(profileDoc, record);
+  return dialogFields.length > 0 && dialogFields.includes(fieldName);
+}
+
+/** Write plain text into one row of a profile repeat field; sibling fields define the row index. */
+function applyPlainValueToProfileField(profileDoc, record, fieldName, incomingValue) {
+  if (!profileDoc || !record || !shouldApplyRepeatScalarCellWrite(profileDoc, record, fieldName, incomingValue)) {
+    return incomingValue != null ? String(incomingValue) : "";
+  }
+  const rowIndex = resolveCorrespondingRepeatRowIndex(record, profileDoc, fieldName);
+  const cellValue = incomingValue != null ? String(incomingValue) : "";
+  let maxRows = maxRepeatScalarRowCount(record, profileDoc);
+  maxRows = Math.max(maxRows, rowIndex + 1);
+
+  const targetParsed = parseProfileRepeatScalarValue(record[fieldName]);
+  let rows = targetParsed.ok ? [...targetParsed.rows] : [];
+
+  const storedStr = record[fieldName] != null ? String(record[fieldName]).trim() : "";
+  if (storedStr && !isProfileRepeatScalarJson(storedStr) && rowIndex > 0 && rows.length === 1) {
+    rows = new Array(maxRows).fill("");
+  } else {
+    while (rows.length < maxRows) rows.push("");
+  }
+  rows[rowIndex] = cellValue;
+  return serializeProfileRepeatScalarValue(rows);
+}
+
+function mergeRepeatGroupRowsFromRecord(record, columns) {
+  const cols = normalizeRepeatColumns(columns);
+  if (cols.length === 0) return [];
+  const arrays = cols.map((c) => {
+    const raw = record && record[c.key] != null ? record[c.key] : "";
+    const parsed = parseProfileRepeatScalarValue(raw);
+    return parsed.ok ? parsed.rows : [];
+  });
+  const maxLen = Math.max(0, ...arrays.map((a) => a.length));
+  const rows = [];
+  for (let i = 0; i < maxLen; i++) {
+    const row = {};
+    for (let j = 0; j < cols.length; j++) {
+      row[cols[j].key] = arrays[j][i] != null ? String(arrays[j][i]) : "";
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function splitRepeatGroupRowsToFieldValues(rows, columns) {
+  const cols = normalizeRepeatColumns(columns);
+  const list = Array.isArray(rows) ? rows : [];
+  const out = {};
+  for (const c of cols) {
+    const arr = list.map((row) => (row && row[c.key] != null ? String(row[c.key]) : ""));
+    out[c.key] = serializeProfileRepeatScalarValue(arr);
+  }
+  return out;
+}
+
+function summarizeProfileRepeatScalarForList(value) {
+  const parsed = parseProfileRepeatScalarValue(value);
+  if (!parsed.ok) return "(invalid repeat data)";
+  if (parsed.rows.length === 0) return "empty";
+  const first = parsed.rows[0];
+  return first != null && String(first).trim() !== "" ? String(first) : "empty";
+}
+
+/** True when stored value is profile repeat scalar JSON ({ rows: ["a", ...] }), not combined object rows. */
+function isProfileRepeatScalarJson(value) {
+  const s = String(value || "").trim();
+  if (!s.startsWith("{") && !s.startsWith("[")) return false;
+  if (isEncryptedFieldValue(s)) return false;
+  try {
+    let parsed = JSON.parse(s);
+    if (Array.isArray(parsed)) {
+      return parsed.every((r) => r == null || typeof r !== "object");
+    }
+    if (parsed && typeof parsed === "object" && Array.isArray(parsed.rows)) {
+      return parsed.rows.every((r) => r == null || typeof r !== "object");
+    }
+  } catch (_) {}
+  return false;
+}
+
+function summarizeRepeatFieldValueForList(profileDoc, fieldName, value) {
+  if (isProfileRepeatField(profileDoc, fieldName) || isProfileRepeatScalarJson(value)) {
+    return summarizeProfileRepeatScalarForList(value);
+  }
+  if (looksLikeRepeatFieldJson(value)) {
+    return summarizeRepeatFieldForList(value);
+  }
+  return value != null ? String(value) : "";
+}
+
+function isRepeatGroupLayoutItem(item) {
+  if (!item || normalizeEntryFieldType(item.fieldType) !== "repeat") return false;
+  const cols = normalizeRepeatColumns(item.repeatColumns);
+  if (cols.length === 0) return false;
+  const fn = typeof item.fieldName === "string" ? item.fieldName.trim() : "";
+  return item.repeatGroup === true || !fn;
+}
+
+function legacyPlainTextAsRepeatFirstRow(stored, cols) {
+  const text = stored != null ? String(stored) : "";
+  const row = {};
+  for (const c of cols) {
+    row[c.key] = "";
+  }
+  if (cols.length > 0) {
+    row[cols[0].key] = text;
+  }
+  return { ok: true, data: { version: 1, rows: [row] }, columns: cols };
+}
+
+/** @returns {{ ok: true, data: { version: number, rows: object[] }, columns: object[] } | { ok: false, error: string }} */
+function parseRepeatFieldValue(stored, columns) {
+  const defaultCols =
+    normalizeRepeatColumns(columns).length > 0
+      ? normalizeRepeatColumns(columns)
+      : defaultRepeatColumnsForField("");
+  const empty = { version: 1, rows: [] };
+  const storedStr = stored == null ? "" : String(stored);
+  if (storedStr.trim() === "") {
+    return { ok: true, data: empty, columns: defaultCols };
+  }
+  if (isEncryptedFieldValue(storedStr)) {
+    return { ok: false, error: "Repeat field value is encrypted." };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(storedStr);
+  } catch (_) {
+    return legacyPlainTextAsRepeatFirstRow(storedStr, defaultCols);
+  }
+  if (typeof parsed === "string") {
+    return legacyPlainTextAsRepeatFirstRow(parsed, defaultCols);
+  }
+  if (Array.isArray(parsed)) {
+    parsed = { version: 1, rows: parsed };
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return legacyPlainTextAsRepeatFirstRow(storedStr, defaultCols);
+  }
+  if (!Array.isArray(parsed.rows)) {
+    return legacyPlainTextAsRepeatFirstRow(storedStr, defaultCols);
+  }
+  const colsFromData = Array.isArray(parsed.columns) ? normalizeRepeatColumns(parsed.columns) : [];
+  const cols = colsFromData.length > 0 ? colsFromData : defaultCols;
+  const rawRows = Array.isArray(parsed.rows) ? parsed.rows : [];
+  const rows = rawRows.map((row) => {
+    const out = {};
+    for (const c of cols) {
+      out[c.key] = row && row[c.key] != null ? String(row[c.key]) : "";
+    }
+    return out;
+  });
+  return { ok: true, data: { version: 1, rows }, columns: cols };
+}
+
+function serializeRepeatFieldValue(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  return JSON.stringify({ version: 1, rows: list });
+}
+
+function appendRepeatRowToFieldValue(stored, columns, newRow) {
+  const parsed = parseRepeatFieldValue(stored, columns);
+  if (!parsed.ok) {
+    throw new Error(parsed.error || "Invalid repeat field value.");
+  }
+  const row = {};
+  for (const c of parsed.columns) {
+    row[c.key] = newRow && newRow[c.key] != null ? String(newRow[c.key]) : "";
+  }
+  const rows = parsed.data.rows.slice();
+  rows.push(row);
+  return serializeRepeatFieldValue(rows);
+}
+
+/**
+ * Param forms:
+ * - PROMPT,RESPONSE — multi-field repeat group (profile field names)
+ * - legacyField|col1,col2 — single combined JSON field (legacy)
+ * - fieldName — legacy single field, columns from form
+ */
+function parseAppendRepeatParam(param) {
+  const s = typeof param === "string" ? param.trim() : "";
+  if (!s) return { profileFieldNames: [], columnKeys: null, legacyFieldName: "" };
+  const pipeIdx = s.indexOf("|");
+  if (pipeIdx !== -1) {
+    const legacyFieldName = s.slice(0, pipeIdx).trim();
+    const keysPart = s.slice(pipeIdx + 1).trim();
+    const columnKeys = keysPart
+      ? keysPart
+          .split(",")
+          .map((k) => k.trim())
+          .filter(Boolean)
+      : null;
+    return {
+      profileFieldNames: legacyFieldName ? [legacyFieldName] : [],
+      columnKeys,
+      legacyFieldName,
+    };
+  }
+  if (s.includes(",")) {
+    const profileFieldNames = s.split(",").map((k) => k.trim()).filter(Boolean);
+    return { profileFieldNames, columnKeys: profileFieldNames, legacyFieldName: "" };
+  }
+  return { profileFieldNames: [s], columnKeys: null, legacyFieldName: s };
+}
+
+function getRepeatGroupLayoutFromForm(formDoc) {
+  if (!formDoc || !Array.isArray(formDoc.fieldLayout)) return null;
+  for (const item of formDoc.fieldLayout) {
+    if (isRepeatGroupLayoutItem(item)) return item;
+  }
+  return null;
+}
+
+function buildRepeatRowFromDataset(columns, dataset) {
+  const row = {};
+  const explicit = dataset && dataset._repeatRow;
+  if (explicit && typeof explicit === "object" && !Array.isArray(explicit)) {
+    for (const c of columns) {
+      row[c.key] = explicit[c.key] != null ? String(explicit[c.key]) : "";
+    }
+    return row;
+  }
+  for (const c of columns) {
+    row[c.key] = dataset && dataset[c.key] != null ? String(dataset[c.key]) : "";
+  }
+  return row;
+}
+
+function getRepeatLayoutItemFromForm(formDoc, fieldName) {
+  if (!formDoc || !Array.isArray(formDoc.fieldLayout)) return null;
+  const fn = typeof fieldName === "string" ? fieldName.trim() : "";
+  if (!fn) return null;
+  for (const item of formDoc.fieldLayout) {
+    if (item && item.fieldName === fn && normalizeEntryFieldType(item.fieldType) === "repeat") {
+      return item;
+    }
+  }
+  return null;
+}
+
+async function loadRepeatColumnsForEntryField(dbInstance, profileId, entryId, fieldName) {
+  let profileDoc;
+  try {
+    profileDoc = await dbInstance.get(profileId);
+  } catch (_) {
+    return defaultRepeatColumnsForField(fieldName);
+  }
+  let record = null;
+  if (entryId) {
+    try {
+      record = await dbInstance.get(entryId);
+    } catch (_) {}
+  }
+  let formDoc = null;
+  const formIds = getProfileEntryFormIds(profileDoc);
+  const formId = record && record.entryFormId ? String(record.entryFormId).trim() : formIds[0] || "";
+  if (formId) {
+    try {
+      formDoc = await dbInstance.get(formId);
+    } catch (_) {}
+  }
+  const layoutItem = getRepeatLayoutItemFromForm(formDoc, fieldName);
+  if (layoutItem) {
+    const cols = normalizeRepeatColumns(layoutItem.repeatColumns);
+    if (cols.length > 0) return cols;
+  }
+  const stored = record && record[fieldName] != null ? String(record[fieldName]) : "";
+  if (stored && !isEncryptedFieldValue(stored)) {
+    const parsed = parseRepeatFieldValue(stored, []);
+    if (parsed.ok && parsed.columns.length > 0) return parsed.columns;
+  }
+  return defaultRepeatColumnsForField(fieldName);
+}
+
+async function loadRepeatGroupColumns(dbInstance, profileId, entryId, profileFieldNames) {
+  if (profileFieldNames && profileFieldNames.length > 0) {
+    return profileFieldNames.map((k) => ({ key: k, label: k, fieldType: "text" }));
+  }
+  let profileDoc;
+  let formDoc = null;
+  let record = null;
+  if (dbInstance && profileId) {
+    try {
+      profileDoc = await dbInstance.get(profileId);
+    } catch (_) {}
+    if (entryId) {
+      try {
+        record = await dbInstance.get(entryId);
+      } catch (_) {}
+    }
+    const formIds = getProfileEntryFormIds(profileDoc);
+    const formId = record && record.entryFormId ? String(record.entryFormId).trim() : formIds[0] || "";
+    if (formId) {
+      try {
+        formDoc = await dbInstance.get(formId);
+      } catch (_) {}
+    }
+  }
+  const groupItem = getRepeatGroupLayoutFromForm(formDoc);
+  if (groupItem) {
+    const cols = normalizeRepeatColumns(groupItem.repeatColumns);
+    if (cols.length > 0) return cols;
+  }
+  return defaultRepeatColumnsForField("");
+}
+
+async function appendRepeatGroupRowToContext(dbInstance, context, profileFieldNames, columns) {
+  const fieldNames = Array.isArray(profileFieldNames) ? profileFieldNames.filter(Boolean) : [];
+  if (fieldNames.length === 0) {
+    throw new Error("Param must list profile repeat field names (e.g. PROMPT,RESPONSE).");
+  }
+  const cols =
+    columns && columns.length > 0
+      ? columns
+      : fieldNames.map((k) => ({ key: k, label: k, fieldType: "text" }));
+  const dataset = context.dataset && typeof context.dataset === "object" ? { ...context.dataset } : {};
+  let existing = null;
+  if (context.entryId && dbInstance) {
+    try {
+      existing = await dbInstance.get(context.entryId);
+    } catch (_) {}
+  }
+  const newRow = buildRepeatRowFromDataset(cols, dataset);
+  let rowCount = 0;
+  for (const fn of fieldNames) {
+    let stored = dataset[fn] != null ? String(dataset[fn]) : "";
+    if (!stored && existing && existing[fn] != null) stored = String(existing[fn]);
+    if (isEncryptedFieldValue(stored)) {
+      throw new Error("Cannot append to encrypted repeat field in this flow context.");
+    }
+    const parsed = parseProfileRepeatScalarValue(stored);
+    const rows = parsed.ok ? parsed.rows.slice() : [];
+    rows.push(newRow[fn] != null ? String(newRow[fn]) : "");
+    dataset[fn] = serializeProfileRepeatScalarValue(rows);
+    rowCount = Math.max(rowCount, rows.length);
+  }
+  context.dataset = {
+    ...dataset,
+    _lastAppendRepeatFields: fieldNames,
+    _lastAppendRepeatRowCount: rowCount,
+  };
+  return { fieldNames, newRow, rowCount };
+}
+
+async function appendRepeatRowToContext(dbInstance, context, param) {
+  const { profileFieldNames, columnKeys, legacyFieldName } = parseAppendRepeatParam(param);
+
+  if (profileFieldNames.length > 1 || (profileFieldNames.length >= 1 && !legacyFieldName && columnKeys && columnKeys.length > 1)) {
+    const names = columnKeys && columnKeys.length > 0 ? columnKeys : profileFieldNames;
+    let columns = names.map((k) => ({ key: k, label: k, fieldType: "text" }));
+    if (dbInstance && context && context.profileId) {
+      const fromForm = await loadRepeatGroupColumns(dbInstance, context.profileId, context.entryId, names);
+      if (fromForm.length > 0) columns = fromForm;
+    }
+    return appendRepeatGroupRowToContext(dbInstance, context, names, columns);
+  }
+
+  const fieldName = legacyFieldName || profileFieldNames[0] || "";
+  if (!fieldName) {
+    throw new Error("Param must be profile repeat field name(s) (e.g. PROMPT,RESPONSE or legacy Dialog|question,answer).");
+  }
+
+  let columns;
+  if (columnKeys && columnKeys.length > 0) {
+    columns = columnKeys.map((k) => ({ key: k, label: k, fieldType: "text" }));
+  } else if (dbInstance && context && context.profileId) {
+    columns = await loadRepeatColumnsForEntryField(dbInstance, context.profileId, context.entryId, fieldName);
+  } else {
+    columns = defaultRepeatColumnsForField(fieldName);
+  }
+
+  const dataset = context.dataset && typeof context.dataset === "object" ? { ...context.dataset } : {};
+  let currentStored = dataset[fieldName] != null ? String(dataset[fieldName]) : "";
+  if (isEncryptedFieldValue(currentStored)) {
+    throw new Error("Cannot append to encrypted repeat field in this flow context.");
+  }
+  if (!currentStored && context.entryId && dbInstance) {
+    try {
+      const existing = await dbInstance.get(context.entryId);
+      if (existing && existing[fieldName] != null) {
+        currentStored = String(existing[fieldName]);
+        if (isEncryptedFieldValue(currentStored)) {
+          throw new Error("Cannot append to encrypted repeat field in this flow context.");
+        }
+      }
+    } catch (e) {
+      if (e && e.message && String(e.message).includes("encrypted repeat")) throw e;
+    }
+  }
+
+  const newRow = buildRepeatRowFromDataset(columns, dataset);
+  const updatedJson = appendRepeatRowToFieldValue(currentStored, columns, newRow);
+  let rowCount = 0;
+  try {
+    rowCount = JSON.parse(updatedJson).rows.length;
+  } catch (_) {}
+  context.dataset = {
+    ...dataset,
+    [fieldName]: updatedJson,
+    _lastAppendRepeatField: fieldName,
+    _lastAppendRepeatRowCount: rowCount,
+  };
+  return { fieldName, updatedJson, newRow, rowCount };
+}
+
+function summarizeRepeatFieldForList(value) {
+  const parsed = parseRepeatFieldValue(value, []);
+  if (!parsed.ok) return "(invalid repeat data)";
+  const n = parsed.data.rows.length;
+  if (n === 0) return "empty";
+  return n === 1 ? "1 row" : n + " rows";
+}
+
+function looksLikeRepeatFieldJson(value) {
+  const s = String(value || "").trim();
+  if (!s.startsWith("{")) return false;
+  try {
+    const o = JSON.parse(s);
+    return !!(o && typeof o === "object" && Array.isArray(o.rows));
+  } catch (_) {
+    return false;
+  }
+}
+
+function compactMarkdownForDisplay(value) {
+  let t = String(value != null ? value : "")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+  t = t.replace(/\n{3,}/g, "\n\n");
+  t = t.replace(/\n\n+(?=[-*+] )/gm, "\n");
+  t = t.replace(/\n\n+(?=\d+\. )/gm, "\n");
+  t = t.replace(/(#{1,6}[^\n]*)\n\n+(?=[-*+]\s|\d+\.\s)/gm, "$1\n");
+  t = t.replace(/(^[-*+] .*(?:\n|$))(?:[ \t]*\n)+(?=[-*+] )/gm, "$1");
+  t = t.replace(/(^\d+\. .*(?:\n|$))(?:[ \t]*\n)+(?=\d+\. )/gm, "$1");
+  t = t.replace(/([^\n])\n(#{1,6}\s)/gm, "$1\n\n$2");
+  return t.trim();
+}
+
+function tightenMarkdownDisplayHtml(html) {
+  if (!html || typeof html !== "string") return html;
+  return html
+    .replace(/<p>\s*<\/p>/gi, "")
+    .replace(/<\/ul>\s*<ul>/gi, "")
+    .replace(/<\/ol>\s*<ol>/gi, "");
+}
+
+function parseMarkdownToDisplayHtml(value) {
+  try {
+    const html = marked.parse(compactMarkdownForDisplay(value));
+    return typeof html === "string" ? tightenMarkdownDisplayHtml(html) : escapeHtml(value);
+  } catch (_) {
+    return escapeHtml(value);
+  }
+}
+
+function formatRepeatSubValueHtml(fieldType, value) {
+  const v = value != null ? String(value) : "";
+  if (!v) return "";
+  const ft = normalizeRepeatSubFieldType(fieldType);
+  if (ft === "markdown") {
+    return parseMarkdownToDisplayHtml(v);
+  }
+  if (ft === "url") {
+    const raw = v.trim();
+    const escapedText = escapeHtml(raw);
+    const hrefRaw = /^(https?:\/\/|mailto:|tel:)/i.test(raw) ? raw : "https://" + raw;
+    return `<a href="${escapeHtml(hrefRaw)}" target="_blank" rel="noopener noreferrer">${escapedText}</a>`;
+  }
+  return escapeHtml(v);
+}
+
+function formatRepeatFieldHtml(value, o) {
+  const parsed = parseRepeatFieldValue(value, o.repeatColumns || []);
+  if (!parsed.ok) {
+    return `<span class="entry-repeat-error">${escapeHtml(parsed.error)}</span>`;
+  }
+  const { data, columns } = parsed;
+  if (columns.length === 0) {
+    return '<span class="entry-repeat-empty">No columns configured.</span>';
+  }
+  const mode = normalizeRepeatMode(o.repeatMode);
+  if (data.rows.length === 0) {
+    return '<span class="entry-repeat-empty">No rows yet.</span>';
+  }
+  if (mode === "stack") {
+    return (
+      `<div class="entry-repeat-stack">` +
+      data.rows
+        .map(
+          (row, idx) =>
+            `<div class="entry-repeat-stack-block">` +
+            `<div class="entry-repeat-stack-head">#${idx + 1}</div>` +
+            columns
+              .map(
+                (c) =>
+                  `<div class="entry-repeat-stack-field"><div class="entry-repeat-col-label">${escapeHtml(c.label)}</div><div class="entry-repeat-col-value${c.fieldType === "markdown" ? " entry-repeat-col-markdown" : ""}">${formatRepeatSubValueHtml(c.fieldType, row[c.key])}</div></div>`
+              )
+              .join("") +
+            `</div>`
+        )
+        .join("") +
+      `</div>`
+    );
+  }
+  const head = `<tr>${columns.map((c) => `<th>${escapeHtml(c.label)}</th>`).join("")}</tr>`;
+  const body = data.rows
+    .map(
+      (row) =>
+        `<tr>${columns.map((c) => `<td${c.fieldType === "markdown" ? ' class="entry-repeat-col-markdown"' : ""}>${formatRepeatSubValueHtml(c.fieldType, row[c.key])}</td>`).join("")}</tr>`
+    )
+    .join("");
+  return `<table class="entry-repeat-table elenko-entry-fields-table"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function formatRepeatGroupHtml(record, o) {
+  const columns = normalizeRepeatColumns(o.repeatColumns || []);
+  if (columns.length === 0) {
+    return '<span class="entry-repeat-empty">No columns configured.</span>';
+  }
+  const rows = mergeRepeatGroupRowsFromRecord(record || {}, columns);
+  const mode = normalizeRepeatMode(o.repeatMode);
+  if (rows.length === 0) {
+    return '<span class="entry-repeat-empty">No rows yet.</span>';
+  }
+  if (mode === "stack") {
+    return (
+      `<div class="entry-repeat-stack">` +
+      rows
+        .map(
+          (row, idx) =>
+            `<div class="entry-repeat-stack-block">` +
+            `<div class="entry-repeat-stack-head">#${idx + 1}</div>` +
+            columns
+              .map(
+                (c) =>
+                  `<div class="entry-repeat-stack-field"><div class="entry-repeat-col-label">${escapeHtml(c.label)}</div><div class="entry-repeat-col-value${c.fieldType === "markdown" ? " entry-repeat-col-markdown" : ""}">${formatRepeatSubValueHtml(c.fieldType, row[c.key])}</div></div>`
+              )
+              .join("") +
+            `</div>`
+        )
+        .join("") +
+      `</div>`
+    );
+  }
+  const head = `<tr>${columns.map((c) => `<th>${escapeHtml(c.label)}</th>`).join("")}</tr>`;
+  const body = rows
+    .map(
+      (row) =>
+        `<tr>${columns.map((c) => `<td${c.fieldType === "markdown" ? ' class="entry-repeat-col-markdown"' : ""}>${formatRepeatSubValueHtml(c.fieldType, row[c.key])}</td>`).join("")}</tr>`
+    )
+    .join("");
+  return `<table class="entry-repeat-table elenko-entry-fields-table"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function buildRepeatCellEditInputHtml(column, cellVal) {
+  const key = escapeHtml(column.key);
+  const escapedVal = escapeHtml(cellVal != null ? String(cellVal) : "");
+  const ft = normalizeRepeatSubFieldType(column.fieldType);
+  if (ft === "url") {
+    return `<input type="url" class="entry-repeat-cell" data-col-key="${key}" data-col-type="url" value="${escapedVal}">`;
+  }
+  if (ft === "markdown") {
+    return `<textarea class="entry-repeat-cell entry-repeat-cell-textarea entry-repeat-cell-markdown" data-col-key="${key}" data-col-type="markdown" rows="6" spellcheck="false">${escapedVal}</textarea>`;
+  }
+  return `<textarea class="entry-repeat-cell entry-repeat-cell-textarea" data-col-key="${key}" data-col-type="text" rows="2">${escapedVal}</textarea>`;
+}
+
+function renderRepeatColumnEditorRowsHtml(columns, fieldName) {
+  const cols = normalizeRepeatColumns(columns);
+  const list = cols.length > 0 ? cols : defaultRepeatColumnsForField(fieldName || "");
+  return list
+    .map((c) => {
+      const ft = normalizeRepeatSubFieldType(c.fieldType);
+      return (
+        `<tr class="fl-repeat-col-row">` +
+        `<td><input type="text" class="fl-repeat-col-key" value="${escapeHtml(c.key)}" placeholder="PROMPT"></td>` +
+        `<td><input type="text" class="fl-repeat-col-label" value="${escapeHtml(c.label)}" placeholder="Label"></td>` +
+        `<td><select class="fl-repeat-col-type">` +
+        `<option value="text"${ft === "text" ? " selected" : ""}>Text</option>` +
+        `<option value="markdown"${ft === "markdown" ? " selected" : ""}>Markdown</option>` +
+        `<option value="url"${ft === "url" ? " selected" : ""}>URL</option>` +
+        `</select></td>` +
+        `<td><button type="button" class="btn btn-remove fl-repeat-col-remove" aria-label="Remove column">Remove</button></td>` +
+        `</tr>`
+      );
+    })
+    .join("");
+}
+
+function buildRepeatFormDesignerConfigHtml(options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const styleAttr = opts.visible ? "" : ' style="display:none;"';
+  const mode = normalizeRepeatMode(opts.repeatMode);
+  const addLabel =
+    typeof opts.repeatAddLabel === "string" && opts.repeatAddLabel.trim() ? opts.repeatAddLabel.trim() : "Add row";
+  const colRows = renderRepeatColumnEditorRowsHtml(opts.repeatColumns, opts.fieldName);
+  return (
+    `<div class="fl-repeat-config"${styleAttr}>` +
+    `<label class="fl-repeat-sub-label">Repeat layout</label>` +
+    `<select class="fl-repeat-mode"><option value="table"${mode === "table" ? " selected" : ""}>Table</option><option value="stack"${mode === "stack" ? " selected" : ""}>Vertical stack</option></select>` +
+    `<label class="fl-repeat-sub-label">Add button label</label>` +
+    `<input type="text" class="fl-repeat-add-label" value="${escapeHtml(addLabel)}" placeholder="Add row">` +
+    `<label class="fl-repeat-sub-label">Profile fields (one row index links columns)</label>` +
+    `<table class="fl-repeat-cols-table"><thead><tr><th>Profile field</th><th>Label</th><th>Type</th><th></th></tr></thead><tbody class="fl-repeat-cols-tbody">${colRows}</tbody></table>` +
+    `<button type="button" class="btn btn-secondary fl-repeat-col-add" style="margin-top:0.35rem;">+ Add column</button>` +
+    `</div>`
+  );
+}
+
+function buildRepeatGroupEditControlHtml(record, o) {
+  const columns =
+    normalizeRepeatColumns(o.repeatColumns).length > 0
+      ? normalizeRepeatColumns(o.repeatColumns)
+      : defaultRepeatColumnsForField("");
+  let rows = mergeRepeatGroupRowsFromRecord(record || {}, columns);
+  if (rows.length === 0) {
+    const emptyRow = {};
+    for (const c of columns) emptyRow[c.key] = "";
+    rows = [emptyRow];
+  }
+  const mode = normalizeRepeatMode(o.repeatMode);
+  const addLabel =
+    typeof o.repeatAddLabel === "string" && o.repeatAddLabel.trim()
+      ? o.repeatAddLabel.trim()
+      : "Add row";
+  const colsJson = escapeHtml(JSON.stringify(columns));
+  const fieldValues = splitRepeatGroupRowsToFieldValues(rows, columns);
+  const hiddenInputs = columns
+    .map((c) => {
+      const fn = escapeHtml(c.key);
+      const val = escapeHtml(fieldValues[c.key] || serializeProfileRepeatScalarValue([]));
+      return `<input type="hidden" class="entry-field entry-repeat-field-json" name="${fn}" data-repeat-field="${fn}" value="${val}">`;
+    })
+    .join("");
+
+  let rowsHtml;
+  if (mode === "stack") {
+    rowsHtml = rows
+      .map(
+        (row, idx) =>
+          `<div class="entry-repeat-row entry-repeat-stack-row" data-row-index="${idx}">` +
+          `<div class="entry-repeat-stack-row-head"><span>#${idx + 1}</span><button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button></div>` +
+          columns
+            .map((c) => {
+              const cellVal = row[c.key] != null ? String(row[c.key]) : "";
+              return `<label class="entry-repeat-stack-edit-field"><span class="entry-repeat-col-label">${escapeHtml(c.label)}</span>${buildRepeatCellEditInputHtml(c, cellVal)}</label>`;
+            })
+            .join("") +
+          `</div>`
+      )
+      .join("");
+  } else {
+    const head = `<tr>${columns.map((c) => `<th>${escapeHtml(c.label)}</th>`).join("")}<th></th></tr>`;
+    const body = rows
+      .map(
+        (row, idx) =>
+          `<tr class="entry-repeat-row" data-row-index="${idx}">` +
+          columns
+            .map((c) => {
+              const cellVal = row[c.key] != null ? String(row[c.key]) : "";
+              return `<td>${buildRepeatCellEditInputHtml(c, cellVal)}</td>`;
+            })
+            .join("") +
+          `<td><button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button></td></tr>`
+      )
+      .join("");
+    rowsHtml = `<table class="entry-repeat-edit-table"><thead>${head}</thead><tbody class="entry-repeat-tbody">${body}</tbody></table>`;
+  }
+
+  return (
+    `<div class="entry-repeat-wrap entry-repeat-group" data-repeat-group="1" data-repeat-mode="${escapeHtml(mode)}" data-repeat-columns="${colsJson}">` +
+    hiddenInputs +
+    `<div class="entry-repeat-body">${rowsHtml}</div>` +
+    `<div class="entry-repeat-actions"><button type="button" class="btn btn-secondary entry-repeat-add">${escapeHtml(addLabel)}</button></div>` +
+    `</div>`
+  );
+}
+
+function buildRepeatEditControlHtml(o, value) {
+  const parsed = parseRepeatFieldValue(value, o.repeatColumns || []);
+  const columns =
+    parsed.ok && parsed.columns.length > 0
+      ? parsed.columns
+      : normalizeRepeatColumns(o.repeatColumns).length > 0
+        ? normalizeRepeatColumns(o.repeatColumns)
+        : defaultRepeatColumnsForField(o.fieldName);
+  let rows = parsed.ok ? parsed.data.rows : [];
+  if (rows.length === 0) {
+    const emptyRow = {};
+    for (const c of columns) emptyRow[c.key] = "";
+    rows = [emptyRow];
+  }
+  const mode = normalizeRepeatMode(o.repeatMode);
+  const addLabel =
+    typeof o.repeatAddLabel === "string" && o.repeatAddLabel.trim()
+      ? o.repeatAddLabel.trim()
+      : "Add row";
+  const storedJson = serializeRepeatFieldValue(rows);
+  const colsJson = escapeHtml(JSON.stringify(columns));
+  const escapedName = escapeHtml(o.fieldName);
+
+  let rowsHtml;
+  if (mode === "stack") {
+    rowsHtml = rows
+      .map(
+        (row, idx) =>
+          `<div class="entry-repeat-row entry-repeat-stack-row" data-row-index="${idx}">` +
+          `<div class="entry-repeat-stack-row-head"><span>#${idx + 1}</span><button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button></div>` +
+          columns
+            .map((c) => {
+              const cellVal = row[c.key] != null ? String(row[c.key]) : "";
+              return `<label class="entry-repeat-stack-edit-field"><span class="entry-repeat-col-label">${escapeHtml(c.label)}</span>${buildRepeatCellEditInputHtml(c, cellVal)}</label>`;
+            })
+            .join("") +
+          `</div>`
+      )
+      .join("");
+  } else {
+    const head = `<tr>${columns.map((c) => `<th>${escapeHtml(c.label)}</th>`).join("")}<th></th></tr>`;
+    const body = rows
+      .map(
+        (row, idx) =>
+          `<tr class="entry-repeat-row" data-row-index="${idx}">` +
+          columns
+            .map((c) => {
+              const cellVal = row[c.key] != null ? String(row[c.key]) : "";
+              return `<td>${buildRepeatCellEditInputHtml(c, cellVal)}</td>`;
+            })
+            .join("") +
+          `<td><button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button></td></tr>`
+      )
+      .join("");
+    rowsHtml = `<table class="entry-repeat-edit-table"><thead>${head}</thead><tbody class="entry-repeat-tbody">${body}</tbody></table>`;
+  }
+
+  return (
+    `<div class="entry-repeat-wrap" data-repeat-mode="${escapeHtml(mode)}" data-repeat-columns="${colsJson}">` +
+    `<input type="hidden" class="entry-field entry-repeat-json" name="${escapedName}" value="${escapeHtml(storedJson)}">` +
+    `<div class="entry-repeat-body">${rowsHtml}</div>` +
+    `<div class="entry-repeat-actions"><button type="button" class="btn btn-secondary entry-repeat-add">${escapeHtml(addLabel)}</button></div>` +
+    `</div>`
+  );
 }
 
 /** Cap for Chart field series length (request/DoS guard). */
@@ -784,7 +1677,11 @@ function normalizeEntryFormDoc(body) {
       if (!item) return false;
       const hasField = typeof item.fieldName === "string" && item.fieldName.trim();
       const hasLabel = typeof item.labelId === "string" && item.labelId.trim();
-      return hasField || hasLabel;
+      const isGroup =
+        normalizeEntryFieldType(item.fieldType) === "repeat" &&
+        normalizeRepeatColumns(item.repeatColumns).length > 0 &&
+        (item.repeatGroup === true || !hasField);
+      return hasField || hasLabel || isGroup;
     })
     .map((item) => {
       const x = parseNum(item.x);
@@ -797,9 +1694,38 @@ function normalizeEntryFormDoc(body) {
         ...(y != null && { y }),
         ...(height != null && { height }),
       };
-      if (typeof item.fieldName === "string" && item.fieldName.trim()) {
-        const fieldType = normalizeEntryFieldType(item.fieldType);
-        return { ...base, fieldName: item.fieldName.trim(), fieldType };
+      const fieldTypeRaw = normalizeEntryFieldType(item.fieldType);
+      const repeatCols = normalizeRepeatColumns(item.repeatColumns);
+      const fieldNameTrim = typeof item.fieldName === "string" ? item.fieldName.trim() : "";
+      if (
+        fieldTypeRaw === "repeat" &&
+        repeatCols.length > 0 &&
+        (item.repeatGroup === true || !fieldNameTrim)
+      ) {
+        return {
+          ...base,
+          fieldType: "repeat",
+          repeatGroup: true,
+          repeatMode: normalizeRepeatMode(item.repeatMode),
+          repeatColumns: repeatCols,
+          repeatAddLabel:
+            typeof item.repeatAddLabel === "string" && item.repeatAddLabel.trim()
+              ? item.repeatAddLabel.trim()
+              : "Add row",
+        };
+      }
+      if (fieldNameTrim) {
+        const fieldType = fieldTypeRaw;
+        const out = { ...base, fieldName: fieldNameTrim, fieldType };
+        if (fieldType === "repeat") {
+          out.repeatMode = normalizeRepeatMode(item.repeatMode);
+          out.repeatColumns = repeatCols.length > 0 ? repeatCols : defaultRepeatColumnsForField(fieldNameTrim);
+          out.repeatAddLabel =
+            typeof item.repeatAddLabel === "string" && item.repeatAddLabel.trim()
+              ? item.repeatAddLabel.trim()
+              : "Add row";
+        }
+        return out;
       }
       return { ...base, labelId: item.labelId.trim() };
     });
@@ -1345,6 +2271,8 @@ function normalizeFlowSteps(steps) {
           ? "create"
           : t === "purgeOld"
           ? "purgeOld"
+          : t === "appendRepeat"
+          ? "appendRepeat"
           : "log";
       const param = typeof (s && s.param) === "string" ? s.param.trim() : "";
       const label = typeof (s && s.label) === "string" ? s.label.trim() : "";
@@ -1959,12 +2887,29 @@ async function updateCurrentEntryFromDataset(dbInstance, context) {
     return;
   }
   if (!existing || existing.type !== "elenko_record" || existing.profileId !== profileId) return;
+  let profileDoc = context.profileDoc;
+  if (!profileDoc && profileId) {
+    try {
+      const pd = await dbInstance.get(profileId);
+      if (pd && pd.type === "elenko_profile") profileDoc = pd;
+    } catch (_) {}
+  }
   const dataset = context.dataset && typeof context.dataset === "object" ? context.dataset : {};
   const patch = { ...dataset };
   // Do not persist helper fields used only inside the pipeline
   delete patch._lastCreatedId;
+  delete patch._repeatRow;
+  delete patch._lastAppendRepeatField;
+  delete patch._lastAppendRepeatFields;
+  delete patch._lastAppendRepeatRowCount;
   delete patch.createdBy;
   delete patch.updatedBy;
+  if (profileDoc) {
+    for (const key of Object.keys(patch)) {
+      if (key.startsWith("_") || key === "type" || key === "profileId" || key === "sortKey") continue;
+      patch[key] = applyPlainValueToProfileField(profileDoc, existing, key, patch[key]);
+    }
+  }
   const updated = { ...existing, ...patch };
   setEntryAuditOnUpdate(updated, context && context.req);
   await dbInstance.insert(updated);
@@ -2114,6 +3059,12 @@ function runApiCallAndWait(apiDocId, context) {
 
 /** Run a flow document's steps in order. Context is mutated (dataset, lastApiResponse, etc.). */
 async function runPipeline(context, flowDoc) {
+  if (!context.profileDoc && context.profileId && db) {
+    try {
+      const pd = await db.get(context.profileId);
+      if (pd && pd.type === "elenko_profile") context.profileDoc = pd;
+    } catch (_) {}
+  }
   const steps = Array.isArray(flowDoc && flowDoc.steps) ? flowDoc.steps : [];
   let hasExplicitPersistStep = false;
   /** Skip update/response (need a current entry). Timer without entry uses this; guardian import always. */
@@ -2138,6 +3089,8 @@ async function runPipeline(context, flowDoc) {
         ? "create"
         : rawTarget === "purgeOld"
         ? "purgeOld"
+        : rawTarget === "appendRepeat"
+        ? "appendRepeat"
         : "log";
     if (target === "log") {
       sendFlowMessage("entry.sendToFlow", {
@@ -2202,6 +3155,34 @@ async function runPipeline(context, flowDoc) {
         _lastPurgeDeleted: purgeRes.deleted,
         _lastPurgeCapped: purgeRes.capped,
       };
+      continue;
+    }
+    if (target === "appendRepeat") {
+      const param = (step && typeof step.param === "string") ? step.param.trim() : "";
+      try {
+        const appendRes = await appendRepeatRowToContext(db, context, param);
+        sendFlowMessage("flow.appendRepeat", {
+          stepIndex: i,
+          profileId: context.profileId,
+          entryId: context.entryId,
+          param,
+          fieldName: appendRes.fieldName,
+          rowCount: appendRes.rowCount,
+          newRow: appendRes.newRow,
+        });
+        if (!suppressPipelineEntryWrites && context.entryId && context.profileId && db) {
+          await updateCurrentEntryFromDataset(db, context);
+          hasExplicitPersistStep = true;
+        }
+      } catch (e) {
+        sendFlowMessage("flow.appendRepeatError", {
+          stepIndex: i,
+          profileId: context.profileId,
+          entryId: context.entryId,
+          param,
+          error: e && e.message ? String(e.message) : "Append repeat row failed",
+        });
+      }
       continue;
     }
     if (target === "script") {
@@ -2306,7 +3287,29 @@ async function runPipeline(context, flowDoc) {
       const bodyStr = (result.body === undefined || result.body === null) ? "" : (typeof result.body === "string" ? result.body : JSON.stringify(result.body));
       context.lastApiResponse = { success: result.success, statusCode: result.statusCode, body: bodyStr, error: result.error };
       if (context.dataset && result.responseField && typeof result.responseField === "string" && result.responseField.trim()) {
-        context.dataset[result.responseField.trim()] = bodyStr;
+        const fn = result.responseField.trim();
+        let bodyToStore = bodyStr;
+        if ((result.responseStart || result.responseEnd) && bodyStr) {
+          const start =
+            typeof result.responseStart === "string" && result.responseStart
+              ? bodyStr.indexOf(result.responseStart)
+              : 0;
+          const startIdx =
+            start === -1 ? 0 : start + (typeof result.responseStart === "string" && result.responseStart ? result.responseStart.length : 0);
+          const endIdx =
+            typeof result.responseEnd === "string" && result.responseEnd
+              ? bodyStr.indexOf(result.responseEnd, startIdx) === -1
+                ? bodyStr.length
+                : bodyStr.indexOf(result.responseEnd, startIdx)
+              : bodyStr.length;
+          bodyToStore = bodyStr.slice(startIdx, endIdx).trim();
+        }
+        context.dataset[fn] = applyPlainValueToProfileField(
+          context.profileDoc,
+          context.dataset,
+          fn,
+          bodyToStore
+        );
       }
     }
   }
@@ -3109,7 +4112,12 @@ function startApiWorker() {
         record.lastApiResponse = lastApiResponse;
         if (responseField && typeof responseField === "string" && responseField.trim()) {
           const fieldName = responseField.trim();
-          record[fieldName] = bodyToStore;
+          let profileDoc = null;
+          try {
+            const pd = await db.get(profileId);
+            if (pd && pd.type === "elenko_profile") profileDoc = pd;
+          } catch (_) {}
+          record[fieldName] = applyPlainValueToProfileField(profileDoc, record, fieldName, bodyToStore);
         }
         await db.insert(record);
         clearProfileListCache(profileId);
@@ -8939,9 +9947,26 @@ app.get("/profile/:id", async (req, res) => {
 
 function getFieldNamesFromFormLayout(formDoc) {
   if (!formDoc || !Array.isArray(formDoc.fieldLayout)) return [];
-  return formDoc.fieldLayout
-    .filter((item) => item && typeof item.fieldName === "string" && item.fieldName.trim())
-    .map((item) => item.fieldName.trim());
+  const names = [];
+  const seen = new Set();
+  for (const item of formDoc.fieldLayout) {
+    if (!item) continue;
+    if (isRepeatGroupLayoutItem(item)) {
+      for (const c of normalizeRepeatColumns(item.repeatColumns)) {
+        if (c && c.key && !seen.has(c.key)) {
+          seen.add(c.key);
+          names.push(c.key);
+        }
+      }
+      continue;
+    }
+    const fn = typeof item.fieldName === "string" ? item.fieldName.trim() : "";
+    if (fn && !seen.has(fn)) {
+      seen.add(fn);
+      names.push(fn);
+    }
+  }
+  return names;
 }
 
 function buildOrderedItems(profileFieldNames, formDoc) {
@@ -8965,22 +9990,53 @@ function buildOrderedItems(profileFieldNames, formDoc) {
   const seenLabels = new Set();
   const ordered = [];
   const sorted = formDoc.fieldLayout
-    .filter((item) => item && (item.fieldName || item.labelId))
+    .filter((item) => item && (item.fieldName || item.labelId || isRepeatGroupLayoutItem(item)))
     .sort((a, b) => (a.order != null ? Number(a.order) : 0) - (b.order != null ? Number(b.order) : 0));
 
   for (const item of sorted) {
+    if (isRepeatGroupLayoutItem(item)) {
+      const cols = normalizeRepeatColumns(item.repeatColumns);
+      ordered.push({
+        type: "repeatGroup",
+        width: item.width || "100%",
+        x: item.x,
+        y: item.y,
+        height: item.height,
+        repeatMode: normalizeRepeatMode(item.repeatMode),
+        repeatColumns: cols,
+        repeatAddLabel:
+          typeof item.repeatAddLabel === "string" && item.repeatAddLabel.trim()
+            ? item.repeatAddLabel.trim()
+            : "Add row",
+      });
+      for (const c of cols) {
+        if (c && c.key) seenFields.add(c.key);
+      }
+      continue;
+    }
     const fn = item && typeof item.fieldName === "string" ? item.fieldName.trim() : "";
     if (fn && !seenFields.has(fn)) {
       seenFields.add(fn);
-      ordered.push({
+      const fieldType = normalizeEntryFieldType(item.fieldType);
+      const orderedItem = {
         type: "field",
         fieldName: fn,
         width: item.width || "100%",
         x: item.x,
         y: item.y,
         height: item.height,
-        fieldType: normalizeEntryFieldType(item.fieldType),
-      });
+        fieldType,
+      };
+      if (fieldType === "repeat") {
+        orderedItem.repeatMode = normalizeRepeatMode(item.repeatMode);
+        const cols = normalizeRepeatColumns(item.repeatColumns);
+        orderedItem.repeatColumns = cols.length > 0 ? cols : defaultRepeatColumnsForField(fn);
+        orderedItem.repeatAddLabel =
+          typeof item.repeatAddLabel === "string" && item.repeatAddLabel.trim()
+            ? item.repeatAddLabel.trim()
+            : "Add row";
+      }
+      ordered.push(orderedItem);
     } else if (item.labelId && labelsById[item.labelId] !== undefined && !seenLabels.has(item.labelId)) {
       seenLabels.add(item.labelId);
       ordered.push({
@@ -8996,6 +10052,28 @@ function buildOrderedItems(profileFieldNames, formDoc) {
   }
   // When field layout is configured, show only fields/labels explicitly listed there.
   return ordered;
+}
+
+function collectOrderedFieldNamesFromItems(orderedItems) {
+  const names = [];
+  const seen = new Set();
+  for (const o of Array.isArray(orderedItems) ? orderedItems : []) {
+    if (o && o.type === "field" && o.fieldName) {
+      const fn = String(o.fieldName);
+      if (!seen.has(fn)) {
+        seen.add(fn);
+        names.push(fn);
+      }
+    } else if (o && o.type === "repeatGroup") {
+      for (const c of normalizeRepeatColumns(o.repeatColumns)) {
+        if (c && c.key && !seen.has(c.key)) {
+          seen.add(c.key);
+          names.push(c.key);
+        }
+      }
+    }
+  }
+  return names;
 }
 
 function positionStyle(o) {
@@ -9361,27 +10439,24 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   const viewHasChartField = orderedItems.some((o) => o.type === "field" && o.fieldType === "chart");
 
   function itemLabel(o) {
-    return o.type === "label" ? o.text : o.fieldName;
+    if (o.type === "label") return o.text;
+    if (o.type === "repeatGroup") return "";
+    return o.fieldName;
   }
   function labelClass(o) {
     return o.type === "label" ? "label static-label" : "label field-label";
   }
   function itemValue(o) {
-    if (o.type === "label") return "";
+    if (o.type === "label" || o.type === "repeatGroup") return "";
     const val = record[o.fieldName];
     return val != null ? String(val) : "";
   }
   function formatValueHtml(o, value, attachmentEntryId) {
     if (o.type === "label") return "";
+    if (o.type === "repeatGroup") return formatRepeatGroupHtml(record, o);
     const attEntry = attachmentEntryId != null ? String(attachmentEntryId) : entryId;
     if (o.fieldType === "markdown" && value) {
-      try {
-        const withNewlines = String(value).replace(/\\n/g, "\n").replace(/\\r/g, "\r");
-        const html = marked.parse(withNewlines);
-        return typeof html === "string" ? html : escapeHtml(value);
-      } catch (_) {
-        return escapeHtml(value);
-      }
+      return parseMarkdownToDisplayHtml(value);
     }
     if (o.fieldType === "url" && value) {
       const raw = String(value).trim();
@@ -9406,6 +10481,12 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     }
     if (o.fieldType === "chart") {
       return formatEntryChartFieldHtml(o.fieldName, value);
+    }
+    if (o.fieldType === "repeat") {
+      return formatRepeatFieldHtml(value, o);
+    }
+    if (isProfileRepeatField(doc, o.fieldName) || isProfileRepeatScalarJson(value)) {
+      return escapeHtml(summarizeProfileRepeatScalarForList(value));
     }
     if (isProfileFileField(doc, o.fieldName) && value) {
       const raw = String(value).trim();
@@ -9496,6 +10577,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       orderedItems
         .map((o) => {
           const isLabel = o.type === "label";
+          const isRepeatGroup = o.type === "repeatGroup";
           const value = itemValue(o);
           const gImg = fieldLayoutImageValueHeightConstraints(o, doc, false);
           const innerImgHeight = !!gImg.style;
@@ -9511,7 +10593,9 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
           }
           const valueHtml = formatValueHtml(o, value);
           const valueClass =
-            (o.fieldType === "markdown"
+            (isRepeatGroup
+              ? " value entry-repeat-group-value"
+              : o.fieldType === "markdown"
               ? " value entry-value-markdown"
               : o.fieldType === "url"
               ? " value entry-value-url"
@@ -9523,6 +10607,12 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
           const stackMaxH = stackLayoutViewValueMaxHeightStyle(o, gImg);
           const valueBoxStyleStr = (gImg.style || "") + stackMaxH;
           const valueBoxStyle = valueBoxStyleStr ? ' style="' + escapeHtml(valueBoxStyleStr) + '"' : "";
+          if (isRepeatGroup) {
+            return `
+        <div class="entry-field-block entry-repeat-group-block"${styleAttr}>
+          <div class="${valueClass}"${valueBoxStyle}>${valueHtml}</div>
+        </div>`;
+          }
           return `
         <div class="entry-field-block"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
@@ -9539,6 +10629,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       orderedItems
         .map((o) => {
           const isLabel = o.type === "label";
+          const isRepeatGroup = o.type === "repeatGroup";
           const value = itemValue(o);
           const cellStyle = gridCellStyle(o);
           const styleAttr = cellStyle ? ' style="' + escapeHtml(cellStyle) + '"' : "";
@@ -9553,7 +10644,9 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
           const valueHtml = formatValueHtml(o, value);
           const gImg = fieldLayoutImageValueHeightConstraints(o, doc, false);
           const valueClass =
-            (o.fieldType === "markdown"
+            (isRepeatGroup
+              ? " value entry-repeat-group-value"
+              : o.fieldType === "markdown"
               ? " value entry-value-markdown"
               : o.fieldType === "url"
               ? " value entry-value-url"
@@ -9563,6 +10656,12 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
               ? " value entry-value-chart"
               : " value") + gImg.className;
           const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
+          if (isRepeatGroup) {
+            return `
+        <div class="entry-grid-cell entry-repeat-group-block"${styleAttr}>
+          <div class="${valueClass}"${valueBoxStyle}>${valueHtml}</div>
+        </div>`;
+          }
           return `
         <div class="entry-grid-cell"${styleAttr}>
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
@@ -9577,6 +10676,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       orderedItems
         .map((o) => {
           const isLabel = o.type === "label";
+          const isRepeatGroup = o.type === "repeatGroup";
           const value = itemValue(o);
           const lc = labelClass(o);
           if (isLabel) {
@@ -9584,6 +10684,14 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
             return `
         <tr class="entry-label-row">
           <td class="${lc}" colspan="2"${w}>${escapeHtml(itemLabel(o))}</td>
+        </tr>`;
+          }
+          if (isRepeatGroup) {
+            const w = o.width && typeof o.width === "string" && o.width.trim() ? ' style="width:' + escapeHtml(o.width.trim()) + '"' : "";
+            const valueHtml = formatValueHtml(o, value);
+            return `
+        <tr class="entry-repeat-group-row">
+          <td class="value entry-repeat-group-value" colspan="2"${w}>${valueHtml}</td>
         </tr>`;
           }
           const valueHtml = formatValueHtml(o, value);
@@ -9743,20 +10851,40 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .entry-view-grid { display: grid; gap: 1rem; }
     .entry-grid-cell .label { display: block; margin-bottom: 0.25rem; color: var(--entry-label, #8b949e); }
     .entry-grid-cell .value { background: var(--entry-field-bg, #161b22); border: 1px solid var(--entry-field-border, #21262d); border-radius: 6px; padding: 0.75rem 1rem; }
-    .entry-value-markdown { line-height: 1.5; }
-    .entry-value-markdown p { margin: 0 0 0.75rem 0; }
-    .entry-value-markdown p:last-child { margin-bottom: 0; }
-    .entry-value-markdown ul, .entry-value-markdown ol { margin: 0 0 0.75rem 0; padding-left: 1.5rem; }
-    .entry-value-markdown h1, .entry-value-markdown h2, .entry-value-markdown h3 { margin: 1rem 0 0.5rem 0; font-weight: 600; }
-    .entry-value-markdown h1 { font-size: 1.25rem; }
-    .entry-value-markdown h2 { font-size: 1.1rem; }
-    .entry-value-markdown h3 { font-size: 1rem; }
-    .entry-value-markdown a { color: var(--entry-link, #58a6ff); }
-    .value:not(.entry-value-markdown):not(.entry-value-chart):not(.entry-value-image) { white-space: pre-wrap; overflow-wrap: break-word; }
+    .entry-value-markdown, .entry-repeat-col-markdown { line-height: 1.4; }
+    .entry-value-markdown > :first-child, .entry-repeat-col-markdown > :first-child { margin-top: 0; }
+    .entry-value-markdown > :last-child, .entry-repeat-col-markdown > :last-child { margin-bottom: 0; }
+    .entry-value-markdown p, .entry-repeat-col-markdown p { margin: 0 0 0.35rem 0; }
+    .entry-value-markdown p:empty, .entry-repeat-col-markdown p:empty { display: none; }
+    .entry-value-markdown ul, .entry-value-markdown ol, .entry-repeat-col-markdown ul, .entry-repeat-col-markdown ol { margin: 0.2rem 0 0.35rem 0; padding-left: 1.25rem; }
+    .entry-value-markdown li, .entry-repeat-col-markdown li { margin: 0.08rem 0; }
+    .entry-value-markdown li p, .entry-repeat-col-markdown li p { margin: 0; }
+    .entry-value-markdown h1, .entry-value-markdown h2, .entry-value-markdown h3, .entry-repeat-col-markdown h1, .entry-repeat-col-markdown h2, .entry-repeat-col-markdown h3 { margin: 0.45rem 0 0.2rem 0; font-weight: 600; line-height: 1.3; }
+    .entry-value-markdown h1:first-child, .entry-value-markdown h2:first-child, .entry-value-markdown h3:first-child, .entry-repeat-col-markdown h1:first-child, .entry-repeat-col-markdown h2:first-child, .entry-repeat-col-markdown h3:first-child { margin-top: 0; }
+    .entry-value-markdown h1:not(:first-child), .entry-value-markdown h2:not(:first-child), .entry-value-markdown h3:not(:first-child), .entry-repeat-col-markdown h1:not(:first-child), .entry-repeat-col-markdown h2:not(:first-child), .entry-repeat-col-markdown h3:not(:first-child) { margin-top: 1rem; }
+    .entry-value-markdown h1, .entry-repeat-col-markdown h1 { font-size: 1.2rem; }
+    .entry-value-markdown h2, .entry-repeat-col-markdown h2 { font-size: 1.05rem; }
+    .entry-value-markdown h3, .entry-repeat-col-markdown h3 { font-size: 0.95rem; }
+    .entry-value-markdown a, .entry-repeat-col-markdown a { color: var(--entry-link, #58a6ff); }
+    .entry-value-markdown ul + ul, .entry-repeat-col-markdown ul + ul { margin-top: 0; }
+    .entry-value-markdown ol + ol, .entry-repeat-col-markdown ol + ol { margin-top: 0; }
+    .entry-value-markdown h1 + ul, .entry-value-markdown h2 + ul, .entry-value-markdown h3 + ul, .entry-repeat-col-markdown h1 + ul, .entry-repeat-col-markdown h2 + ul, .entry-repeat-col-markdown h3 + ul { margin-top: 0.1rem; }
+    .value:not(.entry-value-markdown):not(.entry-value-chart):not(.entry-value-image):not(.entry-repeat-group-value) { white-space: pre-wrap; overflow-wrap: break-word; }
     .entry-value-url a { color: var(--entry-link, #58a6ff); word-break: break-all; }
     .entry-profile-file-dl a { color: var(--entry-link, #58a6ff); word-break: break-all; }
     .entry-value-image { min-height: 0; }
     .entry-inline-image { max-width: 100%; height: auto; max-height: 24rem; display: block; border-radius: 6px; }
+    .entry-repeat-table { width: 100%; border-collapse: collapse; margin-top: 0.25rem; }
+    .entry-repeat-table th, .entry-repeat-table td { border: 1px solid var(--entry-field-border, #21262d); padding: 0.5rem 0.65rem; text-align: left; vertical-align: top; }
+    .entry-repeat-col-value:not(.entry-repeat-col-markdown), .entry-repeat-table td:not(.entry-repeat-col-markdown) { white-space: pre-wrap; overflow-wrap: break-word; }
+    .entry-repeat-table th { background: var(--entry-field-bg, #161b22); color: var(--entry-label, #8b949e); font-weight: 600; }
+    .entry-repeat-stack { display: flex; flex-direction: column; gap: 0.75rem; }
+    .entry-repeat-stack-block { border: 1px solid var(--entry-field-border, #21262d); border-radius: 6px; padding: 0.65rem 0.75rem; background: var(--entry-field-bg, #161b22); }
+    .entry-repeat-stack-head { font-size: 0.8rem; color: var(--entry-label, #8b949e); margin-bottom: 0.35rem; }
+    .entry-repeat-stack-field { margin-top: 0.35rem; }
+    .entry-repeat-col-label { font-size: 0.8rem; color: var(--entry-label, #8b949e); margin-bottom: 0.15rem; }
+    .entry-repeat-empty, .entry-repeat-error { color: var(--entry-label, #8b949e); font-style: italic; }
+    .entry-repeat-error { color: #f85149; font-style: normal; }
     .entry-view-grid .entry-grid-cell .value.entry-grid-image-height .entry-inline-image {
       max-height: 100%;
       width: auto;
@@ -9890,7 +11018,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   const layout = formDoc && (formDoc.layout === "grid" || formDoc.layout === "stack") ? formDoc.layout : "table";
 
   const orderedItems = buildOrderedItems(profileFieldNames, formDoc || {});
-  const orderedFieldNames = orderedItems.filter((o) => o.type === "field").map((o) => o.fieldName);
+  const orderedFieldNames = collectOrderedFieldNamesFromItems(orderedItems);
 
   const themeVars = `
     :root {
@@ -9907,7 +11035,9 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
   const containerPositionStyle = layout === "grid" ? "" : (hasPositioning ? "position:relative;min-height:40em;" : "");
 
   function itemLabel(o) {
-    return o.type === "label" ? o.text : o.fieldName;
+    if (o.type === "label") return o.text;
+    if (o.type === "repeatGroup") return "";
+    return o.fieldName;
   }
   function labelClass(o) {
     return o.type === "label" ? "label static-label" : "label field-label";
@@ -9939,6 +11069,9 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     return `<button type="button" class="${lc} entry-image-import-btn" title="${escapeHtml(pickTitle)}">${text}</button>`;
   }
   function editControlHtml(o, value) {
+    if (o.type === "repeatGroup") {
+      return buildRepeatGroupEditControlHtml(record, o);
+    }
     const escapedName = escapeHtml(o.fieldName);
     const escapedValue = escapeHtml(value);
     if (entryFieldIsImage(o)) {
@@ -10002,6 +11135,9 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     if (o.fieldType === "chart") {
       return `<textarea class="entry-field entry-field-textarea entry-field-chart-json" name="${escapedName}" placeholder='{"version":1,"chartType":"line","xAxis":{"title":"X","values":[]},"yAxis":{"title":"Y","values":[]}}' rows="12" spellcheck="false">${escapedValue}</textarea>`;
     }
+    if (o.fieldType === "repeat") {
+      return buildRepeatEditControlHtml(o, value);
+    }
     return `<textarea class="entry-field entry-field-textarea" name="${escapedName}" placeholder="${escapedName}" rows="3">${escapedValue}</textarea>`;
   }
 
@@ -10014,6 +11150,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       orderedItems
         .map((o) => {
           const isLabel = o.type === "label";
+          const isRepeatGroup = o.type === "repeatGroup";
           const gImg = fieldLayoutImageValueHeightConstraints(o, doc, true);
           const innerImgHeight = !!gImg.style;
           const blockStyle = blockOrCellStyleStackOuter(o, innerImgHeight);
@@ -10026,8 +11163,14 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
         </div>`;
           }
-          const value = record[o.fieldName] != null ? String(record[o.fieldName]) : "";
+          const value = o.type === "field" && o.fieldName ? (record[o.fieldName] != null ? String(record[o.fieldName]) : "") : "";
           const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
+          if (isRepeatGroup) {
+            return `
+        <div class="entry-field-block entry-repeat-group-block"${styleAttr}>
+          <div class="value entry-repeat-group-value${gImg.className}"${valueBoxStyle}>${editControlHtml(o, value)}</div>
+        </div>`;
+          }
           return `
         <div class="entry-field-block"${styleAttr}>
           ${editFieldLabelHtml(o)}
@@ -10043,6 +11186,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       orderedItems
         .map((o) => {
           const isLabel = o.type === "label";
+          const isRepeatGroup = o.type === "repeatGroup";
           const cellStyle = gridCellStyle(o);
           const styleAttr = cellStyle ? ' style="' + escapeHtml(cellStyle) + '"' : "";
           const labelOnlyClass = isLabel ? " entry-label-only" : "";
@@ -10053,9 +11197,15 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
           <span class="${lc}">${escapeHtml(itemLabel(o))}</span>
         </div>`;
           }
-          const value = record[o.fieldName] != null ? String(record[o.fieldName]) : "";
+          const value = o.type === "field" && o.fieldName ? (record[o.fieldName] != null ? String(record[o.fieldName]) : "") : "";
           const gImg = fieldLayoutImageValueHeightConstraints(o, doc, true);
           const valueBoxStyle = gImg.style ? ' style="' + escapeHtml(gImg.style) + '"' : "";
+          if (isRepeatGroup) {
+            return `
+        <div class="entry-grid-cell entry-repeat-group-block"${styleAttr}>
+          <div class="value entry-repeat-group-value${gImg.className}"${valueBoxStyle}>${editControlHtml(o, value)}</div>
+        </div>`;
+          }
           return `
         <div class="entry-grid-cell"${styleAttr}>
           ${editFieldLabelHtml(o)}
@@ -10068,12 +11218,20 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     const rows = orderedItems
       .map((o) => {
         const isLabel = o.type === "label";
+        const isRepeatGroup = o.type === "repeatGroup";
         const lc = labelClass(o);
         if (isLabel) {
           const w = o.width && typeof o.width === "string" && o.width.trim() ? ' style="width:' + escapeHtml(o.width.trim()) + '"' : "";
           return `
         <tr class="entry-label-row">
           <td class="${lc}" colspan="2"${w}>${escapeHtml(itemLabel(o))}</td>
+        </tr>`;
+        }
+        if (isRepeatGroup) {
+          const valueCellWidth = o.width && typeof o.width === "string" && o.width.trim() ? ' style="width:' + escapeHtml(o.width.trim()) + '"' : "";
+          return `
+        <tr class="entry-repeat-group-row">
+          <td class="value entry-repeat-group-value" colspan="2"${valueCellWidth}>${editControlHtml(o, "")}</td>
         </tr>`;
         }
         const value = record[o.fieldName] != null ? String(record[o.fieldName]) : "";
@@ -10212,6 +11370,17 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       box-sizing: border-box;
     }
     textarea.entry-field-chart-json { font-family: ui-monospace, "Cascadia Code", "Consolas", monospace; font-size: 0.8rem; line-height: 1.35; min-height: 8rem; }
+    .entry-repeat-wrap { width: 100%; min-width: 0; }
+    .entry-repeat-edit-table { width: 100%; border-collapse: collapse; }
+    .entry-repeat-edit-table th, .entry-repeat-edit-table td { border: 1px solid #30363d; padding: 0.35rem; vertical-align: top; }
+    .entry-repeat-edit-table th { color: var(--entry-label, #8b949e); font-size: 0.8rem; font-weight: 600; }
+    .entry-repeat-cell, .entry-repeat-cell-textarea { width: 100%; min-width: 6rem; box-sizing: border-box; padding: 0.35rem 0.5rem; background: var(--entry-field-bg-edit, #0d1117); border: 1px solid #30363d; border-radius: 4px; color: var(--entry-text-edit, #e6edf3); font: inherit; }
+    .entry-repeat-cell-textarea { min-height: 2.5rem; resize: vertical; }
+    .entry-repeat-cell-markdown { min-height: 6rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.875rem; line-height: 1.4; }
+    .entry-repeat-stack-row { border: 1px solid #30363d; border-radius: 6px; padding: 0.5rem 0.65rem; margin-bottom: 0.5rem; }
+    .entry-repeat-stack-row-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem; color: var(--entry-label, #8b949e); font-size: 0.8rem; }
+    .entry-repeat-stack-edit-field { display: block; margin-top: 0.35rem; }
+    .entry-repeat-actions { margin-top: 0.5rem; }
     .entry-view-grid { display: grid; gap: 1rem; }
     .entry-grid-cell { min-width: 0; }
     .entry-grid-cell .label { display: block; margin-bottom: 0.25rem; color: var(--entry-label, #8b949e); }
@@ -10467,6 +11636,139 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       el.addEventListener('input', function() { autoResizeTextarea(el); });
     });
 
+    function parseRepeatColumnsJson(raw) {
+      try {
+        const cols = JSON.parse(String(raw || '[]'));
+        return Array.isArray(cols) ? cols : [];
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function syncRepeatWrap(wrap) {
+      if (!wrap) return;
+      const columns = parseRepeatColumnsJson(wrap.getAttribute('data-repeat-columns') || '[]');
+      const rows = [];
+      wrap.querySelectorAll('.entry-repeat-row').forEach((rowEl) => {
+        const row = {};
+        rowEl.querySelectorAll('.entry-repeat-cell').forEach((cell) => {
+          const key = cell.getAttribute('data-col-key');
+          if (!key) return;
+          row[key] = cell && typeof cell.value === 'string' ? cell.value : '';
+        });
+        columns.forEach((c) => {
+          const key = c && c.key ? String(c.key) : '';
+          if (key && row[key] == null) row[key] = '';
+        });
+        rows.push(row);
+      });
+      const isGroup = wrap.getAttribute('data-repeat-group') === '1';
+      if (isGroup) {
+        columns.forEach(function(c) {
+          const key = c && c.key ? String(c.key) : '';
+          if (!key) return;
+          const hidden = wrap.querySelector('.entry-repeat-field-json[data-repeat-field="' + key + '"]');
+          if (!hidden) return;
+          const colRows = rows.map(function(r) { return r[key] != null ? String(r[key]) : ''; });
+          hidden.value = JSON.stringify({ version: 1, rows: colRows });
+        });
+        return;
+      }
+      const hidden = wrap.querySelector('.entry-repeat-json');
+      if (!hidden) return;
+      hidden.value = JSON.stringify({ version: 1, rows: rows });
+    }
+
+    function bindRepeatRow(wrap, rowEl) {
+      if (!wrap || !rowEl) return;
+      rowEl.querySelectorAll('.entry-repeat-cell').forEach((cell) => {
+        autoResizeRepeatCell(cell);
+        cell.addEventListener('input', function() {
+          autoResizeRepeatCell(cell);
+          syncRepeatWrap(wrap);
+        });
+      });
+      const removeBtn = rowEl.querySelector('.entry-repeat-remove');
+      if (removeBtn) {
+        removeBtn.addEventListener('click', function() {
+          rowEl.remove();
+          syncRepeatWrap(wrap);
+        });
+      }
+    }
+
+    function repeatCellInputHtml(c, val) {
+      const key = c && c.key ? String(c.key) : '';
+      const safeVal = String(val != null ? val : '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+      if (c && c.fieldType === 'url') {
+        return '<input type="url" class="entry-repeat-cell" data-col-key="' + key + '" data-col-type="url" value="' + safeVal + '">';
+      }
+      if (c && c.fieldType === 'markdown') {
+        return '<textarea class="entry-repeat-cell entry-repeat-cell-textarea entry-repeat-cell-markdown" data-col-key="' + key + '" data-col-type="markdown" rows="6" spellcheck="false">' + safeVal + '</textarea>';
+      }
+      return '<textarea class="entry-repeat-cell entry-repeat-cell-textarea" data-col-key="' + key + '" data-col-type="text" rows="2">' + safeVal + '</textarea>';
+    }
+
+    function autoResizeRepeatCell(el) {
+      if (!el || el.tagName !== 'TEXTAREA') return;
+      el.style.height = 'auto';
+      el.style.height = Math.max(el.scrollHeight, el.classList.contains('entry-repeat-cell-markdown') ? 96 : 40) + 'px';
+    }
+
+    function buildRepeatRowHtml(wrap, rowData) {
+      const mode = wrap.getAttribute('data-repeat-mode') || 'table';
+      const columns = parseRepeatColumnsJson(wrap.getAttribute('data-repeat-columns') || '[]');
+      const row = rowData && typeof rowData === 'object' ? rowData : {};
+      const idx = wrap.querySelectorAll('.entry-repeat-row').length;
+      if (mode === 'stack') {
+        const fields = columns.map(function(c) {
+          const key = c && c.key ? String(c.key) : '';
+          const label = c && c.label ? String(c.label) : key;
+          const val = row[key] != null ? String(row[key]) : '';
+          return '<label class="entry-repeat-stack-edit-field"><span class="entry-repeat-col-label">' + label + '</span>' + repeatCellInputHtml(c, val) + '</label>';
+        }).join('');
+        const div = document.createElement('div');
+        div.className = 'entry-repeat-row entry-repeat-stack-row';
+        div.setAttribute('data-row-index', String(idx));
+        div.innerHTML = '<div class="entry-repeat-stack-row-head"><span>#' + (idx + 1) + '</span><button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button></div>' + fields;
+        return div;
+      }
+      const tds = columns.map(function(c) {
+        const key = c && c.key ? String(c.key) : '';
+        const val = row[key] != null ? String(row[key]) : '';
+        return '<td>' + repeatCellInputHtml(c, val) + '</td>';
+      }).join('');
+      const tr = document.createElement('tr');
+      tr.className = 'entry-repeat-row';
+      tr.setAttribute('data-row-index', String(idx));
+      tr.innerHTML = tds + '<td><button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button></td>';
+      return tr;
+    }
+
+    function initRepeatFields() {
+      form.querySelectorAll('.entry-repeat-wrap').forEach(function(wrap) {
+        wrap.querySelectorAll('.entry-repeat-row').forEach(function(rowEl) { bindRepeatRow(wrap, rowEl); });
+        const addBtn = wrap.querySelector('.entry-repeat-add');
+        if (addBtn) {
+          addBtn.addEventListener('click', function() {
+            const mode = wrap.getAttribute('data-repeat-mode') || 'table';
+            const rowEl = buildRepeatRowHtml(wrap, {});
+            if (mode === 'stack') {
+              const body = wrap.querySelector('.entry-repeat-body');
+              if (body) body.appendChild(rowEl);
+            } else {
+              const tbody = wrap.querySelector('.entry-repeat-tbody');
+              if (tbody) tbody.appendChild(rowEl);
+            }
+            bindRepeatRow(wrap, rowEl);
+            syncRepeatWrap(wrap);
+          });
+        }
+        syncRepeatWrap(wrap);
+      });
+    }
+    initRepeatFields();
+
     form.onsubmit = async (e) => {
       e.preventDefault();
       msgEl.textContent = '';
@@ -10475,6 +11777,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       if (entryFormSelect) {
         data.entryFormId = entryFormSelect.value;
       }
+      form.querySelectorAll('.entry-repeat-wrap').forEach(function(wrap) { syncRepeatWrap(wrap); });
       orderedFieldNames.forEach((fn) => {
         const el = form.elements.namedItem(fn);
         const raw = el && typeof el.value === 'string' ? el.value : (el && el.value != null ? String(el.value) : '');
@@ -10671,7 +11974,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       ? records.map((rec) => {
           const cells = fieldNames.map((fn, colIdx) => {
             const val = rec[fn];
-            const text = val != null ? String(val) : "";
+            let text = summarizeRepeatFieldValueForList(doc, fn, val);
             const escaped = escapeHtml(text);
             const bodyTextCls = (typeof fn === "string" && fn.trim().toLowerCase() === "bodytext") ? " col-bodytext" : "";
             const mobileCls = (mobileVisibleSet.has(fn) ? " col-mobile-visible" : " col-mobile-hidden") + bodyTextCls;
@@ -12196,7 +13499,7 @@ function renderEditFlowPage(doc, err, appUi) {
   </div>
   <h1>${title}</h1>
   <p class="sub">Steps run in order. Log = passthrough (data unchanged, written to flow log). API and Local DB use the Param column (API doc ID or profile ID).</p>
-  <p class="sub" style="margin-top:0.5rem; padding:0.5rem; background:var(--app-table-bg, #161b22); border-radius:6px; border-left:3px solid var(--app-link, #58a6ff);"><strong>Persistence:</strong> The flow writes or deletes in the database when it includes one of: <em>Send to Local DB</em>, <em>Update current document</em>, <em>Create new document in this profile</em>, or <em>Delete old entries in this profile</em> (Param e.g. <code>7d</code> or <code>2w</code> — rows with <code>createdAt</code> older than that age, capped per run). If none of these are present, the result is not saved (&quot;fire and forget&quot;). Log steps are neutral.</p>
+  <p class="sub" style="margin-top:0.5rem; padding:0.5rem; background:var(--app-table-bg, #161b22); border-radius:6px; border-left:3px solid var(--app-link, #58a6ff);"><strong>Persistence:</strong> The flow writes or deletes in the database when it includes one of: <em>Send to Local DB</em>, <em>Update current document</em>, <em>Create new document in this profile</em>, <em>Append repeat row</em> (when a current entry exists), or <em>Delete old entries in this profile</em> (Param e.g. <code>7d</code> or <code>2w</code> — rows with <code>createdAt</code> older than that age, capped per run). If none of these are present, the result is not saved (&quot;fire and forget&quot;). Log steps are neutral.</p>
   ${errHtml}
   <form id="flow-form">
     ${revInput}
@@ -12243,6 +13546,8 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'create'
           : (step && step.target === 'purgeOld')
           ? 'purgeOld'
+          : (step && step.target === 'appendRepeat')
+          ? 'appendRepeat'
           : 'log';
       const label = (step && step.label != null) ? String(step.label).replace(/"/g, '&quot;') : '';
       const param = (step && step.param != null) ? String(step.param).replace(/"/g, '&quot;') : '';
@@ -12261,6 +13566,8 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'Not used'
           : target === 'purgeOld'
           ? 'Age: 7d or 2w (days/weeks)'
+          : target === 'appendRepeat'
+          ? 'Profile repeat fields (e.g. PROMPT,RESPONSE)'
           : '—';
       tr.innerHTML =
         '<td class="step-num"></td>' +
@@ -12273,6 +13580,7 @@ function renderEditFlowPage(doc, err, appUi) {
         '<option value="update"' + (target === 'update' ? ' selected' : '') + '>Update current document</option>' +
         '<option value="create"' + (target === 'create' ? ' selected' : '') + '>Create new document in this profile</option>' +
         '<option value="purgeOld"' + (target === 'purgeOld' ? ' selected' : '') + '>Delete old entries in this profile</option>' +
+        '<option value="appendRepeat"' + (target === 'appendRepeat' ? ' selected' : '') + '>Append repeat row</option>' +
         '</select></td>' +
         '<td><input type="text" class="step-label" placeholder="Step label" value="' + label + '"></td>' +
         '<td><input type="text" class="step-param" placeholder="' + paramPlaceholder + '" value="' + param + '"></td>' +
@@ -12297,6 +13605,8 @@ function renderEditFlowPage(doc, err, appUi) {
             stepParam.placeholder = 'Not used';
           } else if (this.value === 'purgeOld') {
             stepParam.placeholder = 'Age: 7d or 2w (days/weeks)';
+          } else if (this.value === 'appendRepeat') {
+            stepParam.placeholder = 'Profile repeat fields (e.g. PROMPT,RESPONSE)';
           } else {
             stepParam.placeholder = '—';
           }
@@ -13392,13 +14702,13 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef, prefillU
     </div>
     <div id="apiUserPassRefNotice" class="msg" style="margin-top:0.25rem;" aria-live="polite"></div>
     </div>
-    <label for="template">Template <span class="sub">(optional) For POST/PUT/PATCH: request body with #fieldName# placeholders. For GET: use only if you need a dynamic URL or body-like URL; otherwise leave empty and set the URL above.</span></label>
+    <label for="template">Template <span class="sub">(optional) For POST/PUT/PATCH: request body with #fieldName# placeholders. Repeat fields: #fieldName(FIRST|LAST|ALL|n)# (n is 1-based row). Dialog history: wrap prior turns in <code>#REPEAT(N)# … #END REPEAT(N)#</code> using <code>#PROMPT(N)#</code> / <code>#RESPONSE(N)#</code> inside (loops rows 1 .. last−1), then <code>#PROMPT(LAST)#</code> for the current question. For GET: use only if you need a dynamic URL or body-like URL; otherwise leave empty and set the URL above.</span></label>
     <textarea id="template" name="template" placeholder='e.g. {"query":"#customer#"}' rows="4" style="width:100%;max-width:28rem;font-family:monospace;">${templateVal}</textarea>
     <label class="checkbox-row" for="getQueryFromEntry" style="display:flex;align-items:flex-start;gap:0.5rem;margin-top:0.75rem;max-width:32rem;color:var(--app-label, #8b949e);cursor:pointer;">
       <input type="checkbox" id="getQueryFromEntry" name="getQueryFromEntry" style="width:auto;max-width:none;margin-top:0.2rem;flex-shrink:0;"${getQueryFromEntryChecked ? " checked" : ""}>
       <span>Append entry fields as GET query parameters when Template is empty <span class="sub">(older behaviour; off for fixed URLs such as FRITZ!Box <code>/api/v0/...</code> to avoid very long URLs)</span></span>
     </label>
-    <label for="responseField">Response field <span class="sub">(optional) Elenko document field name where the raw API response body will be stored when updating the same entry)</span></label>
+    <label for="responseField">Response field <span class="sub">(optional) Elenko document field name where the raw API response body will be stored when updating the same entry. For profile fields of type Repeat, the value is written into the last dialog row (same index as the longest repeat field, e.g. matching the last PROMPT).</span></label>
     <input type="text" id="responseField" name="responseField" placeholder="e.g. apiResponse" value="${responseFieldVal}">
     <label for="responseStart">Response start <span class="sub">(optional) Character sequence that marks the start of the useful text; everything before and including it is removed)</span></label>
     <input type="text" id="responseStart" name="responseStart" placeholder='e.g. "content":"' value="${responseStartVal}" style="font-family:monospace;">
@@ -13875,7 +15185,8 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
     ? fieldLayout
         .map(
           (item, idx) => {
-            const fieldOrLabel = item.fieldName || item.labelId || "";
+            const isRepeatGroup = isRepeatGroupLayoutItem(item);
+            const fieldOrLabel = isRepeatGroup ? "" : item.fieldName || item.labelId || "";
             const xVal = item.x != null ? String(item.x) : "";
             const yVal = item.y != null ? String(item.y) : "";
             const hVal = item.height != null ? String(item.height) : "";
@@ -13888,10 +15199,28 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
                 ? "image"
                 : item.fieldType === "chart"
                 ? "chart"
+                : item.fieldType === "repeat"
+                ? "repeat"
                 : "text";
-            const typeSelect = item.fieldName
-              ? `<select class="fl-type"><option value="text"${fieldTypeVal === "text" ? " selected" : ""}>Text</option><option value="markdown"${fieldTypeVal === "markdown" ? " selected" : ""}>Markdown</option><option value="url"${fieldTypeVal === "url" ? " selected" : ""}>URL</option><option value="image"${fieldTypeVal === "image" ? " selected" : ""}>Image</option><option value="chart"${fieldTypeVal === "chart" ? " selected" : ""}>Chart</option></select>`
-              : "<span class=\"sub\">—</span>";
+            const repeatModeVal = item.repeatMode === "stack" ? "stack" : "table";
+            const repeatAddLabelVal =
+              item.fieldType === "repeat" && typeof item.repeatAddLabel === "string" && item.repeatAddLabel.trim()
+                ? item.repeatAddLabel.trim()
+                : "Add row";
+            const repeatConfigHtml =
+              fieldTypeVal === "repeat" && (item.fieldName || isRepeatGroup)
+                ? buildRepeatFormDesignerConfigHtml({
+                    visible: true,
+                    repeatMode: repeatModeVal,
+                    repeatAddLabel: repeatAddLabelVal,
+                    repeatColumns: item.repeatColumns,
+                    fieldName: item.fieldName || "",
+                  })
+                : "";
+            const typeSelect =
+              item.fieldName || isRepeatGroup
+                ? `<select class="fl-type"><option value="text"${fieldTypeVal === "text" ? " selected" : ""}>Text</option><option value="markdown"${fieldTypeVal === "markdown" ? " selected" : ""}>Markdown</option><option value="url"${fieldTypeVal === "url" ? " selected" : ""}>URL</option><option value="image"${fieldTypeVal === "image" ? " selected" : ""}>Image</option><option value="chart"${fieldTypeVal === "chart" ? " selected" : ""}>Chart</option><option value="repeat"${fieldTypeVal === "repeat" ? " selected" : ""}>Repeat group</option></select>${repeatConfigHtml}`
+                : "<span class=\"sub\">—</span>";
             return `
         <tr class="field-layout-row">
           <td><input type="text" class="fl-field" placeholder="Field name or label id" value="${escapeHtml(fieldOrLabel)}"></td>
@@ -13948,8 +15277,14 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
     .btn-remove:hover { color: #ff7b72; }
     .msg.err { background: #3d1f1f; color: #f85149; padding: 0.5rem; border-radius: 6px; margin: 1rem 0; }
     .field-layout-table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
-    .field-layout-table td { padding: 0.25rem; }
+    .field-layout-table td { padding: 0.25rem; vertical-align: top; }
     .field-layout-table input { width: 100%; }
+    .fl-repeat-config { margin-top: 0.35rem; min-width: 14rem; }
+    .fl-repeat-sub-label { font-size: 0.75rem; margin-top: 0.35rem; display: block; color: var(--app-label, #8b949e); font-weight: 600; }
+    .fl-repeat-cols-table { width: 100%; border-collapse: collapse; margin-top: 0.25rem; font-size: 0.8rem; }
+    .fl-repeat-cols-table th, .fl-repeat-cols-table td { padding: 0.2rem; border-bottom: 1px solid var(--app-table-border, #30363d); }
+    .fl-repeat-cols-table th { color: var(--app-label, #8b949e); font-weight: 600; text-align: left; }
+    .fl-repeat-cols-table input, .fl-repeat-cols-table select { font-size: 0.8rem; padding: 0.25rem; }
     .el-theme-colours { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem; width: 100%; }
     .el-theme-row {
       display: grid;
@@ -14038,7 +15373,7 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
     </table>
     <button type="button" class="btn btn-secondary" id="add-label" style="margin-top:0.5rem;">+ Add label</button>
     <label class="field-list-label" style="margin-top:1.5rem;">Field layout (optional: field name or label id, order, type, width, position)</label>
-    <p class="sub" style="margin-top:0;">Use a profile field name or a label id from above. Type: Text (plain), Markdown (rendered in view mode), URL (clickable link in view mode), or Image (single image per field; value is the attachment filename). On edit entry, the field name is the button that opens the file picker. Each upload is limited to ${Math.round(MAX_ENTRY_IMAGE_BYTES / 1024)} KiB before processing (an app policy to keep memory and attachments bounded; not a CouchDB hard limit). Administrators can raise or lower it with the environment variable <code>MAX_ENTRY_IMAGE_BYTES</code> (bytes). For Image fields, the layout Width column also sets the maximum long edge in pixels when scaling on upload (e.g. <code>400px</code>, <code>32ch</code>, or <code>50%</code> of the default screen cap). Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning. In <strong>Grid</strong> layout, Width sets the column size. In <strong>Stack</strong> layout, Height on image/file-preview fields sizes the value box (and no longer forces <code>position:absolute</code> when only Height is set). <strong>Height (em)</strong> limits the box around those fields in both layouts (single-entry view and edit).</p>
+    <p class="sub" style="margin-top:0;">Use a profile field name, a label id from above, or leave the first column empty with type <strong>Repeat group</strong> (pairs profile repeat fields by row index — column keys must match profile field names such as PROMPT and RESPONSE). Type: Text, Markdown, URL, Image, Chart, or Repeat group. For a section heading only, add a static label row (e.g. id <code>dialog</code>, text Dialog) above the repeat group row. On edit entry, the field name is the button that opens the file picker. Each upload is limited to ${Math.round(MAX_ENTRY_IMAGE_BYTES / 1024)} KiB before processing (an app policy to keep memory and attachments bounded; not a CouchDB hard limit). Administrators can raise or lower it with the environment variable <code>MAX_ENTRY_IMAGE_BYTES</code> (bytes). For Image fields, the layout Width column also sets the maximum long edge in pixels when scaling on upload (e.g. <code>400px</code>, <code>32ch</code>, or <code>50%</code> of the default screen cap). Leave empty to use profile field order. Width: e.g. 50%, 1fr, or 40ch. Only Stack supports X (ch), Y (em), and Height (em) for positioning. In <strong>Grid</strong> layout, Width sets the column size. In <strong>Stack</strong> layout, Height on image/file-preview fields sizes the value box (and no longer forces <code>position:absolute</code> when only Height is set). <strong>Height (em)</strong> limits the box around those fields in both layouts (single-entry view and edit).</p>
     <table class="field-layout-table">
       <thead><tr><th>Field name or label id</th><th>Order</th><th>Type</th><th>Width</th><th>X (ch)</th><th>Y (em)</th><th>Height (em)</th><th></th></tr></thead>
       <tbody id="field-layout-tbody">${fieldLayoutRows}
@@ -14185,6 +15520,8 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
           ? "image"
           : fieldType === "chart"
           ? "chart"
+          : fieldType === "repeat"
+          ? "repeat"
           : "text";
       tr.innerHTML =
         '<td><input type="text" class="fl-field" placeholder="Field name or label id" value="' +
@@ -14201,7 +15538,11 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
         (typeVal === "image" ? " selected" : "") +
         '>Image</option><option value="chart"' +
         (typeVal === "chart" ? " selected" : "") +
-        '>Chart</option></select></td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' +
+        '>Chart</option><option value="repeat"' +
+        (typeVal === "repeat" ? " selected" : "") +
+        '>Repeat group</option></select>' +
+        repeatConfigPanelHtml({ visible: typeVal === "repeat", fieldName: fieldName || "" }) +
+        '</td><td><input type="text" class="fl-width" placeholder="50%, 1fr, or 40ch" value="' +
         (width || "100%").replace(/"/g, "&quot;") +
         '"></td><td><input type="number" class="fl-x" step="any" placeholder="—"></td><td><input type="number" class="fl-y" step="any" placeholder="—"></td><td><input type="number" class="fl-height" step="any" placeholder="—" min="0"></td><td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
       tr.querySelector('.fl-x').value = xv;
@@ -14211,7 +15552,95 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
       if (removeBtn) {
         removeBtn.onclick = () => tr.remove();
       }
+      const typeEl = tr.querySelector('.fl-type');
+      if (typeEl) {
+        typeEl.addEventListener('change', () => toggleRepeatConfig(tr));
+        toggleRepeatConfig(tr);
+      }
+      wireRepeatConfigPanel(tr);
       tbody.appendChild(tr);
+    }
+
+    const defaultRepeatColumnsForDesigner = [
+      { key: 'PROMPT', label: 'Prompt', fieldType: 'text' },
+      { key: 'RESPONSE', label: 'Response', fieldType: 'text' },
+    ];
+
+    function repeatColRowInnerHtml(col) {
+      col = col || { key: '', label: '', fieldType: 'text' };
+      const key = (col.key || '').replace(/"/g, '&quot;');
+      const label = (col.label || '').replace(/"/g, '&quot;');
+      const ft = col.fieldType === 'markdown' ? 'markdown' : col.fieldType === 'url' ? 'url' : 'text';
+      return '<td><input type="text" class="fl-repeat-col-key" value="' + key + '" placeholder="PROMPT"></td>' +
+        '<td><input type="text" class="fl-repeat-col-label" value="' + label + '" placeholder="Label"></td>' +
+        '<td><select class="fl-repeat-col-type">' +
+        '<option value="text"' + (ft === 'text' ? ' selected' : '') + '>Text</option>' +
+        '<option value="markdown"' + (ft === 'markdown' ? ' selected' : '') + '>Markdown</option>' +
+        '<option value="url"' + (ft === 'url' ? ' selected' : '') + '>URL</option>' +
+        '</select></td>' +
+        '<td><button type="button" class="btn btn-remove fl-repeat-col-remove" aria-label="Remove column">Remove</button></td>';
+    }
+
+    function repeatConfigPanelHtml(opts) {
+      opts = opts || {};
+      const visible = !!opts.visible;
+      const addLabel = (opts.repeatAddLabel || 'Add row').replace(/"/g, '&quot;');
+      const mode = opts.repeatMode === 'stack' ? 'stack' : 'table';
+      const cols = Array.isArray(opts.repeatColumns) && opts.repeatColumns.length > 0 ? opts.repeatColumns : defaultRepeatColumnsForDesigner.slice();
+      const colRows = cols.map(function(c) {
+        return '<tr class="fl-repeat-col-row">' + repeatColRowInnerHtml(c) + '</tr>';
+      }).join('');
+      return '<div class="fl-repeat-config"' + (visible ? '' : ' style="display:none;"') + '>' +
+        '<label class="fl-repeat-sub-label">Repeat layout</label>' +
+        '<select class="fl-repeat-mode"><option value="table"' + (mode === 'table' ? ' selected' : '') + '>Table</option><option value="stack"' + (mode === 'stack' ? ' selected' : '') + '>Vertical stack</option></select>' +
+        '<label class="fl-repeat-sub-label">Add button label</label>' +
+        '<input type="text" class="fl-repeat-add-label" value="' + addLabel + '" placeholder="Add row">' +
+        '<label class="fl-repeat-sub-label">Profile fields (linked by row index)</label>' +
+        '<table class="fl-repeat-cols-table"><thead><tr><th>Profile field</th><th>Label</th><th>Type</th><th></th></tr></thead><tbody class="fl-repeat-cols-tbody">' + colRows + '</tbody></table>' +
+        '<button type="button" class="btn btn-secondary fl-repeat-col-add" style="margin-top:0.35rem;">+ Add column</button>' +
+        '</div>';
+    }
+
+    function wireRepeatColRow(colTr) {
+      const removeBtn = colTr && colTr.querySelector('.fl-repeat-col-remove');
+      if (removeBtn) removeBtn.onclick = function() { colTr.remove(); };
+    }
+
+    function wireRepeatConfigPanel(row) {
+      const cfg = row && row.querySelector('.fl-repeat-config');
+      if (!cfg) return;
+      const addColBtn = cfg.querySelector('.fl-repeat-col-add');
+      const tbody = cfg.querySelector('.fl-repeat-cols-tbody');
+      if (addColBtn && tbody) {
+        addColBtn.onclick = function() {
+          const tr = document.createElement('tr');
+          tr.className = 'fl-repeat-col-row';
+          tr.innerHTML = repeatColRowInnerHtml({ key: '', label: '', fieldType: 'text' });
+          wireRepeatColRow(tr);
+          tbody.appendChild(tr);
+        };
+      }
+      cfg.querySelectorAll('.fl-repeat-col-row').forEach(wireRepeatColRow);
+    }
+
+    function collectRepeatColumnsFromLayoutRow(tr) {
+      const rows = tr.querySelectorAll('.fl-repeat-col-row');
+      return Array.from(rows).map(function(colTr) {
+        const key = (colTr.querySelector('.fl-repeat-col-key') && colTr.querySelector('.fl-repeat-col-key').value.trim()) || '';
+        const labelRaw = colTr.querySelector('.fl-repeat-col-label') && colTr.querySelector('.fl-repeat-col-label').value.trim();
+        const label = labelRaw || key;
+        const typeEl = colTr.querySelector('.fl-repeat-col-type');
+        const fieldType = typeEl && (typeEl.value === 'markdown' || typeEl.value === 'url') ? typeEl.value : 'text';
+        if (!key || !/^[\\w.-]+$/.test(key)) return null;
+        return { key: key, label: label, fieldType: fieldType };
+      }).filter(Boolean);
+    }
+
+    function toggleRepeatConfig(row) {
+      const typeEl = row && row.querySelector('.fl-type');
+      const cfg = row && row.querySelector('.fl-repeat-config');
+      if (!cfg) return;
+      cfg.style.display = typeEl && typeEl.value === 'repeat' ? 'block' : 'none';
     }
     // Wire remove handlers for any initial field layout rows rendered from the server
     Array.from(tbody.querySelectorAll('.field-layout-row .btn-remove')).forEach((btn) => {
@@ -14219,6 +15648,14 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
         const row = btn.closest('.field-layout-row');
         if (row) row.remove();
       };
+    });
+    Array.from(tbody.querySelectorAll('.field-layout-row')).forEach((row) => {
+      const typeEl = row.querySelector('.fl-type');
+      if (typeEl) {
+        typeEl.addEventListener('change', () => toggleRepeatConfig(row));
+        toggleRepeatConfig(row);
+      }
+      wireRepeatConfigPanel(row);
     });
     addBtn.onclick = () => addRow('', tbody.querySelectorAll('.field-layout-row').length, '100%', '', '', '', 'text');
 
@@ -14279,7 +15716,10 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
       const parseNumInput = (el) => { const v = el && el.value; const n = Number(v); return (v !== '' && Number.isFinite(n)) ? n : undefined; };
       const fieldLayout = Array.from(rows).map((tr, i) => {
         const firstCol = (tr.querySelector('.fl-field') && tr.querySelector('.fl-field').value.trim()) || '';
-        if (!firstCol) return null;
+        const typeEl = tr.querySelector('.fl-type');
+        const typeRaw = typeEl ? typeEl.value : "text";
+        const isRepeatGroupRow = typeRaw === "repeat" && !firstCol;
+        if (!firstCol && !isRepeatGroupRow) return null;
         const item = {
           order: parseInt(tr.querySelector('.fl-order') && tr.querySelector('.fl-order').value, 10) || i,
           width: (tr.querySelector('.fl-width') && tr.querySelector('.fl-width').value.trim()) || '100%'
@@ -14290,16 +15730,30 @@ function renderEntryFormPage(doc, rev, err, flows, queries, appUi) {
         if (x != null) item.x = x;
         if (y != null) item.y = y;
         if (h != null) item.height = h;
-        if (labelIds.has(firstCol)) item.labelId = firstCol; else {
+        if (firstCol && labelIds.has(firstCol)) {
+          item.labelId = firstCol;
+        } else if (typeRaw === "repeat") {
+          item.fieldType = "repeat";
+          if (firstCol) item.fieldName = firstCol;
+          else item.repeatGroup = true;
+          const modeEl = tr.querySelector(".fl-repeat-mode");
+          item.repeatMode = modeEl && modeEl.value === "stack" ? "stack" : "table";
+          const addLabelEl = tr.querySelector(".fl-repeat-add-label");
+          item.repeatAddLabel =
+            addLabelEl && typeof addLabelEl.value === "string" && addLabelEl.value.trim()
+              ? addLabelEl.value.trim()
+              : "Add row";
+          const parsedCols = collectRepeatColumnsFromLayoutRow(tr);
+          item.repeatColumns =
+            parsedCols.length > 0 ? parsedCols : defaultRepeatColumnsForDesigner.slice();
+        } else {
           item.fieldName = firstCol;
-          const typeEl = tr.querySelector('.fl-type');
           item.fieldType =
-            typeEl &&
-            (typeEl.value === "markdown" ||
-              typeEl.value === "url" ||
-              typeEl.value === "image" ||
-              typeEl.value === "chart")
-              ? typeEl.value
+            typeRaw === "markdown" ||
+            typeRaw === "url" ||
+            typeRaw === "image" ||
+            typeRaw === "chart"
+              ? typeRaw
               : "text";
         }
         return item;
@@ -15206,15 +16660,16 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
       const selectOpts = defaultSourceOptions.map(function(opt) {
         return '<option value="' + esc(opt.value) + '"' + (defaultSource === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
       }).join('');
-      const kind = kindVal === 'file' ? 'file' : 'text';
+      const kind = kindVal === 'file' ? 'file' : kindVal === 'repeat' ? 'repeat' : 'text';
       const kindOpts =
         '<option value="text"' + (kind === 'text' ? ' selected' : '') + '>Text</option>' +
+        '<option value="repeat"' + (kind === 'repeat' ? ' selected' : '') + '>Repeat</option>' +
         '<option value="file"' + (kind === 'file' ? ' selected' : '') + '>File</option>';
       const disp = displayVal && typeof displayVal === 'string' ? displayVal : 'auto';
       const dispOpts = displayOptions.map(function(opt) {
         return '<option value="' + esc(opt.value) + '"' + (disp === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
       }).join('');
-      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + esc(value) + '"><select name="fieldKinds" title="Field type: text or file">' + kindOpts + '</select><select name="fieldDefaultSources" title="Default for new entries">' + selectOpts + '</select><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
+      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + esc(value) + '"><select name="fieldKinds" title="Field type: text, repeat, or file">' + kindOpts + '</select><select name="fieldDefaultSources" title="Default for new entries">' + selectOpts + '</select><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
       row.querySelector('.btn-remove').onclick = () => row.remove();
       fieldList.appendChild(row);
     }
@@ -15391,7 +16846,8 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
         const name = input ? input.value.trim() : '';
         if (name) {
           fieldNames.push(name);
-          fieldKinds.push(kindSel && kindSel.value === 'file' ? 'file' : 'text');
+          const kv = kindSel && kindSel.value ? kindSel.value : 'text';
+          fieldKinds.push(kv === 'file' ? 'file' : kv === 'repeat' ? 'repeat' : 'text');
           fieldDefaultSources.push(select ? select.value : '');
           fieldDisplay.push(dispSel ? dispSel.value : 'auto');
         }
@@ -15607,15 +17063,16 @@ function renderCreateProfilePage(appUi) {
       const row = document.createElement('div');
       row.className = 'field-row';
       const esc = (v) => (v || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-      const kind = kindVal === 'file' ? 'file' : 'text';
+      const kind = kindVal === 'file' ? 'file' : kindVal === 'repeat' ? 'repeat' : 'text';
       const kindOpts =
         '<option value="text"' + (kind === 'text' ? ' selected' : '') + '>Text</option>' +
+        '<option value="repeat"' + (kind === 'repeat' ? ' selected' : '') + '>Repeat</option>' +
         '<option value="file"' + (kind === 'file' ? ' selected' : '') + '>File</option>';
       const disp = displayVal && typeof displayVal === 'string' ? displayVal : 'auto';
       const dispOpts = displayOptions.map(function(opt) {
         return '<option value="' + esc(opt.value) + '"' + (disp === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>';
       }).join('');
-      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + (value || '').replace(/"/g, '&quot;') + '"><select name="fieldKinds" title="Field type: text or file">' + kindOpts + '</select><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
+      row.innerHTML = '<input type="text" name="fieldNames" placeholder="Field name" value="' + (value || '').replace(/"/g, '&quot;') + '"><select name="fieldKinds" title="Field type: text, repeat, or file">' + kindOpts + '</select><select name="fieldDisplay" title="Desktop list column width">' + dispOpts + '</select><button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
       row.querySelector('.btn-remove').onclick = () => row.remove();
       fieldList.appendChild(row);
     }
@@ -15710,7 +17167,8 @@ function renderCreateProfilePage(appUi) {
         const fn = input ? input.value.trim() : '';
         if (fn) {
           fieldNames.push(fn);
-          fieldKinds.push(kindSel && kindSel.value === 'file' ? 'file' : 'text');
+          const kv = kindSel && kindSel.value ? kindSel.value : 'text';
+          fieldKinds.push(kv === 'file' ? 'file' : kv === 'repeat' ? 'repeat' : 'text');
           fieldDisplay.push(dispSel ? dispSel.value : 'auto');
         }
       });
