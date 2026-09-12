@@ -64,6 +64,8 @@ const CONFIG_BACKUPS_DIR = path.join(PUBLIC_DIR, "backups");
 const MAX_ENTRIES_PER_PROFILE = 500000;
 /** Max elenko_records deleted in one flow "purge old" step (safety cap). */
 const PURGE_OLD_MAX_DELETE = 500;
+const FLOW_REFRESH_DEFAULT_TIMEOUT_MS = 15000;
+const FLOW_REFRESH_POLL_INTERVAL_MS = 5000;
 const PURGE_OLD_MS_PER_DAY = 24 * 60 * 60 * 1000;
 const ENTRIES_PAGE_SIZE = 25;
 const ENTRIES_PAGE_SIZE_MIN = 5;
@@ -586,6 +588,46 @@ function applyPlainValueToProfileField(profileDoc, record, fieldName, incomingVa
   return serializeProfileRepeatScalarValue(rows);
 }
 
+/** Write plain text into a specific repeat row (view-mode draft edits). */
+function applyPlainValueToProfileFieldAtRow(profileDoc, record, fieldName, rowIndex, incomingValue) {
+  if (!profileDoc || !record || rowIndex < 0) {
+    return incomingValue != null ? String(incomingValue) : "";
+  }
+  if (!shouldApplyRepeatScalarCellWrite(profileDoc, record, fieldName, incomingValue)) {
+    return incomingValue != null ? String(incomingValue) : "";
+  }
+  const cellValue = incomingValue != null ? String(incomingValue) : "";
+  let maxRows = maxRepeatScalarRowCount(record, profileDoc);
+  maxRows = Math.max(maxRows, rowIndex + 1);
+  const targetParsed = parseProfileRepeatScalarValue(record[fieldName]);
+  let rows = targetParsed.ok ? [...targetParsed.rows] : [];
+  while (rows.length < maxRows) rows.push("");
+  rows[rowIndex] = cellValue;
+  return serializeProfileRepeatScalarValue(rows);
+}
+
+function getDraftRepeatRowIndex(record) {
+  if (!record || record.draftRepeatRowIndex == null || record.draftRepeatRowIndex === "") return -1;
+  const idx = parseInt(record.draftRepeatRowIndex, 10);
+  return Number.isFinite(idx) && idx >= 0 ? idx : -1;
+}
+
+function mergeDraftRepeatEditsIntoDataset(context, profileDoc, edits) {
+  if (!context || !profileDoc || !edits || typeof edits !== "object" || Array.isArray(edits)) return;
+  const dataset = context.dataset && typeof context.dataset === "object" ? { ...context.dataset } : {};
+  const draftIdx = getDraftRepeatRowIndex(dataset);
+  if (draftIdx < 0) return;
+  const patch = { ...dataset };
+  for (const key of Object.keys(edits)) {
+    if (key === "rowIndex") continue;
+    const val = edits[key];
+    if (isProfileRepeatField(profileDoc, key) || profileDialogRepeatFieldNames(profileDoc, patch).includes(key)) {
+      patch[key] = applyPlainValueToProfileFieldAtRow(profileDoc, patch, key, draftIdx, val);
+    }
+  }
+  context.dataset = patch;
+}
+
 function mergeRepeatGroupRowsFromRecord(record, columns) {
   const cols = normalizeRepeatColumns(columns);
   if (cols.length === 0) return [];
@@ -776,7 +818,7 @@ function getRepeatGroupLayoutFromForm(formDoc) {
   return null;
 }
 
-function buildRepeatRowFromDataset(columns, dataset) {
+function buildRepeatRowFromDataset(columns, dataset, profileDoc) {
   const row = {};
   const explicit = dataset && dataset._repeatRow;
   if (explicit && typeof explicit === "object" && !Array.isArray(explicit)) {
@@ -786,9 +828,76 @@ function buildRepeatRowFromDataset(columns, dataset) {
     return row;
   }
   for (const c of columns) {
-    row[c.key] = dataset && dataset[c.key] != null ? String(dataset[c.key]) : "";
+    const raw = dataset && dataset[c.key] != null ? String(dataset[c.key]) : "";
+    if (profileDoc && isProfileRepeatField(profileDoc, c.key)) {
+      row[c.key] = shouldMergePlainTextIntoRepeatField(raw) ? raw : "";
+    } else if (isProfileRepeatScalarJson(raw)) {
+      row[c.key] = "";
+    } else {
+      row[c.key] = raw;
+    }
   }
   return row;
+}
+
+async function loadEntryFormDocForContext(dbInstance, context) {
+  if (!dbInstance || !context || !context.profileId) return null;
+  let profileDoc = context.profileDoc;
+  if (!profileDoc) {
+    try {
+      const pd = await dbInstance.get(context.profileId);
+      if (pd && pd.type === "elenko_profile") {
+        profileDoc = pd;
+        context.profileDoc = pd;
+      }
+    } catch (_) {}
+  }
+  let record = context.dataset;
+  if (context.entryId && (!record || record._id !== context.entryId)) {
+    try {
+      record = await dbInstance.get(context.entryId);
+    } catch (_) {}
+  }
+  const formIds = getProfileEntryFormIds(profileDoc);
+  const formId = record && record.entryFormId ? String(record.entryFormId).trim() : formIds[0] || "";
+  if (!formId) return null;
+  try {
+    const formDoc = await dbInstance.get(formId);
+    return formDoc && formDoc.type === "elenko_entry_form" ? formDoc : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Infer PROMPT,RESPONSE (etc.) when the flow step Param is empty. */
+async function resolveAppendRepeatParam(dbInstance, context, param) {
+  const trimmed = typeof param === "string" ? param.trim() : "";
+  if (trimmed) return trimmed;
+
+  let profileDoc = context.profileDoc;
+  if (!profileDoc && dbInstance && context.profileId) {
+    try {
+      const pd = await dbInstance.get(context.profileId);
+      if (pd && pd.type === "elenko_profile") {
+        profileDoc = pd;
+        context.profileDoc = pd;
+      }
+    } catch (_) {}
+  }
+
+  const fromProfile = profileDoc ? getProfileRepeatFieldNames(profileDoc) : [];
+  if (fromProfile.length > 0) return fromProfile.join(",");
+
+  const formDoc = await loadEntryFormDocForContext(dbInstance, context);
+  const groupItem = getRepeatGroupLayoutFromForm(formDoc);
+  if (groupItem) {
+    const keys = normalizeRepeatColumns(groupItem.repeatColumns)
+      .map((c) => c.key)
+      .filter(Boolean);
+    if (keys.length > 0) return keys.join(",");
+  }
+
+  return "";
 }
 
 function getRepeatLayoutItemFromForm(formDoc, fieldName) {
@@ -885,7 +994,14 @@ async function appendRepeatGroupRowToContext(dbInstance, context, profileFieldNa
       existing = await dbInstance.get(context.entryId);
     } catch (_) {}
   }
-  const newRow = buildRepeatRowFromDataset(cols, dataset);
+  let profileDoc = context.profileDoc;
+  if (!profileDoc && dbInstance && context.profileId) {
+    try {
+      const pd = await dbInstance.get(context.profileId);
+      if (pd && pd.type === "elenko_profile") profileDoc = pd;
+    } catch (_) {}
+  }
+  const newRow = buildRepeatRowFromDataset(cols, dataset, profileDoc);
   let rowCount = 0;
   for (const fn of fieldNames) {
     let stored = dataset[fn] != null ? String(dataset[fn]) : "";
@@ -903,12 +1019,14 @@ async function appendRepeatGroupRowToContext(dbInstance, context, profileFieldNa
     ...dataset,
     _lastAppendRepeatFields: fieldNames,
     _lastAppendRepeatRowCount: rowCount,
+    draftRepeatRowIndex: rowCount > 0 ? rowCount - 1 : 0,
   };
   return { fieldNames, newRow, rowCount };
 }
 
 async function appendRepeatRowToContext(dbInstance, context, param) {
-  const { profileFieldNames, columnKeys, legacyFieldName } = parseAppendRepeatParam(param);
+  const resolvedParam = await resolveAppendRepeatParam(dbInstance, context, param);
+  const { profileFieldNames, columnKeys, legacyFieldName } = parseAppendRepeatParam(resolvedParam);
 
   if (profileFieldNames.length > 1 || (profileFieldNames.length >= 1 && !legacyFieldName && columnKeys && columnKeys.length > 1)) {
     const names = columnKeys && columnKeys.length > 0 ? columnKeys : profileFieldNames;
@@ -917,12 +1035,15 @@ async function appendRepeatRowToContext(dbInstance, context, param) {
       const fromForm = await loadRepeatGroupColumns(dbInstance, context.profileId, context.entryId, names);
       if (fromForm.length > 0) columns = fromForm;
     }
-    return appendRepeatGroupRowToContext(dbInstance, context, names, columns);
+    const groupRes = await appendRepeatGroupRowToContext(dbInstance, context, names, columns);
+    return { ...groupRes, resolvedParam };
   }
 
   const fieldName = legacyFieldName || profileFieldNames[0] || "";
   if (!fieldName) {
-    throw new Error("Param must be profile repeat field name(s) (e.g. PROMPT,RESPONSE or legacy Dialog|question,answer).");
+    throw new Error(
+      "Append repeat row needs field names (e.g. PROMPT,RESPONSE). Set Param on the flow step, or configure repeat fields on the profile / repeat group on the entry form."
+    );
   }
 
   let columns;
@@ -953,7 +1074,14 @@ async function appendRepeatRowToContext(dbInstance, context, param) {
     }
   }
 
-  const newRow = buildRepeatRowFromDataset(columns, dataset);
+  let profileDoc = context.profileDoc;
+  if (!profileDoc && dbInstance && context.profileId) {
+    try {
+      const pd = await dbInstance.get(context.profileId);
+      if (pd && pd.type === "elenko_profile") profileDoc = pd;
+    } catch (_) {}
+  }
+  const newRow = buildRepeatRowFromDataset(columns, dataset, profileDoc);
   const updatedJson = appendRepeatRowToFieldValue(currentStored, columns, newRow);
   let rowCount = 0;
   try {
@@ -964,8 +1092,9 @@ async function appendRepeatRowToContext(dbInstance, context, param) {
     [fieldName]: updatedJson,
     _lastAppendRepeatField: fieldName,
     _lastAppendRepeatRowCount: rowCount,
+    draftRepeatRowIndex: rowCount > 0 ? rowCount - 1 : 0,
   };
-  return { fieldName, updatedJson, newRow, rowCount };
+  return { fieldName, updatedJson, newRow, rowCount, resolvedParam };
 }
 
 function summarizeRepeatFieldForList(value) {
@@ -1079,6 +1208,11 @@ function formatRepeatFieldHtml(value, o) {
   return `<table class="entry-repeat-table elenko-entry-fields-table"><thead>${head}</thead><tbody>${body}</tbody></table>`;
 }
 
+function formatRepeatGroupRowCellHtml(column, value, isDraftRow) {
+  if (isDraftRow) return buildRepeatCellEditInputHtml(column, value);
+  return formatRepeatSubValueHtml(column.fieldType, value);
+}
+
 function formatRepeatGroupHtml(record, o) {
   const columns = normalizeRepeatColumns(o.repeatColumns || []);
   if (columns.length === 0) {
@@ -1086,6 +1220,7 @@ function formatRepeatGroupHtml(record, o) {
   }
   const rows = mergeRepeatGroupRowsFromRecord(record || {}, columns);
   const mode = normalizeRepeatMode(o.repeatMode);
+  const draftRowIndex = getDraftRepeatRowIndex(record || {});
   if (rows.length === 0) {
     return '<span class="entry-repeat-empty">No rows yet.</span>';
   }
@@ -1094,16 +1229,23 @@ function formatRepeatGroupHtml(record, o) {
       `<div class="entry-repeat-stack">` +
       rows
         .map(
-          (row, idx) =>
-            `<div class="entry-repeat-stack-block">` +
-            `<div class="entry-repeat-stack-head">#${idx + 1}</div>` +
-            columns
-              .map(
-                (c) =>
-                  `<div class="entry-repeat-stack-field"><div class="entry-repeat-col-label">${escapeHtml(c.label)}</div><div class="entry-repeat-col-value${c.fieldType === "markdown" ? " entry-repeat-col-markdown" : ""}">${formatRepeatSubValueHtml(c.fieldType, row[c.key])}</div></div>`
-              )
-              .join("") +
-            `</div>`
+          (row, idx) => {
+            const isDraft = idx === draftRowIndex;
+            return (
+              `<div class="entry-repeat-stack-block${isDraft ? " entry-repeat-draft-row" : ""}"${isDraft ? ' data-draft-row="1"' : ""}>` +
+              `<div class="entry-repeat-stack-head">#${idx + 1}${isDraft ? ' <span class="entry-repeat-draft-badge">Draft</span>' : ""}</div>` +
+              columns
+                .map((c) => {
+                  const inner = formatRepeatGroupRowCellHtml(c, row[c.key], isDraft);
+                  if (isDraft) {
+                    return `<div class="entry-repeat-stack-field"><div class="entry-repeat-col-label">${escapeHtml(c.label)}</div><div class="entry-repeat-col-value entry-repeat-col-draft">${inner}</div></div>`;
+                  }
+                  return `<div class="entry-repeat-stack-field"><div class="entry-repeat-col-label">${escapeHtml(c.label)}</div><div class="entry-repeat-col-value${c.fieldType === "markdown" ? " entry-repeat-col-markdown" : ""}">${inner}</div></div>`;
+                })
+                .join("") +
+              `</div>`
+            );
+          }
         )
         .join("") +
       `</div>`
@@ -1112,8 +1254,21 @@ function formatRepeatGroupHtml(record, o) {
   const head = `<tr>${columns.map((c) => `<th>${escapeHtml(c.label)}</th>`).join("")}</tr>`;
   const body = rows
     .map(
-      (row) =>
-        `<tr>${columns.map((c) => `<td${c.fieldType === "markdown" ? ' class="entry-repeat-col-markdown"' : ""}>${formatRepeatSubValueHtml(c.fieldType, row[c.key])}</td>`).join("")}</tr>`
+      (row, idx) => {
+        const isDraft = idx === draftRowIndex;
+        return (
+          `<tr${isDraft ? ' class="entry-repeat-draft-row" data-draft-row="1"' : ""}>` +
+          columns
+            .map((c) => {
+              if (isDraft) {
+                return `<td class="entry-repeat-col-draft">${formatRepeatGroupRowCellHtml(c, row[c.key], true)}</td>`;
+              }
+              return `<td${c.fieldType === "markdown" ? ' class="entry-repeat-col-markdown"' : ""}>${formatRepeatSubValueHtml(c.fieldType, row[c.key])}</td>`;
+            })
+            .join("") +
+          `</tr>`
+        );
+      }
     )
     .join("");
   return `<table class="entry-repeat-table elenko-entry-fields-table"><thead>${head}</thead><tbody>${body}</tbody></table>`;
@@ -2273,6 +2428,8 @@ function normalizeFlowSteps(steps) {
           ? "purgeOld"
           : t === "appendRepeat"
           ? "appendRepeat"
+          : t === "refresh"
+          ? "refresh"
           : "log";
       const param = typeof (s && s.param) === "string" ? s.param.trim() : "";
       const label = typeof (s && s.label) === "string" ? s.label.trim() : "";
@@ -2291,6 +2448,97 @@ function parsePurgeOldAgeParam(param) {
   const unit = m[2];
   const ageMs = unit === "w" ? n * 7 * PURGE_OLD_MS_PER_DAY : n * PURGE_OLD_MS_PER_DAY;
   return { ageMs, label: s };
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Param: optional timeout in seconds (e.g. 20 or 20s). Default 15s. */
+function parseFlowRefreshTimeoutParam(param) {
+  const s = typeof param === "string" ? param.trim().toLowerCase() : "";
+  if (!s) return FLOW_REFRESH_DEFAULT_TIMEOUT_MS;
+  const m = /^(\d+)\s*s(?:ec(?:onds?)?)?$/.exec(s) || /^(\d+)$/.exec(s);
+  if (!m) return FLOW_REFRESH_DEFAULT_TIMEOUT_MS;
+  const sec = parseInt(m[1], 10);
+  if (!Number.isFinite(sec) || sec < 1) return FLOW_REFRESH_DEFAULT_TIMEOUT_MS;
+  return Math.min(sec * 1000, 300000);
+}
+
+/** Poll until the current entry _rev changes from the flow-start revision (view refresh). */
+async function runFlowRefreshStep(dbInstance, context, stepIndex, param) {
+  const timeoutMs = parseFlowRefreshTimeoutParam(param);
+  const pollIntervalMs = FLOW_REFRESH_POLL_INTERVAL_MS;
+  const entryId = context && context.entryId;
+  const profileId = context && context.profileId;
+  if (!entryId || !profileId || !dbInstance) {
+    sendFlowMessage("flow.refreshError", {
+      stepIndex,
+      profileId: profileId || "",
+      entryId: entryId || "",
+      param,
+      timeoutMs,
+      pollIntervalMs,
+      error: "Refresh requires a current entry in the flow context.",
+    });
+    return { ok: false };
+  }
+  const baselineRev = context._entryRevAtFlowStart != null ? String(context._entryRevAtFlowStart) : "";
+  const deadline = Date.now() + timeoutMs;
+  let currentRev = baselineRev;
+  let updated = false;
+  while (Date.now() < deadline) {
+    try {
+      const doc = await dbInstance.get(entryId);
+      currentRev = doc && doc._rev ? String(doc._rev) : "";
+      if (currentRev && currentRev !== baselineRev) {
+        updated = true;
+        break;
+      }
+    } catch (e) {
+      sendFlowMessage("flow.refreshError", {
+        stepIndex,
+        profileId,
+        entryId,
+        param,
+        timeoutMs,
+        pollIntervalMs,
+        baselineRev,
+        error: e && e.message ? String(e.message) : "Failed to load entry while waiting for refresh",
+      });
+      return { ok: false };
+    }
+    if (Date.now() + pollIntervalMs >= deadline) break;
+    await delay(pollIntervalMs);
+  }
+  if (updated) {
+    sendFlowMessage("flow.refresh", {
+      stepIndex,
+      profileId,
+      entryId,
+      param,
+      timeoutMs,
+      pollIntervalMs,
+      baselineRev,
+      currentRev,
+    });
+    context.reloadEntry = true;
+    return { ok: true };
+  }
+  const errorMsg = `Entry did not update within ${Math.round(timeoutMs / 1000)}s (polled every ${Math.round(pollIntervalMs / 1000)}s).`;
+  sendFlowMessage("flow.refreshError", {
+    stepIndex,
+    profileId,
+    entryId,
+    param,
+    timeoutMs,
+    pollIntervalMs,
+    baselineRev,
+    currentRev,
+    error: errorMsg,
+  });
+  context.refreshTimedOut = true;
+  return { ok: false };
 }
 
 /**
@@ -2906,11 +3154,14 @@ async function updateCurrentEntryFromDataset(dbInstance, context) {
   delete patch.updatedBy;
   if (profileDoc) {
     for (const key of Object.keys(patch)) {
-      if (key.startsWith("_") || key === "type" || key === "profileId" || key === "sortKey") continue;
+      if (key.startsWith("_") || key === "type" || key === "profileId" || key === "sortKey" || key === "draftRepeatRowIndex") continue;
       patch[key] = applyPlainValueToProfileField(profileDoc, existing, key, patch[key]);
     }
   }
   const updated = { ...existing, ...patch };
+  if (context && context.clearDraftRepeatRowIndex) {
+    delete updated.draftRepeatRowIndex;
+  }
   setEntryAuditOnUpdate(updated, context && context.req);
   await dbInstance.insert(updated);
   clearProfileListCache(profileId);
@@ -3065,6 +3316,14 @@ async function runPipeline(context, flowDoc) {
       if (pd && pd.type === "elenko_profile") context.profileDoc = pd;
     } catch (_) {}
   }
+  if (context.entryId && db && context._entryRevAtFlowStart == null) {
+    try {
+      const startDoc = await db.get(context.entryId);
+      context._entryRevAtFlowStart = startDoc && startDoc._rev ? String(startDoc._rev) : "";
+    } catch (_) {
+      context._entryRevAtFlowStart = "";
+    }
+  }
   const steps = Array.isArray(flowDoc && flowDoc.steps) ? flowDoc.steps : [];
   let hasExplicitPersistStep = false;
   /** Skip update/response (need a current entry). Timer without entry uses this; guardian import always. */
@@ -3091,6 +3350,8 @@ async function runPipeline(context, flowDoc) {
         ? "purgeOld"
         : rawTarget === "appendRepeat"
         ? "appendRepeat"
+        : rawTarget === "refresh"
+        ? "refresh"
         : "log";
     if (target === "log") {
       sendFlowMessage("entry.sendToFlow", {
@@ -3106,7 +3367,13 @@ async function runPipeline(context, flowDoc) {
     if (target === "update") {
       if (suppressPipelineEntryWrites) continue;
       hasExplicitPersistStep = true;
+      if (getDraftRepeatRowIndex(context.dataset) >= 0) {
+        context.clearDraftRepeatRowIndex = true;
+      }
       await updateCurrentEntryFromDataset(db, context);
+      if (context.dataset && typeof context.dataset === "object") {
+        delete context.dataset.draftRepeatRowIndex;
+      }
       continue;
     }
     if (target === "create") {
@@ -3165,8 +3432,9 @@ async function runPipeline(context, flowDoc) {
           stepIndex: i,
           profileId: context.profileId,
           entryId: context.entryId,
-          param,
+          param: appendRes.resolvedParam || param,
           fieldName: appendRes.fieldName,
+          fieldNames: appendRes.fieldNames,
           rowCount: appendRes.rowCount,
           newRow: appendRes.newRow,
         });
@@ -3175,14 +3443,23 @@ async function runPipeline(context, flowDoc) {
           hasExplicitPersistStep = true;
         }
       } catch (e) {
+        let resolvedParam = param;
+        try {
+          resolvedParam = (await resolveAppendRepeatParam(db, context, param)) || param;
+        } catch (_) {}
         sendFlowMessage("flow.appendRepeatError", {
           stepIndex: i,
           profileId: context.profileId,
           entryId: context.entryId,
-          param,
+          param: resolvedParam,
           error: e && e.message ? String(e.message) : "Append repeat row failed",
         });
       }
+      continue;
+    }
+    if (target === "refresh") {
+      const param = (step && typeof step.param === "string") ? step.param.trim() : "";
+      await runFlowRefreshStep(db, context, i, param);
       continue;
     }
     if (target === "script") {
@@ -8888,11 +9165,20 @@ app.post("/api/profile/:id/entry/:entryId/send-to-flow", requireAuth, async (req
             profileId,
             entryId,
             profileName: doc.name || profileId,
-            dataset: record,
+            dataset: { ...record },
             param: flowButtonParam,
+            req,
           };
+          const draftEdits = req.body && req.body.draftRepeatEdits;
+          if (draftEdits && typeof draftEdits === "object" && !Array.isArray(draftEdits)) {
+            mergeDraftRepeatEditsIntoDataset(context, doc, draftEdits);
+          }
           await runPipeline(context, flowDoc);
-          return res.json({ ok: true });
+          return res.json({
+            ok: true,
+            reloadEntry: !!context.reloadEntry,
+            refreshTimedOut: !!context.refreshTimedOut,
+          });
         }
       } catch (pipeErr) {
         console.error("Pipeline error:", pipeErr);
@@ -10885,6 +11171,11 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     .entry-repeat-col-label { font-size: 0.8rem; color: var(--entry-label, #8b949e); margin-bottom: 0.15rem; }
     .entry-repeat-empty, .entry-repeat-error { color: var(--entry-label, #8b949e); font-style: italic; }
     .entry-repeat-error { color: #f85149; font-style: normal; }
+    .entry-repeat-draft-row { outline: 1px solid color-mix(in srgb, var(--entry-link, #58a6ff) 55%, transparent); outline-offset: -1px; }
+    .entry-repeat-draft-badge { font-size: 0.72rem; font-weight: 600; color: var(--entry-link, #58a6ff); text-transform: uppercase; letter-spacing: 0.03em; }
+    .entry-repeat-col-draft .entry-repeat-cell, .entry-repeat-col-draft .entry-repeat-cell-textarea { width: 100%; min-width: 6rem; box-sizing: border-box; padding: 0.35rem 0.5rem; background: var(--entry-field-bg, #0d1117); border: 1px solid #30363d; border-radius: 4px; color: var(--entry-text, #e6edf3); font: inherit; }
+    .entry-repeat-col-draft .entry-repeat-cell-textarea { min-height: 2.5rem; resize: vertical; white-space: pre-wrap; }
+    .entry-repeat-col-draft .entry-repeat-cell-markdown { min-height: 6rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.875rem; line-height: 1.4; }
     .entry-view-grid .entry-grid-cell .value.entry-grid-image-height .entry-inline-image {
       max-height: 100%;
       width: auto;
@@ -10939,7 +11230,7 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
   </div>
   ${hasFlowButtons ? '<div id="flow-msg" class="flow-msg" style="margin-bottom:0.5rem;"></div>' : ""}
   ${contentHtml}
-  ${hasFlowButtons ? "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; background: #238636; color: #fff; }.btn-flow:hover { background: #2ea043; }.btn-flow:disabled { opacity: 0.6; cursor: not-allowed; }.btn-flow-secondary { background: #21262d; }.btn-flow-secondary:hover { background: #30363d; }.flow-msg { margin-top: 0.5rem; font-size: 0.875rem; }.flow-msg.ok { color: #3fb950; }.flow-msg.err { color: #f85149; }</style>\n  <script>\n    (function() {\n      var msgEl = document.getElementById(\"flow-msg\");\n      document.querySelectorAll(\".entry-flow-actions .btn-flow[data-entry-id]\").forEach(function(btn) {\n        if (btn.id === \"refresh-entry-btn\") return;\n        btn.onclick = function() {\n          var pid = btn.getAttribute(\"data-profile-id\");\n          var eid = btn.getAttribute(\"data-entry-id\");\n          if (!pid || !eid) return;\n          btn.disabled = true;\n          if (msgEl) { msgEl.textContent = \"\"; msgEl.className = \"flow-msg\"; }\n          var body = {};\n          var idx = btn.getAttribute(\"data-flow-index\");\n          if (idx !== null && idx !== \"\") body.flowIndex = parseInt(idx, 10);\n          var url = \"/api/profile/\" + encodeURIComponent(pid) + \"/entry/\" + encodeURIComponent(eid) + \"/send-to-flow\";\n          fetch(url, { method: \"POST\", headers: { \"Content-Type\": \"application/json\" }, body: JSON.stringify(body) })\n            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })\n            .then(function(o) {\n              if (o.ok && msgEl) { msgEl.textContent = \"Sent to Flow.\"; msgEl.className = \"flow-msg ok\"; }\n              else if (msgEl) { msgEl.textContent = o.data.error || \"Failed\"; msgEl.className = \"flow-msg err\"; }\n              btn.disabled = false;\n            })\n            .catch(function(e) { if (msgEl) { msgEl.textContent = e.message || \"Request failed\"; msgEl.className = \"flow-msg err\"; } btn.disabled = false; });\n        };\n      });\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>" : "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }.btn-flow-secondary { background: #21262d; color: #e6edf3; }.btn-flow-secondary:hover { background: #30363d; }</style>\n  <script>\n    (function() {\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>"}
+  ${hasFlowButtons ? "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; background: #238636; color: #fff; }.btn-flow:hover { background: #2ea043; }.btn-flow:disabled { opacity: 0.6; cursor: not-allowed; }.btn-flow-secondary { background: #21262d; }.btn-flow-secondary:hover { background: #30363d; }.flow-msg { margin-top: 0.5rem; font-size: 0.875rem; }.flow-msg.ok { color: #3fb950; }.flow-msg.err { color: #f85149; }</style>\n  <script>\n    (function() {\n      var msgEl = document.getElementById(\"flow-msg\");\n      document.querySelectorAll(\".entry-flow-actions .btn-flow[data-entry-id]\").forEach(function(btn) {\n        if (btn.id === \"refresh-entry-btn\") return;\n        btn.onclick = function() {\n          var pid = btn.getAttribute(\"data-profile-id\");\n          var eid = btn.getAttribute(\"data-entry-id\");\n          if (!pid || !eid) return;\n          btn.disabled = true;\n          if (msgEl) { msgEl.textContent = \"\"; msgEl.className = \"flow-msg\"; }\n          var body = {};\n          var idx = btn.getAttribute(\"data-flow-index\");\n          if (idx !== null && idx !== \"\") body.flowIndex = parseInt(idx, 10);\n          var draftRow = document.querySelector(\".entry-repeat-draft-row\");\n          if (draftRow) {\n            var edits = {};\n            draftRow.querySelectorAll(\".entry-repeat-cell\").forEach(function(el) {\n              var k = el.getAttribute(\"data-col-key\");\n              if (k) edits[k] = el.value != null ? el.value : \"\";\n            });\n            if (Object.keys(edits).length) body.draftRepeatEdits = edits;\n          }\n          var url = \"/api/profile/\" + encodeURIComponent(pid) + \"/entry/\" + encodeURIComponent(eid) + \"/send-to-flow\";\n          fetch(url, { method: \"POST\", headers: { \"Content-Type\": \"application/json\" }, body: JSON.stringify(body) })\n            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })\n            .then(function(o) {\n              if (o.ok && o.data && o.data.reloadEntry) {\n                if (msgEl) { msgEl.textContent = \"Updated — refreshing…\"; msgEl.className = \"flow-msg ok\"; }\n                window.location.reload();\n                return;\n              }\n              if (o.ok && msgEl) {\n                msgEl.textContent = (o.data && o.data.refreshTimedOut)\n                  ? \"Flow finished; entry did not update in time (see flow log).\"\n                  : \"Sent to Flow.\";\n                msgEl.className = (o.data && o.data.refreshTimedOut) ? \"flow-msg err\" : \"flow-msg ok\";\n              } else if (msgEl) { msgEl.textContent = o.data.error || \"Failed\"; msgEl.className = \"flow-msg err\"; }\n              btn.disabled = false;\n            })\n            .catch(function(e) { if (msgEl) { msgEl.textContent = e.message || \"Request failed\"; msgEl.className = \"flow-msg err\"; } btn.disabled = false; });\n        };\n      });\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>" : "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }.btn-flow-secondary { background: #21262d; color: #e6edf3; }.btn-flow-secondary:hover { background: #30363d; }</style>\n  <script>\n    (function() {\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>"}
   <script>
     (function() {
       document.querySelectorAll('.linked-query-load-btn').forEach(function(btn) {
@@ -13499,7 +13790,7 @@ function renderEditFlowPage(doc, err, appUi) {
   </div>
   <h1>${title}</h1>
   <p class="sub">Steps run in order. Log = passthrough (data unchanged, written to flow log). API and Local DB use the Param column (API doc ID or profile ID).</p>
-  <p class="sub" style="margin-top:0.5rem; padding:0.5rem; background:var(--app-table-bg, #161b22); border-radius:6px; border-left:3px solid var(--app-link, #58a6ff);"><strong>Persistence:</strong> The flow writes or deletes in the database when it includes one of: <em>Send to Local DB</em>, <em>Update current document</em>, <em>Create new document in this profile</em>, <em>Append repeat row</em> (when a current entry exists), or <em>Delete old entries in this profile</em> (Param e.g. <code>7d</code> or <code>2w</code> — rows with <code>createdAt</code> older than that age, capped per run). If none of these are present, the result is not saved (&quot;fire and forget&quot;). Log steps are neutral.</p>
+  <p class="sub" style="margin-top:0.5rem; padding:0.5rem; background:var(--app-table-bg, #161b22); border-radius:6px; border-left:3px solid var(--app-link, #58a6ff);"><strong>Persistence:</strong> The flow writes or deletes in the database when it includes one of: <em>Send to Local DB</em>, <em>Update current document</em>, <em>Create new document in this profile</em>, <em>Append repeat row</em> (when a current entry exists), or <em>Delete old entries in this profile</em> (Param e.g. <code>7d</code> or <code>2w</code> — rows with <code>createdAt</code> older than that age, capped per run). If none of these are present, the result is not saved (&quot;fire and forget&quot;). Log steps are neutral. <em>Append repeat row</em> marks the new row as an editable draft in entry view. <em>Update current document</em> saves draft edits from view and clears draft mode. <em>Refresh</em> waits for the entry to update (default 15s, poll every 5s; Param overrides timeout in seconds) and reloads the entry view when run from a form button.</p>
   ${errHtml}
   <form id="flow-form">
     ${revInput}
@@ -13548,6 +13839,8 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'purgeOld'
           : (step && step.target === 'appendRepeat')
           ? 'appendRepeat'
+          : (step && step.target === 'refresh')
+          ? 'refresh'
           : 'log';
       const label = (step && step.label != null) ? String(step.label).replace(/"/g, '&quot;') : '';
       const param = (step && step.param != null) ? String(step.param).replace(/"/g, '&quot;') : '';
@@ -13568,6 +13861,8 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'Age: 7d or 2w (days/weeks)'
           : target === 'appendRepeat'
           ? 'Profile repeat fields (e.g. PROMPT,RESPONSE)'
+          : target === 'refresh'
+          ? 'Timeout seconds (default 15)'
           : '—';
       tr.innerHTML =
         '<td class="step-num"></td>' +
@@ -13581,6 +13876,7 @@ function renderEditFlowPage(doc, err, appUi) {
         '<option value="create"' + (target === 'create' ? ' selected' : '') + '>Create new document in this profile</option>' +
         '<option value="purgeOld"' + (target === 'purgeOld' ? ' selected' : '') + '>Delete old entries in this profile</option>' +
         '<option value="appendRepeat"' + (target === 'appendRepeat' ? ' selected' : '') + '>Append repeat row</option>' +
+        '<option value="refresh"' + (target === 'refresh' ? ' selected' : '') + '>Refresh entry view</option>' +
         '</select></td>' +
         '<td><input type="text" class="step-label" placeholder="Step label" value="' + label + '"></td>' +
         '<td><input type="text" class="step-param" placeholder="' + paramPlaceholder + '" value="' + param + '"></td>' +
@@ -13607,6 +13903,8 @@ function renderEditFlowPage(doc, err, appUi) {
             stepParam.placeholder = 'Age: 7d or 2w (days/weeks)';
           } else if (this.value === 'appendRepeat') {
             stepParam.placeholder = 'Profile repeat fields (e.g. PROMPT,RESPONSE)';
+          } else if (this.value === 'refresh') {
+            stepParam.placeholder = 'Timeout seconds (default 15)';
           } else {
             stepParam.placeholder = '—';
           }
