@@ -175,15 +175,21 @@ function resolveTemplateFieldValue(fieldName, modifier, dataset) {
 const FIELD_PLACEHOLDER_RE = /#([A-Za-z_][A-Za-z0-9_]*(?:\((?:FIRST|LAST|ALL|\d+)\))?)\#/g;
 
 /** Replace #REPEAT(N)# blocks, then #fieldName# / #fieldName(FIRST|LAST|ALL|n)# placeholders. */
-function applyTemplate(template, dataset) {
+function applyTemplate(template, dataset, options) {
   if (typeof template !== "string" || !template) return "";
   if (!dataset || typeof dataset !== "object") return template;
+  const forUrl = options && options.forUrl === true;
   const expanded = expandRepeatBlocks(template, dataset);
   return expanded.replace(FIELD_PLACEHOLDER_RE, (_, token) => {
     const { fieldName, modifier } = parseFieldTemplateToken(token);
     if (!fieldName) return "";
-    return escapeTemplateValue(resolveTemplateFieldValue(fieldName, modifier, dataset));
+    const raw = resolveTemplateFieldValue(fieldName, modifier, dataset);
+    return forUrl ? raw : escapeTemplateValue(raw);
   });
+}
+
+function urlHasFieldPlaceholders(url) {
+  return typeof url === "string" && /#[A-Za-z_][A-Za-z0-9_]*(?:\((?:FIRST|LAST|ALL|\d+)\))?\#/.test(url);
 }
 
 function buildUrlWithQuery(baseUrl, dataset) {
@@ -596,7 +602,7 @@ if (parentPort) parentPort.on("message", (msg) => {
   let finalUrl;
   let bodyPayload = undefined;
   if (template) {
-    const substituted = applyTemplate(template, dataset);
+    const substituted = applyTemplate(template, dataset, { forUrl: method === "GET" });
     if (method === "GET") {
       finalUrl = substituted || url;
     } else {
@@ -604,10 +610,15 @@ if (parentPort) parentPort.on("message", (msg) => {
       bodyPayload = substituted;
     }
   } else {
+    let baseUrl = url;
+    const hadPlaceholders = urlHasFieldPlaceholders(baseUrl);
+    if (hadPlaceholders) {
+      baseUrl = applyTemplate(baseUrl, dataset, { forUrl: true });
+    }
     finalUrl =
       method === "GET"
-        ? (appendEntryFieldsToGet ? buildUrlWithQuery(url, dataset) : url)
-        : url;
+        ? (appendEntryFieldsToGet && !hadPlaceholders ? buildUrlWithQuery(baseUrl, dataset) : baseUrl)
+        : baseUrl;
     if ((method === "POST" || method === "PUT" || method === "PATCH") && dataset && typeof dataset === "object") {
       bodyPayload = JSON.stringify(dataset);
     }

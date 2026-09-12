@@ -3146,6 +3146,7 @@ async function updateCurrentEntryFromDataset(dbInstance, context) {
   const patch = { ...dataset };
   // Do not persist helper fields used only inside the pipeline
   delete patch._lastCreatedId;
+  delete patch._lastCreatedCount;
   delete patch._repeatRow;
   delete patch._lastAppendRepeatField;
   delete patch._lastAppendRepeatFields;
@@ -3370,6 +3371,16 @@ async function runPipeline(context, flowDoc) {
       if (getDraftRepeatRowIndex(context.dataset) >= 0) {
         context.clearDraftRepeatRowIndex = true;
       }
+      const updateParam = step && typeof step.param === "string" ? step.param.trim() : "";
+      if (
+        updateParam &&
+        context.dataset &&
+        typeof context.dataset === "object" &&
+        context.dataset._lastCreatedCount != null &&
+        context.dataset._lastCreatedCount !== ""
+      ) {
+        context.dataset[updateParam] = String(context.dataset._lastCreatedCount);
+      }
       await updateCurrentEntryFromDataset(db, context);
       if (context.dataset && typeof context.dataset === "object") {
         delete context.dataset.draftRepeatRowIndex;
@@ -3527,17 +3538,28 @@ async function runPipeline(context, flowDoc) {
         const createManyRaw = Array.isArray(scriptOutput._createMany) ? scriptOutput._createMany : null;
         delete scriptOutput._createMany;
         context.dataset = { ...(context.dataset || {}), ...scriptOutput };
+        let createdCount = 0;
         if (createManyRaw && context.profileId && db) {
-          let createdCount = 0;
           for (let rowIndex = 0; rowIndex < createManyRaw.length; rowIndex++) {
             const row = createManyRaw[rowIndex];
             if (!row || typeof row !== "object") continue;
+            const rowDataset = { ...row };
+            const targetProfileId =
+              (typeof rowDataset._targetProfileId === "string" && rowDataset._targetProfileId.trim()) ||
+              (typeof rowDataset._profileId === "string" && rowDataset._profileId.trim()) ||
+              context.profileId;
+            delete rowDataset._targetProfileId;
+            delete rowDataset._profileId;
             try {
-              await createEntryInProfileFromContext(db, { dataset: row }, context.profileId);
+              await createEntryInProfileFromContext(
+                db,
+                { dataset: rowDataset, req: context && context.req },
+                targetProfileId
+              );
               createdCount++;
             } catch (err) {
               console.error("REST API import _createMany row failed:", {
-                profileId: context.profileId,
+                profileId: targetProfileId,
                 stepIndex: i,
                 rowIndex,
                 message: err && err.message ? err.message : String(err),
@@ -3676,7 +3698,207 @@ function defaultAppUiConfigObject() {
     flowLogIana: "",
     flowLogUtcOffsetMinutes: 0,
     flowLogDockerAdjustMinutes: 0,
+    profileListLayout: [],
   };
+}
+
+function normalizeProfileListLayoutItem(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  if (raw.kind === "group") {
+    const label = typeof raw.label === "string" ? raw.label.trim().slice(0, 200) : "";
+    if (!label) return null;
+    let id = typeof raw.id === "string" ? raw.id.trim().slice(0, 64) : "";
+    if (!id) id = "group-" + crypto.randomBytes(4).toString("hex");
+    return { kind: "group", id, label };
+  }
+  if (raw.kind === "profile") {
+    const profileId = typeof raw.profileId === "string" ? raw.profileId.trim() : "";
+    if (!profileId) return null;
+    return { kind: "profile", profileId };
+  }
+  return null;
+}
+
+function normalizeProfileListLayout(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seenProfiles = new Set();
+  for (const item of raw) {
+    const norm = normalizeProfileListLayoutItem(item);
+    if (!norm) continue;
+    if (norm.kind === "profile") {
+      if (seenProfiles.has(norm.profileId)) continue;
+      seenProfiles.add(norm.profileId);
+    }
+    out.push(norm);
+  }
+  return out;
+}
+
+/** Ordered sections for home / profiles list (groups, loose blocks, unlisted profiles at end). */
+function buildProfileListSections(profiles, layout) {
+  const list = Array.isArray(profiles) ? profiles : [];
+  const byId = new Map(list.map((p) => [p._id, p]));
+  const layoutNorm = normalizeProfileListLayout(layout);
+  const placedIds = new Set();
+  const sections = [];
+  let currentGroup = null;
+  let currentLoose = null;
+
+  function flushLoose() {
+    if (currentLoose && currentLoose.profiles.length > 0) {
+      sections.push(currentLoose);
+      currentLoose = null;
+    }
+  }
+
+  function ensureLoose() {
+    if (!currentLoose) currentLoose = { kind: "profiles", profiles: [] };
+    return currentLoose;
+  }
+
+  for (const item of layoutNorm) {
+    if (item.kind === "group") {
+      flushLoose();
+      currentGroup = { kind: "group", id: item.id, label: item.label, profiles: [] };
+      sections.push(currentGroup);
+    } else {
+      placedIds.add(item.profileId);
+      const p = byId.get(item.profileId);
+      if (!p) continue;
+      if (currentGroup) currentGroup.profiles.push(p);
+      else ensureLoose().profiles.push(p);
+    }
+  }
+  flushLoose();
+  currentGroup = null;
+
+  const unlisted = list
+    .filter((p) => !placedIds.has(p._id))
+    .sort((a, b) => String(a.name || a._id).localeCompare(String(b.name || b._id), undefined, { sensitivity: "base" }));
+  if (unlisted.length > 0) {
+    sections.push({ kind: "profiles", profiles: unlisted });
+  }
+
+  return sections.filter((s) => (s.kind === "group" ? s.profiles.length > 0 : s.profiles.length > 0));
+}
+
+function renderProfileListTableRow(p, opts) {
+  const adminMode = !!(opts && opts.adminMode);
+  const mobileHideDate = !!(opts && opts.mobileHideDate);
+  const groupId = opts && opts.groupId ? String(opts.groupId) : "";
+  const createdDate = p.createdAt ? formatDateOnly(p.createdAt) : "—";
+  const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
+  const href = adminMode
+    ? `/profile/${encodeURIComponent(p._id)}/edit`
+    : `/profile/${encodeURIComponent(p._id)}`;
+  const nameCell = `<a href="${href}">${escapeHtml(p.name || p._id)}</a>`;
+  const descCell = adminMode
+    ? escapeHtml(truncate(p.description || "", 80))
+    : escapeHtml(p.description || "—");
+  const dateTd = mobileHideDate
+    ? `<td class="col-mobile-hidden">${escapeHtml(createdDate)}</td>`
+    : `<td>${escapeHtml(createdDate)}</td>`;
+  const groupAttrs = groupId
+    ? ` class="profile-group-member" data-group-id="${escapeHtml(groupId)}" hidden`
+    : "";
+  if (adminMode) {
+    return (
+      `<tr${groupAttrs}>` +
+      `<td>${nameCell}</td>` +
+      `<td>${descCell}</td>` +
+      dateTd +
+      `<td class="row-actions"><a href="/profile/${encodeURIComponent(p._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a>` +
+      `<button type="button" class="copy-btn icon-action profile-copy-btn" data-id="${escapeHtml(p._id)}" aria-label="Copy" title="Copy">⧉</button>` +
+      `<button type="button" class="delete-btn icon-action delete-profile-btn" data-id="${escapeHtml(p._id)}" data-rev="${escapeHtml(p._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>` +
+      `</tr>`
+    );
+  }
+  return `<tr${groupAttrs}><td>${nameCell}</td><td>${descCell}</td>${dateTd}</tr>`;
+}
+
+function renderGroupedProfileListBody(sections, opts) {
+  const adminMode = !!(opts && opts.adminMode);
+  const mobileHideDate = !!(opts && opts.mobileHideDate);
+  const colspan = adminMode ? 4 : 3;
+  let html = "";
+  for (const section of sections || []) {
+    if (section.kind === "group") {
+      const gid = escapeHtml(section.id);
+      const label = escapeHtml(section.label);
+      const count = section.profiles.length;
+      html +=
+        `<tr class="profile-group-header" data-group-id="${gid}"><td colspan="${colspan}">` +
+        `<button type="button" class="profile-group-toggle collapsed" data-group-id="${gid}" aria-expanded="false">` +
+        `<span class="profile-group-chevron" aria-hidden="true">▶</span> ${label} ` +
+        `<span class="profile-group-count">(${count})</span></button></td></tr>`;
+      for (const p of section.profiles) {
+        html += renderProfileListTableRow(p, { adminMode, mobileHideDate, groupId: section.id });
+      }
+    } else {
+      for (const p of section.profiles) {
+        html += renderProfileListTableRow(p, { adminMode, mobileHideDate, groupId: "" });
+      }
+    }
+  }
+  return html;
+}
+
+const PROFILE_LIST_GROUP_STYLES = `
+    .profile-group-header td { background: var(--app-table-header-bg, #21262d); padding: 0.45rem 1rem; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    .profile-group-toggle { display: inline-flex; align-items: center; gap: 0.35rem; border: none; background: transparent; color: var(--app-text, #e6edf3); font: inherit; font-weight: 600; cursor: pointer; padding: 0.15rem 0; text-align: left; }
+    .profile-group-toggle:hover { color: var(--app-link, #58a6ff); }
+    .profile-group-toggle:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; border-radius: 4px; }
+    .profile-group-chevron { display: inline-block; width: 1rem; color: var(--app-label, #8b949e); }
+    .profile-group-toggle:not(.collapsed) .profile-group-chevron { transform: rotate(90deg); }
+    .profile-group-count { color: var(--app-label, #8b949e); font-weight: 400; font-size: 0.92em; }
+`;
+
+const PROFILE_LIST_GROUP_SCRIPT = `
+    document.querySelectorAll('.profile-group-toggle').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var gid = btn.getAttribute('data-group-id');
+        if (!gid) return;
+        var expanded = btn.getAttribute('aria-expanded') === 'true';
+        var next = !expanded;
+        btn.setAttribute('aria-expanded', next ? 'true' : 'false');
+        btn.classList.toggle('collapsed', !next);
+        document.querySelectorAll('.profile-group-member[data-group-id="' + gid + '"]').forEach(function(row) {
+          row.hidden = !next;
+        });
+      });
+    });
+`;
+
+async function saveProfileListLayoutToAppConfig(layout) {
+  if (!configDb) throw new Error("Config store not available");
+  const normalized = normalizeProfileListLayout(layout);
+  const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+  let doc = result.docs && result.docs[0];
+  if (!doc || doc.type !== "elenko_app_config") {
+    doc = { type: "elenko_app_config", theme: { ...DEFAULT_APP_THEME } };
+  }
+  doc.profileListLayout = normalized;
+  await configDb.insert(doc);
+  invalidateAppUiConfigCache();
+}
+
+async function removeProfileFromListLayout(profileId) {
+  if (!configDb || !profileId) return;
+  try {
+    const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+    const doc = result.docs && result.docs[0];
+    if (!doc || doc.type !== "elenko_app_config" || !Array.isArray(doc.profileListLayout)) return;
+    const next = normalizeProfileListLayout(doc.profileListLayout).filter(
+      (item) => !(item.kind === "profile" && item.profileId === profileId)
+    );
+    if (next.length === normalizeProfileListLayout(doc.profileListLayout).length) return;
+    doc.profileListLayout = next;
+    await configDb.insert(doc);
+    invalidateAppUiConfigCache();
+  } catch (e) {
+    console.warn("removeProfileFromListLayout:", e.message || e);
+  }
 }
 
 async function getAppUiConfig() {
@@ -3719,6 +3941,7 @@ async function getAppUiConfig() {
           flowLogIana: typeof doc.flowLogIana === "string" ? doc.flowLogIana.trim() : "",
           flowLogUtcOffsetMinutes: parseBoundedInt(doc.flowLogUtcOffsetMinutes, 0, -840, 840),
           flowLogDockerAdjustMinutes: parseBoundedInt(doc.flowLogDockerAdjustMinutes, 0, -10080, 10080),
+          profileListLayout: normalizeProfileListLayout(doc.profileListLayout),
         };
       }
       cachedAppConfigLoadedAt = Date.now();
@@ -4352,6 +4575,23 @@ function startApiWorker() {
           profileId: msg.profileId,
           authType,
           apiKeyPreview: apiKeyPreview || "",
+        });
+        const bodyForLog =
+          bodyToResolve != null
+            ? typeof bodyToResolve === "string"
+              ? bodyToResolve
+              : JSON.stringify(bodyToResolve)
+            : null;
+        const bodyTruncated =
+          bodyForLog && bodyForLog.length > 2048 ? bodyForLog.slice(0, 2048) + "…[truncated]" : bodyForLog;
+        sendFlowMessage("api.response", {
+          entryId: msg.entryId,
+          profileId: msg.profileId,
+          success: !!msg.success,
+          statusCode: msg.statusCode ?? null,
+          body: bodyTruncated,
+          error: msg.error ?? null,
+          responseTarget: msg.responseTarget || "update",
         });
       }
       return;
@@ -6222,6 +6462,34 @@ app.get("/application-properties", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("Error loading application properties:", err);
     res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/profile-list-layout", requireAdmin, async (req, res) => {
+  try {
+    const result = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "name", "description"],
+      sort: [{ name: "asc" }],
+    });
+    const profiles = result.docs || [];
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderProfileListLayoutPage(profiles, appUi, null));
+  } catch (err) {
+    console.error("Error loading profile list layout page:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/profile-list-layout", requireAdmin, async (req, res) => {
+  try {
+    const layout = normalizeProfileListLayout(req.body && req.body.profileListLayout);
+    await saveProfileListLayoutToAppConfig(layout);
+    res.json({ ok: true, profileListLayout: layout });
+  } catch (err) {
+    console.error("Error saving profile list layout:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -9880,6 +10148,97 @@ app.delete("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res)
   }
 });
 
+app.post("/api/profiles/:id/entries/bulk-delete", requireAdmin, async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const doc = await db.get(profileId);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const encAccess = await resolveProfileEncryptionAccess(req, doc);
+    if (isProfilePersonalEncryptionEnabled(doc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "json");
+    }
+    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+    const searchQuery = typeof req.body?.q === "string" ? req.body.q.trim() : "";
+    const useAccentFolding = isProfileSearchAccentFoldingEnabled(doc);
+    const deleteAll = req.body?.all === true;
+    let targets = [];
+
+    if (deleteAll) {
+      const selector = buildProfileEntrySearchSelector(profileId, fieldNames, searchQuery, useAccentFolding);
+      const normalizedSearch =
+        searchQuery && useAccentFolding ? normalizeForSearch(searchQuery) : "";
+      const deleteFields =
+        searchQuery && useAccentFolding && fieldNames.length
+          ? ["_id", "_rev", "profileId", "type", ...fieldNames]
+          : ["_id", "_rev", "profileId", "type"];
+      const BATCH = 500;
+      let bookmark;
+      for (;;) {
+        const findOpts = {
+          selector,
+          fields: deleteFields,
+          limit: BATCH,
+        };
+        if (bookmark) findOpts.bookmark = bookmark;
+        const batch = await db.find(findOpts);
+        let docs = batch.docs || [];
+        if (searchQuery && useAccentFolding && normalizedSearch) {
+          docs = docs.filter((d) => entryMatchesSearchQuery(d, fieldNames, normalizedSearch));
+        }
+        for (const d of docs) {
+          if (d && d._id && d._rev && d.type === "elenko_record" && d.profileId === profileId) {
+            targets.push({ id: d._id, rev: d._rev });
+          }
+        }
+        if (!batch.docs || batch.docs.length < BATCH) break;
+        bookmark = batch.bookmark;
+        if (!bookmark) break;
+      }
+    } else {
+      const items = req.body?.items;
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: "Missing or empty items array" });
+      }
+      for (const it of items) {
+        const id = it && it.id != null ? String(it.id).trim() : "";
+        const rev = it && it.rev != null ? String(it.rev).trim() : "";
+        if (!id || !rev) continue;
+        let record;
+        try {
+          record = await db.get(id);
+        } catch (e) {
+          if (e.statusCode === 404) continue;
+          throw e;
+        }
+        if (!record || record.type !== "elenko_record" || record.profileId !== profileId) continue;
+        targets.push({ id, rev: record._rev || rev });
+      }
+    }
+
+    let deleted = 0;
+    let skipped = 0;
+    for (const t of targets) {
+      try {
+        await db.destroy(t.id, t.rev);
+        deleted++;
+      } catch (err) {
+        if (err?.statusCode === 404) {
+          skipped++;
+          continue;
+        }
+        throw err;
+      }
+    }
+    if (deleted > 0) clearProfileListCache(profileId);
+    res.json({ ok: true, deleted, skipped, requested: targets.length });
+  } catch (err) {
+    console.error("Error bulk-deleting entries:", err);
+    res.status(500).json({ error: err.message || "Bulk delete failed" });
+  }
+});
+
 app.get("/deletions", requireAdmin, async (req, res) => {
   try {
     const result = await db.find({
@@ -9989,6 +10348,7 @@ app.post("/api/profiles/:id/delete", requireAdmin, async (req, res) => {
     });
     const entries = (recordsResult.docs || []).map((r) => ({ id: r._id, rev: r._rev }));
     await db.destroy(id, _rev);
+    await removeProfileFromListLayout(id);
     let redirect = "/";
     if (entries.length > 0) {
       await db.insert({
@@ -10094,11 +10454,12 @@ app.get("/profile/:id", async (req, res) => {
     const SORT_FETCH_LIMIT = 50000;
 
     let totalPages = null;
+    let totalEntries = null;
     let allDocs = [];
     if (!searchQuery) {
       try {
         const countResult = await db.view("records", "countByProfile", { key: profileId });
-        const totalEntries = countResult.rows && countResult.rows[0] ? countResult.rows[0].value : 0;
+        totalEntries = countResult.rows && countResult.rows[0] ? countResult.rows[0].value : 0;
         totalPages = Math.max(1, Math.ceil(totalEntries / profileEntriesPageSize));
       } catch (e) {
         totalPages = 1;
@@ -10110,6 +10471,7 @@ app.get("/profile/:id", async (req, res) => {
       const sortConfig = JSON.stringify({ sortKeyFields, sortDirection });
       const cached = profileListCache.get(cacheKey);
       if (cached && cached.sortConfig === sortConfig && Array.isArray(cached.docs)) {
+        totalEntries = cached.docs.length;
         totalPages = Math.max(1, Math.ceil(cached.docs.length / profileEntriesPageSize));
         allDocs = cached.docs.slice(skip, skip + profileEntriesPageSize + 1);
       } else {
@@ -10133,6 +10495,7 @@ app.get("/profile/:id", async (req, res) => {
         };
         fullDocs.sort(cmp);
         profileListCache.set(cacheKey, { docs: fullDocs, sortConfig });
+        totalEntries = fullDocs.length;
         totalPages = Math.max(1, Math.ceil(fullDocs.length / profileEntriesPageSize));
         allDocs = fullDocs.slice(skip, skip + profileEntriesPageSize + 1);
       }
@@ -10144,6 +10507,7 @@ app.get("/profile/:id", async (req, res) => {
         profileId + SEARCH_CACHE_KEY_SEP + sortConfig + SEARCH_CACHE_KEY_SEP + acfKey + SEARCH_CACHE_KEY_SEP + searchQuery;
       const cached = searchListCache.get(searchCacheKey);
       if (cached && Array.isArray(cached.docs)) {
+        totalEntries = cached.docs.length;
         totalPages = Math.max(1, Math.ceil(cached.docs.length / profileEntriesPageSize));
         allDocs = cached.docs.slice(skip, skip + profileEntriesPageSize + 1);
       } else {
@@ -10173,6 +10537,7 @@ app.get("/profile/:id", async (req, res) => {
         };
         fullDocs.sort(cmp);
         searchListCache.set(searchCacheKey, { docs: fullDocs });
+        totalEntries = fullDocs.length;
         totalPages = Math.max(1, Math.ceil(fullDocs.length / profileEntriesPageSize));
         allDocs = fullDocs.slice(skip, skip + profileEntriesPageSize + 1);
       }
@@ -10193,6 +10558,7 @@ app.get("/profile/:id", async (req, res) => {
               entryMatchesSearchQuery(d, fieldNames, normalizedSearch)
             );
           }
+          totalEntries = filtered.length;
           totalPages = Math.max(1, Math.ceil(filtered.length / profileEntriesPageSize));
           allDocs = filtered.slice(skip, skip + profileEntriesPageSize + 1);
         } else {
@@ -10223,7 +10589,17 @@ app.get("/profile/:id", async (req, res) => {
     const hasPrev = page > 1;
     const role = (req.session && req.session.role) || "editor";
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderElenkoDatabasePage(doc, records, role, { page, totalPages, hasNext, hasPrev, searchQuery }));
+    res.send(
+      renderElenkoDatabasePage(doc, records, role, {
+        page,
+        totalPages,
+        hasNext,
+        hasPrev,
+        searchQuery,
+        totalEntries,
+        profileEntriesPageSize,
+      })
+    );
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Profile not found"));
     console.error("Error loading profile:", err);
@@ -12166,10 +12542,18 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     hasNext = false,
     hasPrev = false,
     searchQuery = "",
+    totalEntries = null,
+    profileEntriesPageSize = null,
     encryptionLock = null,
     encryptionEnabled = false,
     encryptionOwner = "",
   } = pagination;
+  const canBulkDelete = isAdmin && !encryptionLock;
+  const recordsOnPage = Array.isArray(records) ? records.length : 0;
+  const bulkSelectScopeCount =
+    totalEntries != null && Number.isFinite(Number(totalEntries))
+      ? Number(totalEntries)
+      : recordsOnPage;
   const profileBase = "/profile/" + encodeURIComponent(doc._id);
   const encryptionBanner = encryptionLock
     ? `<div class="encryption-notice" style="margin:0.75rem 0;padding:0.75rem 1rem;border:1px solid var(--profile-table-border, #30363d);border-radius:8px;background:var(--profile-table-header-bg, #21262d);color:var(--profile-text, #e6edf3);">
@@ -12240,9 +12624,13 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       --profile-table-border: ${escapeHtml(theme.tableBorder)};
     }`;
 
+  const selectColHeader = canBulkDelete
+    ? `<th class="entry-select-col entry-select-hidden"><input type="checkbox" id="entry-select-all" aria-label="Select all entries in this profile"></th>`
+    : "";
+
   const headerRow =
     fieldNames.length > 0
-      ? `<tr>${fieldNames
+      ? `<tr>${selectColHeader}${fieldNames
           .map((f, idx) => {
             const bodyTextCls = (typeof f === "string" && f.trim().toLowerCase() === "bodytext") ? " col-bodytext" : "";
             const mobileCls = (mobileVisibleSet.has(f) ? "col col-mobile-visible" : "col col-mobile-hidden") + bodyTextCls;
@@ -12293,14 +12681,18 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             }
             return `<td class="${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}${escaped}</span></td>`;
           });
-          return `\n        <tr class="entry-row" data-entry-id="${escapeHtml(rec._id || "")}">${cells.join("")}</tr>`;
+          const selectCell = canBulkDelete
+            ? `<td class="entry-select-col entry-select-hidden"><input type="checkbox" class="entry-delete-cb" data-id="${escapeHtml(rec._id || "")}" data-rev="${escapeHtml(rec._rev || "")}" aria-label="Select entry"></td>`
+            : "";
+          return `\n        <tr class="entry-row" data-entry-id="${escapeHtml(rec._id || "")}">${selectCell}${cells.join("")}</tr>`;
         })
       : [];
 
+  const tableColSpan = fieldNames.length + (canBulkDelete ? 1 : 0);
   const emptyRow =
     fieldNames.length > 0 && records.length === 0
       ? '\n        <tr><td colspan="' +
-        fieldNames.length +
+        tableColSpan +
         '" class="empty">' +
         (encryptionLock
           ? escapeHtml(encryptionLock.error || "This encrypted database is locked.")
@@ -12344,8 +12736,21 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .topbar-links a.topbar-icon-btn:hover { text-decoration: none; background: #30363d; color: var(--profile-link, #58a6ff); }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
     .topbar-actions { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: flex-end; }
-    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.35rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.9rem; }
+    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.35rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.9rem; border: none; cursor: pointer; }
     .btn:hover { background: #2ea043; text-decoration: none; }
+    .btn.btn-secondary { background: var(--profile-table-header-bg, #21262d); color: var(--profile-link, #58a6ff); border: 1px solid var(--profile-table-border, #21262d); }
+    .btn.btn-secondary:hover { background: #30363d; color: var(--profile-link, #58a6ff); }
+    .btn.btn-danger { background: #da3633; color: #fff; margin-left: 0.5rem; }
+    .btn.btn-danger:hover { background: #f85149; }
+    .btn.btn-danger:disabled { opacity: 0.55; cursor: not-allowed; }
+    .topbar-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; justify-content: flex-end; }
+    .entry-select-col { width: 2.25rem; text-align: center; padding-left: 0.5rem; padding-right: 0.5rem; vertical-align: middle; }
+    .entry-select-col input[type="checkbox"] { width: auto; margin: 0; cursor: pointer; }
+    .entry-select-hidden { display: none; }
+    body.entry-select-mode .entry-select-hidden { display: table-cell; }
+    .entry-bulk-msg { margin: 0 0 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 0.875rem; display: none; }
+    .entry-bulk-msg.err { display: block; background: #3d1f1f; color: #f85149; }
+    .entry-bulk-msg.ok { display: block; background: #1a2f1a; color: #3fb950; }
     table.elenko-db-table { width: 100%; border-collapse: collapse; background: var(--profile-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
     th, td { padding: 0.35rem 1rem; text-align: left; border-bottom: 1px solid var(--profile-table-border, #21262d); line-height: 1.35; }
     th { background: var(--profile-table-header-bg, #21262d); color: var(--profile-table-header-text, #8b949e); font-weight: 600; }
@@ -12450,7 +12855,11 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
         ${description ? `<span class="sub">${description}</span>` : ""}
       </div>
     </div>
-    <div class="topbar-actions">${canEdit && !encryptionLock ? `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn">Create entry</a>` : ""}</div>
+    <div class="topbar-actions">${
+      canBulkDelete
+        ? `<button type="button" id="toggle-select-mode" class="btn btn-secondary">Select entries</button><button type="button" id="delete-selected-btn" class="btn btn-danger" style="display:none;" disabled>Delete selected</button>`
+        : ""
+    }${canEdit && !encryptionLock ? `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn btn-create-entry">Create entry</a>` : ""}</div>
   </div>
   ${encryptionBanner}
   ${splitViewEnabled && splitViewOrientation !== "horizontal" ? `<div class="split-view-wrap split-${splitViewOrientation}" data-orientation="${splitViewOrientation}"><div class="split-list-pane">` : ""}
@@ -12472,6 +12881,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     ${hasNext ? `<a href="${nextUrl}" class="btn-pag btn-pag-next">▶▶</a>` : `<span class="btn-pag btn-pag-next disabled">▶▶</span>`}
     ${lastUrl ? `<a href="${lastUrl}" class="btn-pag btn-pag-last">▶|</a>` : `<span class="btn-pag btn-pag-last disabled">▶|</span>`}
   </div>
+  ${canBulkDelete ? `<div id="entry-bulk-msg" class="entry-bulk-msg" role="status" aria-live="polite"></div>` : ""}
   ${
     splitViewEnabled && splitViewOrientation === "horizontal"
       ? `<div class="split-view-wrap split-horizontal" data-orientation="horizontal"><div class="split-entry-pane"><iframe id="split-entry-frame" class="split-entry-frame" title="Selected entry view"></iframe><div id="split-entry-empty" class="split-entry-empty">Select an entry from the first-column link to open it here.</div></div><div class="split-divider" id="split-divider" aria-hidden="true"></div><div class="split-list-pane">`
@@ -12688,6 +13098,137 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       refreshButtons();
     })();
   </script>
+  ${
+    canBulkDelete
+      ? `<script>
+    (function() {
+      var toggleBtn = document.getElementById('toggle-select-mode');
+      var deleteBtn = document.getElementById('delete-selected-btn');
+      var selectAll = document.getElementById('entry-select-all');
+      var msgEl = document.getElementById('entry-bulk-msg');
+      var profileId = ${JSON.stringify(String(doc._id || ""))};
+      var searchQuery = ${JSON.stringify(searchQuery || "")};
+      var scopeCount = ${JSON.stringify(bulkSelectScopeCount)};
+      var recordsOnPage = ${JSON.stringify(recordsOnPage)};
+      var selectMode = false;
+      var deleteAllInScope = false;
+
+      function rowChecks() {
+        return Array.prototype.slice.call(document.querySelectorAll('.entry-delete-cb'));
+      }
+      function checkedRows() {
+        return rowChecks().filter(function(cb) { return cb.checked; });
+      }
+      function setMsg(text, kind) {
+        if (!msgEl) return;
+        msgEl.textContent = text || '';
+        msgEl.className = 'entry-bulk-msg' + (kind ? ' ' + kind : '');
+        msgEl.style.display = text ? 'block' : 'none';
+      }
+      function updateDeleteBtn() {
+        if (!deleteBtn) return;
+        var n = deleteAllInScope ? scopeCount : checkedRows().length;
+        deleteBtn.disabled = n === 0;
+        deleteBtn.textContent = n > 0 ? ('Delete selected (' + n + ')') : 'Delete selected';
+      }
+      function syncSelectAllState() {
+        if (!selectAll) return;
+        var boxes = rowChecks();
+        var checked = checkedRows();
+        if (boxes.length === 0) {
+          selectAll.checked = false;
+          selectAll.indeterminate = false;
+          return;
+        }
+        if (deleteAllInScope) {
+          selectAll.checked = true;
+          selectAll.indeterminate = false;
+          return;
+        }
+        selectAll.checked = checked.length === boxes.length;
+        selectAll.indeterminate = checked.length > 0 && checked.length < boxes.length;
+      }
+      function setSelectMode(on) {
+        selectMode = !!on;
+        document.body.classList.toggle('entry-select-mode', selectMode);
+        if (toggleBtn) toggleBtn.textContent = selectMode ? 'Cancel selection' : 'Select entries';
+        if (deleteBtn) deleteBtn.style.display = selectMode ? 'inline-block' : 'none';
+        if (!selectMode) {
+          deleteAllInScope = false;
+          rowChecks().forEach(function(cb) { cb.checked = false; });
+          if (selectAll) {
+            selectAll.checked = false;
+            selectAll.indeterminate = false;
+          }
+          setMsg('');
+        }
+        updateDeleteBtn();
+      }
+      if (toggleBtn) {
+        toggleBtn.addEventListener('click', function() {
+          setSelectMode(!selectMode);
+        });
+      }
+      if (selectAll) {
+        selectAll.addEventListener('change', function() {
+          var on = !!selectAll.checked;
+          deleteAllInScope = on && scopeCount > recordsOnPage;
+          rowChecks().forEach(function(cb) { cb.checked = on; });
+          syncSelectAllState();
+          updateDeleteBtn();
+        });
+      }
+      rowChecks().forEach(function(cb) {
+        cb.addEventListener('change', function() {
+          if (!cb.checked) deleteAllInScope = false;
+          syncSelectAllState();
+          updateDeleteBtn();
+        });
+        cb.addEventListener('click', function(ev) { ev.stopPropagation(); });
+      });
+      if (deleteBtn) {
+        deleteBtn.addEventListener('click', async function() {
+          var count = deleteAllInScope ? scopeCount : checkedRows().length;
+          if (count === 0) {
+            setMsg('Select at least one entry.', 'err');
+            return;
+          }
+          var scopeLabel = searchQuery
+            ? (' matching your search')
+            : '';
+          var confirmText = deleteAllInScope
+            ? ('Delete all ' + count + ' entries in this profile' + scopeLabel + '? This cannot be undone.')
+            : ('Delete ' + count + ' selected entr' + (count === 1 ? 'y' : 'ies') + '? This cannot be undone.');
+          if (!window.confirm(confirmText)) return;
+          deleteBtn.disabled = true;
+          setMsg('');
+          var body = deleteAllInScope
+            ? { all: true, q: searchQuery }
+            : { items: checkedRows().map(function(cb) { return { id: cb.getAttribute('data-id'), rev: cb.getAttribute('data-rev') }; }) };
+          try {
+            var r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/entries/bulk-delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body)
+            });
+            var data = await r.json();
+            if (!r.ok) {
+              setMsg(data.error || 'Delete failed', 'err');
+              updateDeleteBtn();
+              return;
+            }
+            setMsg('Deleted ' + (data.deleted || 0) + ' entr' + ((data.deleted || 0) === 1 ? 'y' : 'ies') + '.', 'ok');
+            setTimeout(function() { window.location.reload(); }, 700);
+          } catch (err) {
+            setMsg((err && err.message) ? err.message : 'Request failed', 'err');
+            updateDeleteBtn();
+          }
+        });
+      }
+    })();
+  </script>`
+      : ""
+  }
 </body>
 </html>`;
 }
@@ -13213,21 +13754,10 @@ function renderFlowsListPage(flows, appUi) {
 function renderProfilesListPage(profiles, appUi) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
-  const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
+  const sections = buildProfileListSections(profiles, appUi && appUi.profileListLayout);
   const rows =
     profiles.length > 0
-      ? profiles
-          .map((p) => {
-            const createdDate = p.createdAt ? formatDateOnly(p.createdAt) : "—";
-            return `
-        <tr>
-          <td><a href="/profile/${encodeURIComponent(p._id)}/edit">${escapeHtml(p.name || p._id)}</a></td>
-          <td>${escapeHtml(truncate(p.description || "", 80))}</td>
-          <td>${escapeHtml(createdDate)}</td>
-          <td class="row-actions"><a href="/profile/${encodeURIComponent(p._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action profile-copy-btn" data-id="${escapeHtml(p._id)}" aria-label="Copy" title="Copy">⧉</button><button type="button" class="delete-btn icon-action delete-profile-btn" data-id="${escapeHtml(p._id)}" data-rev="${escapeHtml(p._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
-        </tr>`;
-          })
-          .join("")
+      ? renderGroupedProfileListBody(sections, { adminMode: true, mobileHideDate: false })
       : `
         <tr>
           <td colspan="4" class="empty">No Elenko database profiles yet. <a href="/profile/create">Create one</a>.</td>
@@ -13314,12 +13844,13 @@ function renderProfilesListPage(profiles, appUi) {
     .empty { color: var(--app-label, #8b949e); font-style: italic; }
     .empty a { color: var(--app-link, #58a6ff); }
     #profiles-list-msg { margin-top: 0.75rem; font-size: 0.875rem; }
+    ${PROFILE_LIST_GROUP_STYLES}
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Start</a><a href="/profile/create" class="btn">Create Elenko database</a></div>
+  <div class="actions"><a href="/">← Start</a><a href="/profile/create" class="btn">Create Elenko database</a><a href="/profile-list-layout">List layout</a></div>
   <h1>Elenko profiles</h1>
-  <p class="sub">All database profiles. Name opens the profile edit page (not the entry list). Use ⧉ to duplicate a profile (entries are not copied).</p>
+  <p class="sub">All database profiles. Folders match the start page layout (<a href="/profile-list-layout">edit layout</a>). Name opens the profile edit page (not the entry list). Use ⧉ to duplicate a profile (entries are not copied).</p>
   <table>
     <thead><tr><th>Name</th><th>Description</th><th>Creation date</th><th>Actions</th></tr></thead>
     <tbody>${rows}
@@ -13387,6 +13918,7 @@ function renderProfilesListPage(profiles, appUi) {
             });
         });
       });
+      ${PROFILE_LIST_GROUP_SCRIPT}
     })();
   </script>
 </body>
@@ -14273,6 +14805,7 @@ output._createMany = [
   <ul>
     <li>Each object is mapped to profile fields by name.</li>
     <li>Unknown fields are ignored; missing profile fields become empty.</li>
+    <li>Optional <code>_targetProfileId</code> (or <code>_profileId</code>) on a row creates that entry in another profile (id or name).</li>
   </ul>
 
   <h2>Combined example</h2>
@@ -16385,18 +16918,9 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
       --app-table-header-text: ${escapeHtml(theme.tableHeaderText)};
       --app-table-border: ${escapeHtml(theme.tableBorder)};
     }`;
+  const sections = buildProfileListSections(profiles, appUi && appUi.profileListLayout);
   const rows = profiles.length
-    ? profiles
-        .map((p) => {
-          const createdDate = p.createdAt ? formatDateOnly(p.createdAt) : "—";
-          return `
-        <tr>
-          <td><a href="/profile/${encodeURIComponent(p._id)}">${escapeHtml(p.name || p._id)}</a></td>
-          <td>${escapeHtml(p.description || "—")}</td>
-          <td class="col-mobile-hidden">${escapeHtml(createdDate)}</td>
-        </tr>`;
-        })
-        .join("")
+    ? renderGroupedProfileListBody(sections, { adminMode: false, mobileHideDate: true })
     : `
         <tr>
           <td colspan="3" class="empty">No Elenko database profiles yet.${isAdmin ? ' Add documents with <code>type: "elenko_profile"</code> in CouchDB.' : ""}</td>
@@ -16405,7 +16929,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
     const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
   const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option><option value="/account/unlock-keyfile">Provide key file</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
   const thead = '<tr><th>Name</th><th>Description</th><th class="col-mobile-hidden">Creation date</th></tr>';
 
@@ -16455,6 +16979,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
       .nav-select-flow { width: 4.4rem; max-width: 4.4rem; min-width: 4.4rem; }
       .nav-select-special { width: 4.4rem; max-width: 4.4rem; min-width: 4.4rem; }
     }
+    ${PROFILE_LIST_GROUP_STYLES}
   </style>
 </head>
 <body>
@@ -16488,6 +17013,221 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
       var v = this.value;
       if (v) { window.location.href = v; }
     });
+    ${PROFILE_LIST_GROUP_SCRIPT}
+  </script>
+</body>
+</html>`;
+}
+
+function renderProfileListLayoutPage(profiles, appUi, err) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const layout = normalizeProfileListLayout(appUi && appUi.profileListLayout);
+  const profileById = {};
+  for (const p of profiles || []) {
+    profileById[p._id] = p;
+  }
+  const layoutJson = JSON.stringify(layout).replace(/<\//g, "<\\/");
+  const profilesJson = JSON.stringify(profiles || []).replace(/<\//g, "<\\/");
+  const msgErr = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Database list layout</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 52rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a, .actions button { margin-right: 0.5rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .actions a:hover { text-decoration: underline; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; margin-bottom: 1rem; }
+    th, td { padding: 0.6rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); vertical-align: middle; }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    .layout-folder td { background: rgba(88, 166, 255, 0.06); }
+    .layout-actions { white-space: nowrap; }
+    .layout-actions button { border: none; background: none; color: var(--app-label, #8b949e); font: inherit; cursor: pointer; padding: 0.2rem 0.35rem; font-size: 1rem; }
+    .layout-actions button:hover { color: var(--app-link, #58a6ff); }
+    .layout-actions button:disabled { opacity: 0.35; cursor: not-allowed; }
+    .layout-label-input { width: 100%; max-width: 20rem; padding: 0.35rem 0.5rem; background: var(--app-bg, #0f1419); border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; color: var(--app-text, #e6edf3); font: inherit; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 1rem; }
+    select { padding: 0.4rem 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font: inherit; max-width: 18rem; }
+    .btn { display: inline-block; padding: 0.45rem 0.85rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
+    .btn-primary { background: #238636; color: #fff; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); border: 1px solid var(--app-table-border, #30363d); }
+    .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
+    .msg.err { background: #3d1f1f; color: #f85149; }
+    .msg.ok { background: #1f3d2a; color: #3fb950; }
+    .empty-layout { color: var(--app-label, #8b949e); font-style: italic; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="actions">
+    <a href="/">← Start</a>
+    <button type="button" id="save-layout-btn" class="btn btn-primary">Save layout</button>
+    <a href="/profiles" class="btn btn-secondary">Elenko profiles</a>
+  </div>
+  <h1>Database list layout</h1>
+  <p class="sub">Define folders and order for the start page and <a href="/profiles">Elenko profiles</a> list. Folders are collapsed by default. Each database appears at most once; databases not listed appear at the end (ungrouped). Empty folders are hidden on the start page.</p>
+  ${msgErr}
+  <table>
+    <thead><tr><th>#</th><th>Type</th><th>Name</th><th>Move</th></tr></thead>
+    <tbody id="layout-body"></tbody>
+  </table>
+  <div id="layout-empty" class="empty-layout" style="display:none;">No layout entries yet. Add a folder or database below.</div>
+  <div class="toolbar">
+    <button type="button" id="add-folder-btn" class="btn btn-secondary">Add folder</button>
+    <select id="add-profile-select" aria-label="Database to add"><option value="">Add database…</option></select>
+    <button type="button" id="add-profile-btn" class="btn btn-secondary">Add database</button>
+  </div>
+  <div id="msg" class="msg" style="display:none;"></div>
+  <script>
+    (function() {
+      var layout = ${layoutJson};
+      var profiles = ${profilesJson};
+      var profileById = {};
+      profiles.forEach(function(p) { profileById[p._id] = p; });
+      var bodyEl = document.getElementById('layout-body');
+      var emptyEl = document.getElementById('layout-empty');
+      var msgEl = document.getElementById('msg');
+      var addSelect = document.getElementById('add-profile-select');
+
+      function layoutProfileIds() {
+        var ids = {};
+        layout.forEach(function(item) {
+          if (item.kind === 'profile') ids[item.profileId] = true;
+        });
+        return ids;
+      }
+
+      function refreshAddProfileSelect() {
+        var used = layoutProfileIds();
+        addSelect.innerHTML = '<option value="">Add database…</option>';
+        profiles.forEach(function(p) {
+          if (used[p._id]) return;
+          var opt = document.createElement('option');
+          opt.value = p._id;
+          opt.textContent = p.name || p._id;
+          addSelect.appendChild(opt);
+        });
+      }
+
+      function moveItem(index, delta) {
+        var next = index + delta;
+        if (next < 0 || next >= layout.length) return;
+        var tmp = layout[index];
+        layout[index] = layout[next];
+        layout[next] = tmp;
+        render();
+      }
+
+      function removeItem(index) {
+        layout.splice(index, 1);
+        render();
+      }
+
+      function render() {
+        bodyEl.innerHTML = '';
+        emptyEl.style.display = layout.length ? 'none' : 'block';
+        layout.forEach(function(item, index) {
+          var tr = document.createElement('tr');
+          if (item.kind === 'group') tr.className = 'layout-folder';
+          var numTd = document.createElement('td');
+          numTd.textContent = String(index + 1);
+          tr.appendChild(numTd);
+          var typeTd = document.createElement('td');
+          typeTd.textContent = item.kind === 'group' ? 'Folder' : 'Database';
+          tr.appendChild(typeTd);
+          var nameTd = document.createElement('td');
+          if (item.kind === 'group') {
+            var inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'layout-label-input';
+            inp.value = item.label || '';
+            inp.addEventListener('input', function() { item.label = inp.value; });
+            nameTd.appendChild(inp);
+          } else {
+            var p = profileById[item.profileId];
+            nameTd.textContent = p ? (p.name || p._id) : ('(missing: ' + item.profileId + ')');
+          }
+          tr.appendChild(nameTd);
+          var actTd = document.createElement('td');
+          actTd.className = 'layout-actions';
+          var up = document.createElement('button');
+          up.type = 'button';
+          up.title = 'Move up';
+          up.textContent = '↑';
+          up.disabled = index === 0;
+          up.addEventListener('click', function() { moveItem(index, -1); });
+          var down = document.createElement('button');
+          down.type = 'button';
+          down.title = 'Move down';
+          down.textContent = '↓';
+          down.disabled = index === layout.length - 1;
+          down.addEventListener('click', function() { moveItem(index, 1); });
+          var rm = document.createElement('button');
+          rm.type = 'button';
+          rm.title = 'Remove';
+          rm.textContent = '✕';
+          rm.addEventListener('click', function() { removeItem(index); });
+          actTd.appendChild(up);
+          actTd.appendChild(down);
+          actTd.appendChild(rm);
+          tr.appendChild(actTd);
+          bodyEl.appendChild(tr);
+        });
+        refreshAddProfileSelect();
+      }
+
+      document.getElementById('add-folder-btn').addEventListener('click', function() {
+        layout.push({ kind: 'group', id: 'group-' + Date.now().toString(36), label: 'New folder' });
+        render();
+      });
+
+      document.getElementById('add-profile-btn').addEventListener('click', function() {
+        var id = addSelect.value;
+        if (!id) return;
+        layout.push({ kind: 'profile', profileId: id });
+        render();
+      });
+
+      document.getElementById('save-layout-btn').addEventListener('click', async function() {
+        msgEl.style.display = 'none';
+        msgEl.textContent = '';
+        var btn = document.getElementById('save-layout-btn');
+        btn.disabled = true;
+        try {
+          var r = await fetch('/api/profile-list-layout', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profileListLayout: layout })
+          });
+          var data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Save failed');
+          if (Array.isArray(data.profileListLayout)) layout = data.profileListLayout;
+          render();
+          msgEl.textContent = 'Layout saved.';
+          msgEl.className = 'msg ok';
+          msgEl.style.display = 'block';
+        } catch (e) {
+          msgEl.textContent = e.message || 'Save failed';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      render();
+    })();
   </script>
 </body>
 </html>`;
