@@ -76,6 +76,7 @@ const PRIMARY_KEY_FIELDS_MAX = 3;
 const DB_CODE_LEN = 8;
 const PRIMARY_KEY_SEGMENT_LEN_MIN = 1;
 const PRIMARY_KEY_SEGMENT_LEN_MAX = 512;
+const PRIMARY_KEY_SEGMENT_LEN_DEFAULT = 64;
 const DEFAULT_VALUE_SOURCES = ["", "createdAt", "updatedAt", "currentUser"];
 
 /** Inline entry images: CouchDB attachments (see POST/GET .../attachments). */
@@ -2630,7 +2631,7 @@ function apiKeyLookupErrorInfo(err) {
 /** Stored on `elenko_api.apiAuthType`. Legacy docs without it use bearer when `apiKeyRef` is set, else none. */
 function normalizeElenkoApiAuthType(apiDoc) {
   const t = apiDoc && typeof apiDoc.apiAuthType === "string" ? apiDoc.apiAuthType.trim().toLowerCase() : "";
-  if (t === "none" || t === "bearer" || t === "basic" || t === "digest" || t === "fritz") return t;
+  if (t === "none" || t === "bearer" || t === "x-api-key" || t === "basic" || t === "digest" || t === "fritz") return t;
   const kr = apiDoc && typeof apiDoc.apiKeyRef === "string" ? apiDoc.apiKeyRef.trim() : "";
   return kr ? "bearer" : "none";
 }
@@ -2667,7 +2668,7 @@ async function resolveApiWorkerAuthBundle(apiDoc) {
     }
   }
 
-  if (authType === "bearer") {
+  if (authType === "bearer" || authType === "x-api-key") {
     apiKeyRef = apiDoc && typeof apiDoc.apiKeyRef === "string" ? apiDoc.apiKeyRef.trim() : "";
     if (apiKeyRef) {
       const r = await loadRef(apiKeyRef);
@@ -2849,7 +2850,7 @@ function normalizePrimaryKeyFieldsFromBody(fieldNames, rawFields, rawLengths) {
           : Math.min(Math.max(len, PRIMARY_KEY_SEGMENT_LEN_MIN), PRIMARY_KEY_SEGMENT_LEN_MAX)
       );
     } else {
-      primaryKeySegmentLengths.push(32);
+      primaryKeySegmentLengths.push(PRIMARY_KEY_SEGMENT_LEN_DEFAULT);
     }
   }
   return { primaryKeyFields: fields, primaryKeySegmentLengths };
@@ -2872,11 +2873,11 @@ function computePrimaryKeyForRecord(record, profileDoc) {
     const maxLen =
       lengths[i] != null && Number.isFinite(Number(lengths[i]))
         ? Math.floor(Number(lengths[i]))
-        : 32;
+        : PRIMARY_KEY_SEGMENT_LEN_DEFAULT;
     const segLen =
       maxLen >= PRIMARY_KEY_SEGMENT_LEN_MIN && maxLen <= PRIMARY_KEY_SEGMENT_LEN_MAX
         ? maxLen
-        : 32;
+        : PRIMARY_KEY_SEGMENT_LEN_DEFAULT;
     const raw = record[fn] != null ? String(record[fn]) : "";
     const segment = raw.length > segLen ? raw.slice(0, segLen) : raw;
     str += segment + " ".repeat(segLen - segment.length);
@@ -2941,6 +2942,46 @@ async function recomputePrimaryKeysForProfileRecords(dbInstance, profileDoc) {
     rec.updatedAt = now;
     await dbInstance.insert(rec);
   }
+}
+
+function normalizeListFlowConfigItem(item) {
+  if (!item || typeof item !== "object") return null;
+  const flowId = typeof item.flowId === "string" ? item.flowId.trim() : "";
+  if (!flowId) return null;
+  const label = typeof item.label === "string" && item.label.trim() ? item.label.trim() : "Run flow";
+  const enabled = item.enabled !== false && item.enabled !== "false";
+  return { flowId, label, enabled };
+}
+
+function getProfileListFlowConfigs(profileDoc) {
+  const raw = Array.isArray(profileDoc && profileDoc.listFlowConfigs) ? profileDoc.listFlowConfigs : [];
+  return raw.map(normalizeListFlowConfigItem).filter(Boolean).filter((c) => c.enabled);
+}
+
+function profileAllowsListFlow(profileDoc, flowRef) {
+  const ref = typeof flowRef === "string" ? flowRef.trim() : "";
+  if (!ref) return false;
+  const configs = Array.isArray(profileDoc && profileDoc.listFlowConfigs) ? profileDoc.listFlowConfigs : [];
+  return configs.some((item) => {
+    const norm = normalizeListFlowConfigItem(item);
+    return norm && norm.enabled && norm.flowId === ref;
+  });
+}
+
+async function resolveFlowDocByRef(flowRef) {
+  const ref = typeof flowRef === "string" ? flowRef.trim() : "";
+  if (!ref || !configDb) return null;
+  let flowDoc = null;
+  try {
+    flowDoc = await configDb.get(ref);
+  } catch (e) {
+    if (e.statusCode !== 404) throw e;
+  }
+  if (!flowDoc || flowDoc.type !== "elenko_flow") {
+    const byName = await configDb.find({ selector: { type: "elenko_flow", name: ref }, limit: 1 });
+    flowDoc = byName.docs && byName.docs[0];
+  }
+  return flowDoc && flowDoc.type === "elenko_flow" ? flowDoc : null;
 }
 
 function getProfileEntryFormIds(profileDoc) {
@@ -3147,6 +3188,9 @@ async function updateCurrentEntryFromDataset(dbInstance, context) {
   // Do not persist helper fields used only inside the pipeline
   delete patch._lastCreatedId;
   delete patch._lastCreatedCount;
+  delete patch._lastImportAttempted;
+  delete patch._lastSkippedDuplicates;
+  delete patch._lastImportFailed;
   delete patch._repeatRow;
   delete patch._lastAppendRepeatField;
   delete patch._lastAppendRepeatFields;
@@ -3539,6 +3583,8 @@ async function runPipeline(context, flowDoc) {
         delete scriptOutput._createMany;
         context.dataset = { ...(context.dataset || {}), ...scriptOutput };
         let createdCount = 0;
+        let skippedDuplicateCount = 0;
+        let failedCount = 0;
         if (createManyRaw && context.profileId && db) {
           for (let rowIndex = 0; rowIndex < createManyRaw.length; rowIndex++) {
             const row = createManyRaw[rowIndex];
@@ -3558,15 +3604,31 @@ async function runPipeline(context, flowDoc) {
               );
               createdCount++;
             } catch (err) {
+              const msg = err && err.message ? String(err.message) : String(err);
+              if (/duplicate primary key/i.test(msg)) {
+                skippedDuplicateCount++;
+              } else {
+                failedCount++;
+              }
               console.error("REST API import _createMany row failed:", {
                 profileId: targetProfileId,
                 stepIndex: i,
                 rowIndex,
-                message: err && err.message ? err.message : String(err),
+                message: msg,
               });
             }
           }
           context.dataset._lastCreatedCount = createdCount;
+          context.dataset._lastImportAttempted = createManyRaw.length;
+          context.dataset._lastSkippedDuplicates = skippedDuplicateCount;
+          context.dataset._lastImportFailed = failedCount;
+          sendFlowMessage("flow.importStats", {
+            stepIndex: i,
+            attempted: createManyRaw.length,
+            created: createdCount,
+            skippedDuplicates: skippedDuplicateCount,
+            failed: failedCount,
+          });
           hasExplicitPersistStep = true;
         }
       }
@@ -3603,12 +3665,13 @@ async function runPipeline(context, flowDoc) {
               : bodyStr.length;
           bodyToStore = bodyStr.slice(startIdx, endIdx).trim();
         }
-        context.dataset[fn] = applyPlainValueToProfileField(
-          context.profileDoc,
-          context.dataset,
-          fn,
-          bodyToStore
-        );
+        const profileFieldNames = Array.isArray(context.profileDoc && context.profileDoc.fieldNames)
+          ? context.profileDoc.fieldNames
+          : [];
+        context.dataset[fn] =
+          profileFieldNames.includes(fn)
+            ? applyPlainValueToProfileField(context.profileDoc, context.dataset, fn, bodyToStore)
+            : bodyToStore;
       }
     }
   }
@@ -3698,6 +3761,7 @@ function defaultAppUiConfigObject() {
     flowLogIana: "",
     flowLogUtcOffsetMinutes: 0,
     flowLogDockerAdjustMinutes: 0,
+    flowLogLevel: "normal",
     profileListLayout: [],
   };
 }
@@ -3941,6 +4005,7 @@ async function getAppUiConfig() {
           flowLogIana: typeof doc.flowLogIana === "string" ? doc.flowLogIana.trim() : "",
           flowLogUtcOffsetMinutes: parseBoundedInt(doc.flowLogUtcOffsetMinutes, 0, -840, 840),
           flowLogDockerAdjustMinutes: parseBoundedInt(doc.flowLogDockerAdjustMinutes, 0, -10080, 10080),
+          flowLogLevel: normalizeFlowLogLevel(doc.flowLogLevel),
           profileListLayout: normalizeProfileListLayout(doc.profileListLayout),
         };
       }
@@ -3970,10 +4035,72 @@ async function getAppUiConfig() {
 }
 
 const FLOW_LOG_DISPLAY_MODES = new Set(["utc", "iana", "utc_offset"]);
+const FLOW_LOG_LEVELS = new Set(["minimal", "normal", "verbose"]);
+const FLOW_LOG_READ_TAIL_BYTES = 2 * 1024 * 1024;
 
 function normalizeFlowLogDisplayMode(m) {
   const s = typeof m === "string" ? m.trim().toLowerCase() : "";
   return FLOW_LOG_DISPLAY_MODES.has(s) ? s : "utc";
+}
+
+function normalizeFlowLogLevel(raw) {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (FLOW_LOG_LEVELS.has(s)) return s;
+  if (/^(1|true|yes)$/i.test(String(process.env.FLOW_DEBUG || "").trim())) return "verbose";
+  const envLevel = typeof process.env.FLOW_LOG_LEVEL === "string" ? process.env.FLOW_LOG_LEVEL.trim().toLowerCase() : "";
+  if (FLOW_LOG_LEVELS.has(envLevel)) return envLevel;
+  return "normal";
+}
+
+function getFlowLogFilePath() {
+  return process.env.FLOW_LOG_FILE || path.join(__dirname, "logs", "elenko.log");
+}
+
+function readFlowLogTailLines(limitRaw) {
+  const limit = parseBoundedInt(limitRaw, 25, 1, 1000);
+  const logFile = getFlowLogFilePath();
+  if (!fs.existsSync(logFile)) {
+    return { entries: [], logFile, fileSize: 0, limit, truncatedRead: false };
+  }
+  const stat = fs.statSync(logFile);
+  let content = "";
+  let truncatedRead = false;
+  if (stat.size <= FLOW_LOG_READ_TAIL_BYTES) {
+    content = fs.readFileSync(logFile, "utf8");
+  } else {
+    truncatedRead = true;
+    const fd = fs.openSync(logFile, "r");
+    const buf = Buffer.alloc(FLOW_LOG_READ_TAIL_BYTES);
+    fs.readSync(fd, buf, 0, FLOW_LOG_READ_TAIL_BYTES, stat.size - FLOW_LOG_READ_TAIL_BYTES);
+    fs.closeSync(fd);
+    content = buf.toString("utf8");
+    const nl = content.indexOf("\n");
+    if (nl >= 0) content = content.slice(nl + 1);
+  }
+  const lines = content.split(/\r?\n/).filter((l) => l.trim());
+  const lastLines = lines.slice(-limit);
+  const entries = lastLines.map((line) => {
+    try {
+      return JSON.parse(line);
+    } catch (_) {
+      return { raw: line };
+    }
+  });
+  return { entries, logFile, fileSize: stat.size, limit, truncatedRead };
+}
+
+function notifyFlowWorkerLogLevel(level) {
+  if (!flowWorker) return;
+  try {
+    flowWorker.postMessage({ type: "flow.logConfig", payload: { level: normalizeFlowLogLevel(level) } });
+  } catch (err) {
+    originalConsoleError("Failed to notify flow worker log level:", err);
+  }
+}
+
+async function applyFlowLogLevelFromConfig() {
+  const appUi = await getAppUiConfig();
+  notifyFlowWorkerLogLevel(appUi && appUi.flowLogLevel ? appUi.flowLogLevel : "normal");
 }
 
 function parseBoundedInt(v, def, min, max) {
@@ -3989,6 +4116,7 @@ function ensureAppUiTimeFields(obj) {
   obj.flowLogIana = typeof obj.flowLogIana === "string" ? obj.flowLogIana.trim() : "";
   obj.flowLogUtcOffsetMinutes = parseBoundedInt(obj.flowLogUtcOffsetMinutes, 0, -840, 840);
   obj.flowLogDockerAdjustMinutes = parseBoundedInt(obj.flowLogDockerAdjustMinutes, 0, -10080, 10080);
+  obj.flowLogLevel = normalizeFlowLogLevel(obj.flowLogLevel);
 }
 
 function pad2(n) {
@@ -6493,6 +6621,94 @@ app.post("/api/profile-list-layout", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/debug", requireAdmin, async (req, res) => {
+  try {
+    const appUi = await getAppUiConfig();
+    const limit = parseBoundedInt(req.query && req.query.limit, 25, 1, 1000);
+    const logData = readFlowLogTailLines(limit);
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderDebugPage(appUi, logData, null));
+  } catch (err) {
+    console.error("Error loading debug page:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/api/debug/log", requireAdmin, async (req, res) => {
+  try {
+    const limit = parseBoundedInt(req.query && req.query.limit, 25, 1, 1000);
+    const logData = readFlowLogTailLines(limit);
+    res.json({
+      ok: true,
+      logFile: logData.logFile,
+      fileSize: logData.fileSize,
+      limit: logData.limit,
+      truncatedRead: logData.truncatedRead,
+      flowLogLevel: normalizeFlowLogLevel((await getAppUiConfig()).flowLogLevel),
+      entries: logData.entries,
+    });
+  } catch (err) {
+    console.error("Error reading flow log:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/debug/log/download", requireAdmin, async (req, res) => {
+  try {
+    const limit = parseBoundedInt(req.query && req.query.limit, 25, 1, 1000);
+    const logData = readFlowLogTailLines(limit);
+    const body =
+      logData.entries
+        .map((entry) => {
+          try {
+            return JSON.stringify(entry);
+          } catch (_) {
+            return JSON.stringify({ raw: String(entry) });
+          }
+        })
+        .join("\n") + (logData.entries.length ? "\n" : "");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="elenko-flow-log-${stamp}.jsonl"`);
+    res.send(body);
+  } catch (err) {
+    console.error("Error downloading flow log:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/debug/log-config", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const body = req.body || {};
+    const level = normalizeFlowLogLevel(body.flowLogLevel);
+
+    let doc = null;
+    const id = typeof body._id === "string" && body._id.trim() ? body._id.trim() : "";
+    if (id) {
+      try {
+        const existing = await configDb.get(id);
+        if (existing && existing.type === "elenko_app_config") doc = existing;
+      } catch (_) {}
+    }
+    if (!doc) {
+      const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+      doc = result.docs && result.docs[0];
+    }
+    if (!doc || doc.type !== "elenko_app_config") {
+      doc = { type: "elenko_app_config", theme: { ...DEFAULT_APP_THEME } };
+    }
+    doc.flowLogLevel = level;
+    const ins = await configDb.insert(doc);
+    invalidateAppUiConfigCache();
+    notifyFlowWorkerLogLevel(level);
+    res.json({ ok: true, id: ins.id, rev: ins.rev, flowLogLevel: level });
+  } catch (err) {
+    console.error("Error saving debug log config:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/application-properties", requireAdmin, async (req, res) => {
   try {
     if (!configDb) return res.status(503).json({ error: "Config store not available" });
@@ -8962,10 +9178,22 @@ app.get("/profile/:id/edit", requireAdmin, async (req, res) => {
       });
       forms = result.docs || [];
     } catch (e) {}
+    let flows = [];
+    try {
+      if (configDb) {
+        const flowResult = await configDb.find({
+          selector: { type: "elenko_flow" },
+          fields: ["_id", "name"],
+          sort: [{ name: "asc" }],
+          limit: 500,
+        });
+        flows = flowResult.docs || [];
+      }
+    } catch (e) {}
     const appUi = await getAppUiConfig();
     const keyFileUsers = await loadUsersWithRegisteredKeyFiles(db);
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditProfilePage(doc, forms, appUi, keyFileUsers));
+    res.send(renderEditProfilePage(doc, forms, appUi, keyFileUsers, flows));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Profile not found"));
     console.error("Error loading profile:", err);
@@ -8989,6 +9217,7 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       mobileSingleEntryFormId,
       infoImportFlowId,
       infoImportButtonTitle,
+      listFlowConfigs: rawListFlowConfigs,
       entriesPageSize,
       splitView,
       guardianFlowId,
@@ -9079,6 +9308,11 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
         ? infoImportButtonTitle.trim()
         : "Import from Guardian";
     doc.infoImportButtonTitle = importButtonTitle;
+    if (Array.isArray(rawListFlowConfigs)) {
+      doc.listFlowConfigs = rawListFlowConfigs.map(normalizeListFlowConfigItem).filter(Boolean);
+    } else if (!Array.isArray(doc.listFlowConfigs)) {
+      doc.listFlowConfigs = [];
+    }
     const rawPageSize = Number(entriesPageSize);
     doc.entriesPageSize =
       Number.isFinite(rawPageSize) && rawPageSize >= ENTRIES_PAGE_SIZE_MIN && rawPageSize <= ENTRIES_PAGE_SIZE_MAX
@@ -10236,6 +10470,128 @@ app.post("/api/profiles/:id/entries/bulk-delete", requireAdmin, async (req, res)
   } catch (err) {
     console.error("Error bulk-deleting entries:", err);
     res.status(500).json({ error: err.message || "Bulk delete failed" });
+  }
+});
+
+app.post("/api/profiles/:id/entries/bulk-run-flow", requireAuth, async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const flowRef = typeof req.body?.flowId === "string" ? req.body.flowId.trim() : "";
+    if (!flowRef) {
+      return res.status(400).json({ error: "Missing flowId" });
+    }
+    const doc = await db.get(profileId);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    if (!profileAllowsListFlow(doc, flowRef)) {
+      return res.status(403).json({ error: "This flow is not configured for the database list view." });
+    }
+    const encAccess = await resolveProfileEncryptionAccess(req, doc);
+    if (isProfilePersonalEncryptionEnabled(doc) && !encAccess.ok) {
+      return respondEncryptionAccessDenied(res, encAccess, "json");
+    }
+    const flowDoc = await resolveFlowDocByRef(flowRef);
+    if (!flowDoc) {
+      return res.status(404).json({ error: "Flow not found: " + flowRef });
+    }
+    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+    const searchQuery = typeof req.body?.q === "string" ? req.body.q.trim() : "";
+    const useAccentFolding = isProfileSearchAccentFoldingEnabled(doc);
+    const runAll = req.body?.all === true;
+    let entryIds = [];
+
+    if (runAll) {
+      const selector = buildProfileEntrySearchSelector(profileId, fieldNames, searchQuery, useAccentFolding);
+      const normalizedSearch =
+        searchQuery && useAccentFolding ? normalizeForSearch(searchQuery) : "";
+      const findFields =
+        searchQuery && useAccentFolding && fieldNames.length
+          ? ["_id", "profileId", "type", ...fieldNames]
+          : ["_id", "profileId", "type"];
+      const BATCH = 500;
+      let bookmark;
+      for (;;) {
+        const findOpts = {
+          selector,
+          fields: findFields,
+          limit: BATCH,
+        };
+        if (bookmark) findOpts.bookmark = bookmark;
+        const batch = await db.find(findOpts);
+        let docs = batch.docs || [];
+        if (searchQuery && useAccentFolding && normalizedSearch) {
+          docs = docs.filter((d) => entryMatchesSearchQuery(d, fieldNames, normalizedSearch));
+        }
+        for (const d of docs) {
+          if (d && d._id && d.type === "elenko_record" && d.profileId === profileId) {
+            entryIds.push(String(d._id));
+          }
+        }
+        if (!batch.docs || batch.docs.length < BATCH) break;
+        bookmark = batch.bookmark;
+        if (!bookmark) break;
+      }
+    } else {
+      const items = req.body?.items;
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: "Missing or empty items array" });
+      }
+      for (const it of items) {
+        const id = it && it.id != null ? String(it.id).trim() : "";
+        if (!id) continue;
+        let record;
+        try {
+          record = await db.get(id);
+        } catch (e) {
+          if (e.statusCode === 404) continue;
+          throw e;
+        }
+        if (!record || record.type !== "elenko_record" || record.profileId !== profileId) continue;
+        entryIds.push(id);
+      }
+    }
+
+    if (entryIds.length === 0) {
+      return res.status(400).json({ error: "No entries selected" });
+    }
+
+    const formDoc = await loadDefaultEntryFormForProfile(db, doc);
+    let ran = 0;
+    let failed = 0;
+    const errors = [];
+    for (const entryId of entryIds) {
+      try {
+        const record = await db.get(entryId);
+        if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
+          failed++;
+          continue;
+        }
+        if (encAccess.profileKey) {
+          decryptRecordFieldsInPlace(record, doc, encAccess.profileKey, formDoc);
+        }
+        const context = {
+          profileId,
+          entryId,
+          profileName: doc.name || profileId,
+          dataset: { ...record },
+          param: "",
+          req,
+        };
+        await runPipeline(context, flowDoc);
+        ran++;
+      } catch (err) {
+        failed++;
+        if (errors.length < 5) {
+          errors.push({ entryId, error: err && err.message ? String(err.message) : String(err) });
+        }
+      }
+    }
+    if (ran > 0) clearProfileListCache(profileId);
+    res.json({ ok: true, ran, failed, requested: entryIds.length, errors });
+  } catch (err) {
+    console.error("Error bulk-running flow on entries:", err);
+    res.status(500).json({ error: err.message || "Bulk flow run failed" });
   }
 });
 
@@ -12549,6 +12905,8 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     encryptionOwner = "",
   } = pagination;
   const canBulkDelete = isAdmin && !encryptionLock;
+  const listFlowConfigs = getProfileListFlowConfigs(doc);
+  const canBulkSelect = !encryptionLock && (canBulkDelete || (canEdit && listFlowConfigs.length > 0));
   const recordsOnPage = Array.isArray(records) ? records.length : 0;
   const bulkSelectScopeCount =
     totalEntries != null && Number.isFinite(Number(totalEntries))
@@ -12624,7 +12982,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       --profile-table-border: ${escapeHtml(theme.tableBorder)};
     }`;
 
-  const selectColHeader = canBulkDelete
+  const selectColHeader = canBulkSelect
     ? `<th class="entry-select-col entry-select-hidden"><input type="checkbox" id="entry-select-all" aria-label="Select all entries in this profile"></th>`
     : "";
 
@@ -12681,14 +13039,14 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             }
             return `<td class="${mobileCls}${deskCls}${dispCls}"${styleAttr}><span class="entry-cell-clamp">${responseMarker}${escaped}</span></td>`;
           });
-          const selectCell = canBulkDelete
+          const selectCell = canBulkSelect
             ? `<td class="entry-select-col entry-select-hidden"><input type="checkbox" class="entry-delete-cb" data-id="${escapeHtml(rec._id || "")}" data-rev="${escapeHtml(rec._rev || "")}" aria-label="Select entry"></td>`
             : "";
           return `\n        <tr class="entry-row" data-entry-id="${escapeHtml(rec._id || "")}">${selectCell}${cells.join("")}</tr>`;
         })
       : [];
 
-  const tableColSpan = fieldNames.length + (canBulkDelete ? 1 : 0);
+  const tableColSpan = fieldNames.length + (canBulkSelect ? 1 : 0);
   const emptyRow =
     fieldNames.length > 0 && records.length === 0
       ? '\n        <tr><td colspan="' +
@@ -12856,8 +13214,13 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       </div>
     </div>
     <div class="topbar-actions">${
-      canBulkDelete
-        ? `<button type="button" id="toggle-select-mode" class="btn btn-secondary">Select entries</button><button type="button" id="delete-selected-btn" class="btn btn-danger" style="display:none;" disabled>Delete selected</button>`
+      canBulkSelect
+        ? `<button type="button" id="toggle-select-mode" class="btn btn-secondary">Select entries</button>${listFlowConfigs
+            .map(
+              (cfg) =>
+                `<button type="button" class="btn btn-secondary entry-bulk-flow-btn" data-flow-id="${escapeHtml(cfg.flowId)}" style="display:none;" disabled>${escapeHtml(cfg.label)}</button>`
+            )
+            .join("")}${canBulkDelete ? `<button type="button" id="delete-selected-btn" class="btn btn-danger" style="display:none;" disabled>Delete selected</button>` : ""}`
         : ""
     }${canEdit && !encryptionLock ? `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn btn-create-entry">Create entry</a>` : ""}</div>
   </div>
@@ -12881,7 +13244,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     ${hasNext ? `<a href="${nextUrl}" class="btn-pag btn-pag-next">▶▶</a>` : `<span class="btn-pag btn-pag-next disabled">▶▶</span>`}
     ${lastUrl ? `<a href="${lastUrl}" class="btn-pag btn-pag-last">▶|</a>` : `<span class="btn-pag btn-pag-last disabled">▶|</span>`}
   </div>
-  ${canBulkDelete ? `<div id="entry-bulk-msg" class="entry-bulk-msg" role="status" aria-live="polite"></div>` : ""}
+  ${canBulkSelect ? `<div id="entry-bulk-msg" class="entry-bulk-msg" role="status" aria-live="polite"></div>` : ""}
   ${
     splitViewEnabled && splitViewOrientation === "horizontal"
       ? `<div class="split-view-wrap split-horizontal" data-orientation="horizontal"><div class="split-entry-pane"><iframe id="split-entry-frame" class="split-entry-frame" title="Selected entry view"></iframe><div id="split-entry-empty" class="split-entry-empty">Select an entry from the first-column link to open it here.</div></div><div class="split-divider" id="split-divider" aria-hidden="true"></div><div class="split-list-pane">`
@@ -13099,11 +13462,12 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     })();
   </script>
   ${
-    canBulkDelete
+    canBulkSelect
       ? `<script>
     (function() {
       var toggleBtn = document.getElementById('toggle-select-mode');
       var deleteBtn = document.getElementById('delete-selected-btn');
+      var flowBtns = Array.prototype.slice.call(document.querySelectorAll('.entry-bulk-flow-btn'));
       var selectAll = document.getElementById('entry-select-all');
       var msgEl = document.getElementById('entry-bulk-msg');
       var profileId = ${JSON.stringify(String(doc._id || ""))};
@@ -13119,17 +13483,24 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       function checkedRows() {
         return rowChecks().filter(function(cb) { return cb.checked; });
       }
+      function selectedCount() {
+        return deleteAllInScope ? scopeCount : checkedRows().length;
+      }
       function setMsg(text, kind) {
         if (!msgEl) return;
         msgEl.textContent = text || '';
         msgEl.className = 'entry-bulk-msg' + (kind ? ' ' + kind : '');
         msgEl.style.display = text ? 'block' : 'none';
       }
-      function updateDeleteBtn() {
-        if (!deleteBtn) return;
-        var n = deleteAllInScope ? scopeCount : checkedRows().length;
-        deleteBtn.disabled = n === 0;
-        deleteBtn.textContent = n > 0 ? ('Delete selected (' + n + ')') : 'Delete selected';
+      function updateActionButtons() {
+        var n = selectedCount();
+        if (deleteBtn) {
+          deleteBtn.disabled = n === 0;
+          deleteBtn.textContent = n > 0 ? ('Delete selected (' + n + ')') : 'Delete selected';
+        }
+        flowBtns.forEach(function(btn) {
+          btn.disabled = n === 0;
+        });
       }
       function syncSelectAllState() {
         if (!selectAll) return;
@@ -13153,6 +13524,9 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
         document.body.classList.toggle('entry-select-mode', selectMode);
         if (toggleBtn) toggleBtn.textContent = selectMode ? 'Cancel selection' : 'Select entries';
         if (deleteBtn) deleteBtn.style.display = selectMode ? 'inline-block' : 'none';
+        flowBtns.forEach(function(btn) {
+          btn.style.display = selectMode ? 'inline-block' : 'none';
+        });
         if (!selectMode) {
           deleteAllInScope = false;
           rowChecks().forEach(function(cb) { cb.checked = false; });
@@ -13162,7 +13536,13 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
           }
           setMsg('');
         }
-        updateDeleteBtn();
+        updateActionButtons();
+      }
+      function confirmLargeSelection(count, actionLabel) {
+        if (count <= 10) return true;
+        return window.confirm(
+          'You selected ' + count + ' entries. Running "' + actionLabel + '" on more than 10 entries may take a while. Continue?'
+        );
       }
       if (toggleBtn) {
         toggleBtn.addEventListener('click', function() {
@@ -13175,20 +13555,62 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
           deleteAllInScope = on && scopeCount > recordsOnPage;
           rowChecks().forEach(function(cb) { cb.checked = on; });
           syncSelectAllState();
-          updateDeleteBtn();
+          updateActionButtons();
         });
       }
       rowChecks().forEach(function(cb) {
         cb.addEventListener('change', function() {
           if (!cb.checked) deleteAllInScope = false;
           syncSelectAllState();
-          updateDeleteBtn();
+          updateActionButtons();
         });
         cb.addEventListener('click', function(ev) { ev.stopPropagation(); });
       });
+      flowBtns.forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+          var count = selectedCount();
+          if (count === 0) {
+            setMsg('Select at least one entry.', 'err');
+            return;
+          }
+          var flowId = btn.getAttribute('data-flow-id') || '';
+          var actionLabel = (btn.textContent || 'flow').trim();
+          if (!flowId) return;
+          if (!confirmLargeSelection(count, actionLabel)) return;
+          flowBtns.forEach(function(b) { b.disabled = true; });
+          if (deleteBtn) deleteBtn.disabled = true;
+          setMsg('Running ' + actionLabel + ' on ' + count + ' entr' + (count === 1 ? 'y' : 'ies') + '…');
+          var body = deleteAllInScope
+            ? { all: true, q: searchQuery, flowId: flowId }
+            : { flowId: flowId, items: checkedRows().map(function(cb) { return { id: cb.getAttribute('data-id') }; }) };
+          try {
+            var r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/entries/bulk-run-flow', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body)
+            });
+            var data = await r.json();
+            if (!r.ok) {
+              setMsg(data.error || 'Flow run failed', 'err');
+              updateActionButtons();
+              return;
+            }
+            var ran = typeof data.ran === 'number' ? data.ran : 0;
+            var failed = typeof data.failed === 'number' ? data.failed : 0;
+            var resultText = 'Flow finished: ' + ran + ' succeeded';
+            if (failed > 0) resultText += ', ' + failed + ' failed';
+            resultText += '.';
+            setMsg(resultText, failed > 0 ? 'err' : 'ok');
+            setTimeout(function() { window.location.reload(); }, failed > 0 ? 1500 : 700);
+          } catch (err) {
+            setMsg((err && err.message) ? err.message : 'Request failed', 'err');
+            updateActionButtons();
+          }
+        });
+      });
       if (deleteBtn) {
         deleteBtn.addEventListener('click', async function() {
-          var count = deleteAllInScope ? scopeCount : checkedRows().length;
+          var count = selectedCount();
           if (count === 0) {
             setMsg('Select at least one entry.', 'err');
             return;
@@ -13201,6 +13623,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             : ('Delete ' + count + ' selected entr' + (count === 1 ? 'y' : 'ies') + '? This cannot be undone.');
           if (!window.confirm(confirmText)) return;
           deleteBtn.disabled = true;
+          flowBtns.forEach(function(b) { b.disabled = true; });
           setMsg('');
           var body = deleteAllInScope
             ? { all: true, q: searchQuery }
@@ -13214,14 +13637,14 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             var data = await r.json();
             if (!r.ok) {
               setMsg(data.error || 'Delete failed', 'err');
-              updateDeleteBtn();
+              updateActionButtons();
               return;
             }
             setMsg('Deleted ' + (data.deleted || 0) + ' entr' + ((data.deleted || 0) === 1 ? 'y' : 'ies') + '.', 'ok');
             setTimeout(function() { window.location.reload(); }, 700);
           } catch (err) {
             setMsg((err && err.message) ? err.message : 'Request failed', 'err');
-            updateDeleteBtn();
+            updateActionButtons();
           }
         });
       }
@@ -15507,6 +15930,7 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef, prefillU
     <select id="apiAuthType" name="apiAuthType">
       <option value="none"${authTypeStored === "none" ? " selected" : ""}>None</option>
       <option value="bearer"${authTypeStored === "bearer" ? " selected" : ""}>Bearer or API key (Authorization + api-key headers)</option>
+      <option value="x-api-key"${authTypeStored === "x-api-key" ? " selected" : ""}>X-API-Key header only (no Bearer)</option>
       <option value="basic"${authTypeStored === "basic" ? " selected" : ""}>HTTP Basic (username + password documents)</option>
       <option value="digest"${authTypeStored === "digest" ? " selected" : ""}>HTTP Digest (username + password documents)</option>
       <option value="fritz"${authTypeStored === "fritz" ? " selected" : ""}>FRITZ!Box session (login_sid.lua + sid — use for /api/v0/smarthome)</option>
@@ -15597,6 +16021,10 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef, prefillU
         upBlock.style.display = 'none';
       } else if (v === 'bearer') {
         hint.textContent = 'The secret document value is sent as Bearer token and as the api-key header.';
+        bBlock.style.display = 'block';
+        upBlock.style.display = 'none';
+      } else if (v === 'x-api-key') {
+        hint.textContent = 'The secret document value is sent only in the X-API-Key header. No Authorization header is sent.';
         bBlock.style.display = 'block';
         upBlock.style.display = 'none';
       } else if (v === 'fritz') {
@@ -16929,7 +17357,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
     const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
   const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option><option value="/account/unlock-keyfile">Provide key file</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/debug">Debug / flow log</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
   const thead = '<tr><th>Name</th><th>Description</th><th class="col-mobile-hidden">Creation date</th></tr>';
 
@@ -17242,7 +17670,7 @@ function toHex6(hex) {
   return "#" + s;
 }
 
-function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
+function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows = []) {
   const appTheme = normalizeAppTheme(appUi && appUi.theme);
   const appThemeVars = getAppThemeVars(appTheme);
   const name = escapeHtml(doc.name || "");
@@ -17293,17 +17721,17 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
   const pkLen0 = String(
     primaryKeySegmentLengthsCfg[0] != null && Number.isFinite(Number(primaryKeySegmentLengthsCfg[0]))
       ? Math.floor(Number(primaryKeySegmentLengthsCfg[0]))
-      : 32
+      : PRIMARY_KEY_SEGMENT_LEN_DEFAULT
   );
   const pkLen1 = String(
     primaryKeySegmentLengthsCfg[1] != null && Number.isFinite(Number(primaryKeySegmentLengthsCfg[1]))
       ? Math.floor(Number(primaryKeySegmentLengthsCfg[1]))
-      : 32
+      : PRIMARY_KEY_SEGMENT_LEN_DEFAULT
   );
   const pkLen2 = String(
     primaryKeySegmentLengthsCfg[2] != null && Number.isFinite(Number(primaryKeySegmentLengthsCfg[2]))
       ? Math.floor(Number(primaryKeySegmentLengthsCfg[2]))
-      : 32
+      : PRIMARY_KEY_SEGMENT_LEN_DEFAULT
   );
   const mobileSingleEntryFormId =
     typeof doc.mobileSingleEntryFormId === "string" && doc.mobileSingleEntryFormId.trim()
@@ -17317,6 +17745,11 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
     typeof doc.infoImportButtonTitle === "string" && doc.infoImportButtonTitle.trim()
       ? doc.infoImportButtonTitle.trim()
       : "Import from Guardian";
+  const listFlowConfigsRaw = Array.isArray(doc.listFlowConfigs) ? doc.listFlowConfigs : [];
+  const listFlowConfigs = listFlowConfigsRaw.map(normalizeListFlowConfigItem).filter(Boolean);
+  const allFlows = Array.isArray(flows)
+    ? flows.map((f) => ({ id: f._id, name: f.name || f._id }))
+    : [];
   const entriesPageSizeRaw = Number(doc.entriesPageSize);
   const entriesPageSize =
     Number.isFinite(entriesPageSizeRaw) &&
@@ -17551,6 +17984,10 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
     <label for="infoImportButtonTitle" style="margin-top:0.75rem;">Information Import button title</label>
     <p class="sub" style="margin-top:0.25rem;">Text shown on the import button in the database view.</p>
     <input type="text" id="infoImportButtonTitle" name="infoImportButtonTitle" placeholder="e.g. Import from Guardian" value="${escapeHtml(infoImportButtonTitle)}">
+    <label style="margin-top:1.5rem;">Database list flow buttons</label>
+    <p class="sub" style="margin-top:0.25rem;">When <strong>Select entries</strong> is active on the database list, these flows can be run on the selected entries. Buttons appear to the left of <strong>Delete selected</strong>. A warning is shown when more than 10 entries are selected.</p>
+    <div id="list-flow-configs" style="margin-top:0.5rem;"></div>
+    <button type="button" class="btn btn-secondary" id="add-list-flow-btn" style="margin-top:0.5rem;">Add flow button</button>
     <label for="entriesPageSize" style="margin-top:0.75rem;">Entries per page</label>
     <p class="sub" style="margin-top:0.25rem;">Rows shown in the database list pagination. Default is 25.</p>
     <input type="number" id="entriesPageSize" name="entriesPageSize" min="${ENTRIES_PAGE_SIZE_MIN}" max="${ENTRIES_PAGE_SIZE_MAX}" step="1" value="${escapeHtml(String(entriesPageSize))}">
@@ -17734,6 +18171,44 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
     const cloneEntryFormBtn = document.getElementById('clone-entry-form');
     const allEntryForms = ${JSON.stringify(allEntryForms)};
     const initialEntryFormIds = ${JSON.stringify(initialEntryFormIds)};
+    const allFlows = ${JSON.stringify(allFlows)};
+    const initialListFlowConfigs = ${JSON.stringify(listFlowConfigs)};
+
+    const listFlowConfigsEl = document.getElementById('list-flow-configs');
+    const addListFlowBtn = document.getElementById('add-list-flow-btn');
+
+    function addListFlowRow(cfg) {
+      if (!listFlowConfigsEl) return;
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      row.style.alignItems = 'center';
+      const esc = (v) => (v || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const flowId = cfg && cfg.flowId ? cfg.flowId : '';
+      const label = cfg && cfg.label ? cfg.label : '';
+      const enabled = !cfg || cfg.enabled !== false;
+      let flowOpts = '<option value="">— Choose flow —</option>';
+      allFlows.forEach(function(f) {
+        flowOpts += '<option value="' + esc(f.id) + '"' + (flowId === f.id ? ' selected' : '') + '>' + esc(f.name || f.id) + '</option>';
+        if (flowId && flowId !== f.id && flowId === (f.name || '')) {
+          flowOpts += '<option value="' + esc(flowId) + '" selected>' + esc(flowId) + '</option>';
+        }
+      });
+      if (flowId && !allFlows.some(function(f) { return f.id === flowId || f.name === flowId; })) {
+        flowOpts += '<option value="' + esc(flowId) + '" selected>' + esc(flowId) + '</option>';
+      }
+      row.innerHTML =
+        '<select class="list-flow-id" title="Flow">' + flowOpts + '</select>' +
+        '<input type="text" class="list-flow-label" placeholder="Button label" value="' + esc(label) + '" style="min-width:10rem;">' +
+        '<label style="display:flex;align-items:center;gap:0.35rem;margin:0;white-space:nowrap;"><input type="checkbox" class="list-flow-enabled"' + (enabled ? ' checked' : '') + ' style="width:auto;"> Enabled</label>' +
+        '<button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
+      row.querySelector('.btn-remove').onclick = function() { row.remove(); };
+      listFlowConfigsEl.appendChild(row);
+    }
+
+    if (addListFlowBtn) {
+      addListFlowBtn.onclick = function() { addListFlowRow({ enabled: true, label: 'Run flow', flowId: '' }); };
+    }
+    (initialListFlowConfigs.length ? initialListFlowConfigs : []).forEach(function(cfg) { addListFlowRow(cfg); });
 
     function addEntryFormRow(selectedId) {
       const row = document.createElement('div');
@@ -17933,6 +18408,16 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
             sortDirection: document.getElementById('sortDirection').value,
             infoImportFlowId: (document.getElementById('infoImportFlowId') && document.getElementById('infoImportFlowId').value.trim()) || '',
             infoImportButtonTitle: (document.getElementById('infoImportButtonTitle') && document.getElementById('infoImportButtonTitle').value.trim()) || '',
+            listFlowConfigs: Array.from(document.querySelectorAll('#list-flow-configs .field-row')).map(function(row) {
+              var flowSel = row.querySelector('.list-flow-id');
+              var labelIn = row.querySelector('.list-flow-label');
+              var enabledCb = row.querySelector('.list-flow-enabled');
+              return {
+                flowId: flowSel ? flowSel.value.trim() : '',
+                label: labelIn ? labelIn.value.trim() : '',
+                enabled: !!(enabledCb && enabledCb.checked)
+              };
+            }).filter(function(cfg) { return cfg.flowId; }),
             entriesPageSize: (document.getElementById('entriesPageSize') && document.getElementById('entriesPageSize').value) || '${ENTRIES_PAGE_SIZE}',
             searchAccentFolding: !!(document.getElementById('searchAccentFolding') && document.getElementById('searchAccentFolding').checked),
             splitView: {
@@ -17950,8 +18435,8 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
                 if (!v) continue;
                 fields.push(v);
                 var lenEl = document.getElementById(lens[i]);
-                var n = lenEl ? parseInt(lenEl.value, 10) : 32;
-                lengths.push(Number.isFinite(n) ? n : 32);
+                var n = lenEl ? parseInt(lenEl.value, 10) : ${PRIMARY_KEY_SEGMENT_LEN_DEFAULT};
+                lengths.push(Number.isFinite(n) ? n : ${PRIMARY_KEY_SEGMENT_LEN_DEFAULT});
               }
               return fields;
             })(),
@@ -17964,8 +18449,8 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = []) {
                 var v = sel && sel.value ? sel.value.trim() : '';
                 if (!v) continue;
                 var lenEl = document.getElementById(lens[i]);
-                var n = lenEl ? parseInt(lenEl.value, 10) : 32;
-                lengths.push(Number.isFinite(n) ? n : 32);
+                var n = lenEl ? parseInt(lenEl.value, 10) : ${PRIMARY_KEY_SEGMENT_LEN_DEFAULT};
+                lengths.push(Number.isFinite(n) ? n : ${PRIMARY_KEY_SEGMENT_LEN_DEFAULT});
               }
               return lengths;
             })(),
@@ -18679,6 +19164,245 @@ function renderEditAppConfigPage(appUi, err) {
           msgEl.style.display = 'block';
         }
       };
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function formatDebugLogEntryPreview(entry) {
+  if (!entry || typeof entry !== "object") return String(entry ?? "");
+  try {
+    const copy = { ...entry };
+    if (copy.payload && typeof copy.payload === "object") {
+      copy.payload = { ...copy.payload };
+      if (typeof copy.payload.body === "string" && copy.payload.body.length > 400) {
+        copy.payload.body = copy.payload.body.slice(0, 400) + "…[truncated]";
+      }
+      if (typeof copy.payload.input === "object" && copy.payload.input) {
+        const inputCopy = { ...copy.payload.input };
+        if (typeof inputCopy.rssXml === "string" && inputCopy.rssXml.length > 400) {
+          inputCopy.rssXml = inputCopy.rssXml.slice(0, 400) + "…[truncated]";
+        }
+        copy.payload.input = inputCopy;
+      }
+    }
+    const json = JSON.stringify(copy, null, 2);
+    return json.length > 4000 ? json.slice(0, 4000) + "\n…[truncated]" : json;
+  } catch (_) {
+    return String(entry);
+  }
+}
+
+function renderDebugPage(appUi, logData, err) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  ensureAppUiTimeFields(appUi || {});
+  const level = normalizeFlowLogLevel(appUi && appUi.flowLogLevel);
+  const id = appUi && appUi._id ? String(appUi._id) : "";
+  const rev = appUi && appUi._rev ? String(appUi._rev) : "";
+  const limit = logData && logData.limit ? logData.limit : 25;
+  const logFile = logData && logData.logFile ? String(logData.logFile) : getFlowLogFilePath();
+  const fileSize = logData && Number.isFinite(logData.fileSize) ? logData.fileSize : 0;
+  const truncatedRead = !!(logData && logData.truncatedRead);
+  const entries = logData && Array.isArray(logData.entries) ? logData.entries : [];
+  const msgErr = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+  const sel = (v) => (level === v ? " selected" : "");
+
+  const rows =
+    entries.length > 0
+      ? entries
+          .map((entry, idx) => {
+            const type = entry && entry.type ? String(entry.type) : "—";
+            const ts = entry && entry.ts ? String(entry.ts) : "—";
+            const tsDisplay = entry && entry.tsDisplay ? String(entry.tsDisplay) : "";
+            const preview = formatDebugLogEntryPreview(entry);
+            return (
+              `<tr><td>${idx + 1}</td><td><code>${escapeHtml(type)}</code></td>` +
+              `<td><code>${escapeHtml(ts)}</code>${tsDisplay ? `<div class="sub" style="margin:0.15rem 0 0 0;">${escapeHtml(tsDisplay)}</div>` : ""}</td>` +
+              `<td><pre class="log-preview">${escapeHtml(preview)}</pre></td></tr>`
+            );
+          })
+          .join("")
+      : `<tr><td colspan="4" class="empty">No log entries found.</td></tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Debug / flow log</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 72rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    h2 { font-weight: 600; font-size: 1.05rem; margin-top: 1.5rem; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="number"], select { padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-end; margin: 1rem 0; }
+    .toolbar label { margin: 0; }
+    .toolbar .field { display: flex; flex-direction: column; gap: 0.25rem; }
+    .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
+    .btn-primary { background: #238636; color: #fff; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); border: 1px solid var(--app-table-border, #30363d); }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
+    .panel { background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 8px; padding: 1rem; margin-top: 1rem; font-size: 0.9rem; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; margin-top: 1rem; }
+    th, td { padding: 0.6rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); vertical-align: top; }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    code { font-size: 0.85em; word-break: break-word; }
+    pre.log-preview { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 0.78rem; max-height: 12rem; overflow: auto; color: var(--app-label, #8b949e); }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
+    .msg.err { background: #3d1f1f; color: #f85149; }
+    .msg.ok { background: #1f3d2a; color: #3fb950; }
+  </style>
+</head>
+<body>
+  <div class="actions">
+    <a href="/">← Start</a>
+    <button type="button" id="save-log-config-btn" class="btn btn-primary">Save log level</button>
+    <a href="/application-properties" class="btn btn-secondary">Application properties</a>
+  </div>
+  <h1>Debug / flow log</h1>
+  <p class="sub">Admin-only view of the JSON-lines flow log (flows, timers, API calls, script logs). Useful on remote instances without shell access.</p>
+  ${msgErr}
+  <div class="panel">
+    <strong>Log file</strong>
+    <p class="sub" style="margin:0.5rem 0 0 0;"><code>${escapeHtml(logFile)}</code></p>
+    <p class="sub" style="margin:0.35rem 0 0 0;">Size: ${fileSize.toLocaleString("en-US")} bytes${truncatedRead ? " (preview reads tail only)" : ""}</p>
+  </div>
+  <h2>Logging level</h2>
+  <form id="debug-config-form">
+    ${id ? `<input type="hidden" id="debugAppId" value="${escapeHtml(id)}">` : ""}
+    ${rev ? `<input type="hidden" id="debugAppRev" value="${escapeHtml(rev)}">` : ""}
+    <label for="flowLogLevel">Flow log level</label>
+    <select id="flowLogLevel" name="flowLogLevel">
+      <option value="minimal"${sel("minimal")}>Minimal — errors, script logs, import stats</option>
+      <option value="normal"${sel("normal")}>Normal — standard flow events (default)</option>
+      <option value="verbose"${sel("verbose")}>Verbose — includes script request/response payloads</option>
+    </select>
+    <p class="sub" style="margin-top:0.35rem;">Applied immediately to the running instance. Stored in application config (export/import with configuration).</p>
+  </form>
+  <h2>Log entries</h2>
+  <div class="toolbar">
+    <div class="field">
+      <label for="logLimit">Entries to show / download</label>
+      <input type="number" id="logLimit" min="1" max="1000" step="1" value="${limit}" style="width:6rem;">
+    </div>
+    <button type="button" id="refresh-log-btn" class="btn btn-secondary">Refresh</button>
+    <a id="download-log-link" class="btn btn-secondary" href="/api/debug/log/download?limit=${limit}">Download JSONL</a>
+  </div>
+  <table>
+    <thead><tr><th>#</th><th>Type</th><th>Time (UTC)</th><th>Payload</th></tr></thead>
+    <tbody id="log-body">${rows}</tbody>
+  </table>
+  <div id="msg" class="msg" style="display:none;"></div>
+  <script>
+    (function() {
+      var msgEl = document.getElementById('msg');
+      var logBody = document.getElementById('log-body');
+      var limitEl = document.getElementById('logLimit');
+      var downloadLink = document.getElementById('download-log-link');
+
+      function esc(s) {
+        return String(s == null ? '' : s)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function previewEntry(entry) {
+        try {
+          var copy = JSON.parse(JSON.stringify(entry || {}));
+          if (copy.payload && typeof copy.payload.body === 'string' && copy.payload.body.length > 400) {
+            copy.payload.body = copy.payload.body.slice(0, 400) + '…[truncated]';
+          }
+          if (copy.payload && copy.payload.input && typeof copy.payload.input.rssXml === 'string' && copy.payload.input.rssXml.length > 400) {
+            copy.payload.input.rssXml = copy.payload.input.rssXml.slice(0, 400) + '…[truncated]';
+          }
+          var json = JSON.stringify(copy, null, 2);
+          return json.length > 4000 ? json.slice(0, 4000) + '\\n…[truncated]' : json;
+        } catch (e) {
+          return String(entry);
+        }
+      }
+
+      function renderEntries(entries) {
+        if (!entries || !entries.length) {
+          logBody.innerHTML = '<tr><td colspan="4" class="empty">No log entries found.</td></tr>';
+          return;
+        }
+        logBody.innerHTML = entries.map(function(entry, idx) {
+          var type = entry && entry.type ? String(entry.type) : '—';
+          var ts = entry && entry.ts ? String(entry.ts) : '—';
+          var tsDisplay = entry && entry.tsDisplay ? String(entry.tsDisplay) : '';
+          return '<tr><td>' + (idx + 1) + '</td><td><code>' + esc(type) + '</code></td><td><code>' + esc(ts) + '</code>' +
+            (tsDisplay ? '<div class="sub" style="margin:0.15rem 0 0 0;">' + esc(tsDisplay) + '</div>' : '') +
+            '</td><td><pre class="log-preview">' + esc(previewEntry(entry)) + '</pre></td></tr>';
+        }).join('');
+      }
+
+      function currentLimit() {
+        var n = parseInt(limitEl.value, 10);
+        if (!Number.isFinite(n) || n < 1) return 25;
+        if (n > 1000) return 1000;
+        return n;
+      }
+
+      function syncDownloadLink() {
+        downloadLink.href = '/api/debug/log/download?limit=' + encodeURIComponent(String(currentLimit()));
+      }
+
+      limitEl.addEventListener('change', syncDownloadLink);
+      limitEl.addEventListener('input', syncDownloadLink);
+
+      document.getElementById('refresh-log-btn').addEventListener('click', async function() {
+        msgEl.style.display = 'none';
+        syncDownloadLink();
+        try {
+          var r = await fetch('/api/debug/log?limit=' + encodeURIComponent(String(currentLimit())));
+          var data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Refresh failed');
+          renderEntries(data.entries || []);
+        } catch (e) {
+          msgEl.textContent = e.message || 'Refresh failed';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+        }
+      });
+
+      document.getElementById('save-log-config-btn').addEventListener('click', async function() {
+        msgEl.style.display = 'none';
+        var payload = { flowLogLevel: document.getElementById('flowLogLevel').value };
+        var idEl = document.getElementById('debugAppId');
+        var revEl = document.getElementById('debugAppRev');
+        if (idEl && idEl.value) payload._id = idEl.value;
+        if (revEl && revEl.value) payload._rev = revEl.value;
+        try {
+          var r = await fetch('/api/debug/log-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          var data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Save failed');
+          if (revEl && data.rev) revEl.value = data.rev;
+          msgEl.textContent = 'Log level saved (' + (data.flowLogLevel || payload.flowLogLevel) + ').';
+          msgEl.className = 'msg ok';
+          msgEl.style.display = 'block';
+        } catch (e) {
+          msgEl.textContent = e.message || 'Save failed';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+        }
+      });
     })();
   </script>
 </body>
@@ -20330,6 +21054,7 @@ async function main() {
   await getAppUiConfig();
   startApiWorker();
   startFlowWorker();
+  await applyFlowLogLevelFromConfig();
   startTimerWorker();
   await syncTimersFromDb();
   setInterval(() => {

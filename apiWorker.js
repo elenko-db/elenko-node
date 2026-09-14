@@ -196,7 +196,8 @@ function buildUrlWithQuery(baseUrl, dataset) {
   if (!dataset || typeof dataset !== "object") return baseUrl;
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(dataset)) {
-    if (k === "_id" || k === "_rev" || k === "type" || k === "profileId" || k === "sortKey" || k === "createdAt" || k === "updatedAt" || k === "entryFormId" || k === "sourceDocId") continue;
+    if (DATASET_SKIP_KEYS.has(k) || k.startsWith("_")) continue;
+    if (k === "lastApiResponse" || k === "rssXml" || k === "importCount" || k === "lastRun" || k === "lastImported") continue;
     if (v != null && String(v).trim() !== "") params.set(k, String(v).trim());
   }
   const qs = params.toString();
@@ -535,6 +536,15 @@ async function fetchWithElenkoAuth(finalUrl, method, bodyPayload, authType, apiK
     });
   }
 
+  if (authType === "x-api-key" && apiKey && String(apiKey).trim()) {
+    const key = String(apiKey).trim();
+    return fetch(finalUrl, {
+      method,
+      headers: merge({ "X-API-Key": key }),
+      body: bodyPayload,
+    });
+  }
+
   if (authType === "basic" && apiUsername != null && apiPassword != null) {
     const auth = Buffer.from(String(apiUsername) + ":" + String(apiPassword), "utf8").toString("base64");
     return fetch(finalUrl, {
@@ -562,6 +572,7 @@ if (parentPort) parentPort.on("message", (msg) => {
   const authType =
     authTypeRaw === "none" ||
     authTypeRaw === "bearer" ||
+    authTypeRaw === "x-api-key" ||
     authTypeRaw === "basic" ||
     authTypeRaw === "digest" ||
     authTypeRaw === "fritz"

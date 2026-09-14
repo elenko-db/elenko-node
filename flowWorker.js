@@ -11,9 +11,39 @@ const path = require("path");
 const logFile = process.env.FLOW_LOG_FILE || path.join(__dirname, "logs", "elenko.log");
 const logDir = path.dirname(logFile);
 
-// When FLOW_DEBUG is set (e.g. 1, true, yes), log every message that passes through,
-// including those that are routed to localDb or api (which are otherwise not written).
-const debug = /^(1|true|yes)$/i.test(String(process.env.FLOW_DEBUG || "").trim());
+const FLOW_LOG_LEVELS = new Set(["minimal", "normal", "verbose"]);
+
+function normalizeFlowLogLevel(raw) {
+  const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (FLOW_LOG_LEVELS.has(s)) return s;
+  if (/^(1|true|yes)$/i.test(String(process.env.FLOW_DEBUG || "").trim())) return "verbose";
+  const envLevel = typeof process.env.FLOW_LOG_LEVEL === "string" ? process.env.FLOW_LOG_LEVEL.trim().toLowerCase() : "";
+  if (FLOW_LOG_LEVELS.has(envLevel)) return envLevel;
+  return "normal";
+}
+
+let logLevel = normalizeFlowLogLevel("");
+
+function shouldLogMessage(msg) {
+  if (!msg || typeof msg !== "object") return false;
+  const type = typeof msg.type === "string" ? msg.type : "";
+  if (type === "flow.logConfig") return false;
+  if (type === "flow.scriptRequest" || type === "flow.scriptResponse") {
+    return logLevel === "verbose";
+  }
+  if (logLevel === "minimal") {
+    if (
+      /Error|error|callRejected|keyLookupError|pipelineError|scriptError|purgeOldError|refreshError|appendRepeatError|console\.error/i.test(
+        type
+      )
+    ) {
+      return true;
+    }
+    if (type === "flow.scriptLog" || type === "flow.importStats") return true;
+    return false;
+  }
+  return true;
+}
 
 // Check if .env is present and readable; use path from main thread (workerData.envPath) if provided
 const envPath = (workerData && workerData.envPath) ? workerData.envPath : path.resolve(__dirname, ".env");
@@ -32,7 +62,7 @@ try {
   console.error("Flow worker: failed to create log directory:", err);
 }
 
-console.log("Flow worker: logging to", logFile, debug ? "(debug: log all messages)" : "");
+console.log("Flow worker: logging to", logFile, "(level:", logLevel + ")");
 
 let scriptWorker = null;
 try {
@@ -74,10 +104,13 @@ function writeNext() {
   });
 }
 
-// Log startup and current debug level to the flow log
+// Log startup and current level to the flow log
 queue.push({
   type: "flowWorker.start",
-  payload: envStatus === ".env not found" ? { debug, env: envStatus, envPath } : { debug, env: envStatus },
+  payload:
+    envStatus === ".env not found"
+      ? { logLevel, env: envStatus, envPath, logFile }
+      : { logLevel, env: envStatus, logFile },
   ts: new Date().toISOString(),
 });
 writeNext();
@@ -88,8 +121,19 @@ if (!parentPort) {
 
 parentPort.on("message", (msg) => {
   const eventType = msg && msg.type ? msg.type : "";
-  const skipLogging = eventType === "flow.scriptRequest" || eventType === "flow.scriptResponse";
-  if (debug && !skipLogging) {
+
+  if (eventType === "flow.logConfig") {
+    logLevel = normalizeFlowLogLevel(msg.payload && msg.payload.level);
+    queue.push({
+      type: "flowWorker.logConfig",
+      payload: { logLevel },
+      ts: new Date().toISOString(),
+    });
+    writeNext();
+    return;
+  }
+
+  if (shouldLogMessage(msg)) {
     queue.push(msg);
     writeNext();
   }
@@ -158,10 +202,6 @@ parentPort.on("message", (msg) => {
       dataset: msg.payload.dataset,
     });
     return;
-  }
-  if (!debug && !skipLogging) {
-    queue.push(msg);
-    writeNext();
   }
 });
 

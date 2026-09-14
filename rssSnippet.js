@@ -12,7 +12,7 @@
 //   feedUrl          — RSS/Atom URL
 //   sourceName       — e.g. "The Guardian UK"
 //   targetProfileId  — profile id or name of the news inbox profile
-//   maxItems         — optional cap (default 25)
+//   maxItems         — optional cap (default 40, max 100)
 //   lastRun          — set by script (ISO UTC)
 //   lastImported     — use flow step Update current document, Param: lastImported
 //                      (copies _lastCreatedCount after import, incl. primary-key skips)
@@ -32,8 +32,24 @@
 var raw = input && typeof input.rssXml === "string" ? input.rssXml : "";
 var sourceName = input && input.sourceName != null ? String(input.sourceName) : "";
 var targetProfileId = input && input.targetProfileId != null ? String(input.targetProfileId).trim() : "";
-var maxItemsRaw = input && input.maxItems != null ? parseInt(input.maxItems, 10) : 25;
-var maxItems = Number.isFinite(maxItemsRaw) && maxItemsRaw > 0 ? Math.min(maxItemsRaw, 100) : 25;
+function resolveMaxItems(raw) {
+  if (raw == null) return 40;
+  var s = String(raw).trim();
+  if (!s) return 40;
+  if (s.charAt(0) === "{") {
+    try {
+      var parsed = JSON.parse(s);
+      if (parsed && typeof parsed === "object" && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
+        s = String(parsed.rows[0] != null ? parsed.rows[0] : "").trim();
+      }
+    } catch (_) {}
+  }
+  var n = parseInt(s, 10);
+  if (!Number.isFinite(n) || n <= 0) return 40;
+  return Math.min(n, 100);
+}
+
+var maxItems = resolveMaxItems(input && input.maxItems);
 
 function runTimestampIso() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -136,10 +152,13 @@ function linkHref(block) {
 
 function parseRss2Items(xml) {
   var items = [];
-  var re = /<item\b[\s\S]*?<\/item>/gi;
-  var m;
-  while ((m = re.exec(xml)) !== null) {
-    var block = m[0];
+  var text = String(xml || "");
+  var parts = text.split(/<item\b/i);
+  for (var pi = 1; pi < parts.length; pi++) {
+    var chunk = parts[pi];
+    var end = chunk.search(/<\/item>/i);
+    if (end < 0) continue;
+    var block = "<item" + chunk.slice(0, end + 7);
     items.push({
       title: tagText(block, "title"),
       link: linkHref(block),
@@ -213,6 +232,8 @@ output._writeLog({
   stage: "parse",
   message: "RSS/Atom parsed",
   itemCount: parsedItems.length,
+  maxItems: maxItems,
+  rssBytes: raw.length,
   sourceName: sourceName,
   targetProfileId: targetProfileId || "(current profile)",
 });
