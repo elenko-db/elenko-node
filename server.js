@@ -10,6 +10,7 @@ const marked = require("marked");
 const nano = require("nano");
 const multer = require("multer");
 const sharp = require("sharp");
+const { buildApiRequestTarget, applyTemplate, urlHasFieldPlaceholders } = require("./apiWorker");
 
 const originalConsoleError = console.error.bind(console);
 
@@ -89,6 +90,16 @@ const ALLOWED_ENTRY_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/web
 const entryImageUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_ENTRY_IMAGE_BYTES },
+});
+
+/** Start page profile / folder icons (CouchDB attachments). */
+const MAX_START_ICON_BYTES = Number(process.env.MAX_START_ICON_BYTES) || 512 * 1024;
+const START_ICON_MAX_EDGE = Number(process.env.START_ICON_MAX_EDGE) || 512;
+const PROFILE_START_ICON_FILENAME = "elenko-start-icon.webp";
+
+const startIconUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_START_ICON_BYTES },
 });
 
 const MAX_KEYFILE_BYTES = 4096;
@@ -3185,16 +3196,10 @@ async function updateCurrentEntryFromDataset(dbInstance, context) {
   }
   const dataset = context.dataset && typeof context.dataset === "object" ? context.dataset : {};
   const patch = { ...dataset };
-  // Do not persist helper fields used only inside the pipeline
-  delete patch._lastCreatedId;
-  delete patch._lastCreatedCount;
-  delete patch._lastImportAttempted;
-  delete patch._lastSkippedDuplicates;
-  delete patch._lastImportFailed;
-  delete patch._repeatRow;
-  delete patch._lastAppendRepeatField;
-  delete patch._lastAppendRepeatFields;
-  delete patch._lastAppendRepeatRowCount;
+  // Do not persist helper fields used only inside the pipeline (CouchDB rejects custom _ fields).
+  for (const key of Object.keys(patch)) {
+    if (key.startsWith("_")) delete patch[key];
+  }
   delete patch.createdBy;
   delete patch.updatedBy;
   if (profileDoc) {
@@ -3210,6 +3215,65 @@ async function updateCurrentEntryFromDataset(dbInstance, context) {
   setEntryAuditOnUpdate(updated, context && context.req);
   await dbInstance.insert(updated);
   clearProfileListCache(profileId);
+}
+
+/** Resolve #fieldName# placeholders in a flow step Param from the pipeline dataset (forUrl rules). */
+function resolveFlowStepParam(param, dataset) {
+  const raw = param != null ? String(param).trim() : "";
+  if (!raw) return "";
+  if (!urlHasFieldPlaceholders(raw)) return raw;
+  if (!dataset || typeof dataset !== "object") return raw;
+  return applyTemplate(raw, dataset, { forUrl: true }).trim();
+}
+
+/** Resolve Param for Call API / script / localDb steps; logs and returns null when empty. */
+function resolvePipelineStepParam(step, stepIndex, context, targetLabel) {
+  const paramRaw = step && typeof step.param === "string" ? step.param.trim() : "";
+  const param = resolveFlowStepParam(paramRaw, context.dataset);
+  if (paramRaw && urlHasFieldPlaceholders(paramRaw) && param !== paramRaw) {
+    sendFlowMessage("flow.paramResolved", {
+      stepIndex: stepIndex,
+      target: targetLabel,
+      paramRaw,
+      param,
+      profileId: context.profileId,
+      entryId: context.entryId,
+    });
+  }
+  if (!param) {
+    if (paramRaw) {
+      sendFlowMessage("flow.paramError", {
+        stepIndex: stepIndex,
+        target: targetLabel,
+        paramRaw,
+        error: urlHasFieldPlaceholders(paramRaw)
+          ? "Param placeholder resolved to an empty value."
+          : "Missing Param.",
+        profileId: context.profileId,
+        entryId: context.entryId,
+      });
+    }
+    return null;
+  }
+  return param;
+}
+
+function logApiRequestForFlow(apiDoc, dataset, meta) {
+  const workerDoc = apiDocPayloadForApiWorker(apiDoc);
+  const built = buildApiRequestTarget(workerDoc, dataset);
+  const payload = {
+    apiDocId: meta && meta.apiDocId != null ? String(meta.apiDocId) : workerDoc.name || "",
+    apiName: meta && meta.apiName != null ? String(meta.apiName) : workerDoc.name || "",
+    entryId: meta && meta.entryId != null ? meta.entryId : "",
+    profileId: meta && meta.profileId != null ? meta.profileId : "",
+    url: built.finalUrl || workerDoc.url || "",
+    method: built.method || workerDoc.method || "GET",
+    responseTarget: workerDoc.responseTarget || "update",
+    authType: meta && meta.authType != null ? meta.authType : "",
+  };
+  if (built.error) payload.requestBuildError = built.error;
+  if (meta && meta.includeDataset) payload.dataset = dataset;
+  sendFlowMessage("api.request", payload);
 }
 
 /** Subset of elenko_api sent to apiWorker (no secrets). */
@@ -3332,6 +3396,15 @@ function runApiCallAndWait(apiDocId, context) {
         if (p) {
           p.apiKeyPreview = previewApiCredentialsForFlow(bundle);
           p.authType = bundle.authType || "";
+        }
+        if (flowWorker) {
+          logApiRequestForFlow(apiDoc, context.dataset, {
+            apiDocId: tid,
+            apiName: apiDoc.name || tid,
+            entryId: context.entryId,
+            profileId: context.profileId,
+            authType: bundle.authType,
+          });
         }
         apiWorker.postMessage({
           type: "apiRequest",
@@ -3518,7 +3591,7 @@ async function runPipeline(context, flowDoc) {
       continue;
     }
     if (target === "script") {
-      const param = (step && typeof step.param === "string") ? step.param.trim() : "";
+      const param = resolvePipelineStepParam(step, i, context, "script");
       if (!param || !configDb) continue;
       let jsDoc = null;
       try {
@@ -3635,14 +3708,14 @@ async function runPipeline(context, flowDoc) {
       continue;
     }
     if (target === "localDb") {
-      const param = (step && typeof step.param === "string") ? step.param.trim() : "";
+      const param = resolvePipelineStepParam(step, i, context, "localDb");
       if (!param) continue;
       const created = await createEntryInProfileFromContext(db, context, param);
       context.dataset = { ...(context.dataset || {}), _lastCreatedId: created._id };
       continue;
     }
     if (target === "api") {
-      const param = (step && typeof step.param === "string") ? step.param.trim() : "";
+      const param = resolvePipelineStepParam(step, i, context, "api");
       if (!param) continue;
       const result = await runApiCallAndWait(param, context);
       const bodyStr = (result.body === undefined || result.body === null) ? "" : (typeof result.body === "string" ? result.body : JSON.stringify(result.body));
@@ -3766,6 +3839,142 @@ function defaultAppUiConfigObject() {
   };
 }
 
+function normalizeLayoutItemColor(raw) {
+  if (raw == null || typeof raw !== "string") return "";
+  const t = raw.trim();
+  const m = t.match(/^#?([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$/);
+  if (!m) return "";
+  let s = m[1];
+  if (s.length === 3) s = s[0] + s[0] + s[1] + s[1] + s[2] + s[2];
+  return "#" + s.toLowerCase();
+}
+
+function hslToHex(h, s, l) {
+  s /= 100;
+  l /= 100;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (h < 60) {
+    r = c;
+    g = x;
+  } else if (h < 120) {
+    r = x;
+    g = c;
+  } else if (h < 180) {
+    g = c;
+    b = x;
+  } else if (h < 240) {
+    g = x;
+    b = c;
+  } else if (h < 300) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+  const toByte = (v) => Math.round((v + m) * 255)
+    .toString(16)
+    .padStart(2, "0");
+  return "#" + toByte(r) + toByte(g) + toByte(b);
+}
+
+/** Stable accent colour from a display name (folders / databases on the start page). */
+function hashColorFromName(name) {
+  const s = String(name || "").trim() || "default";
+  let hash = 0;
+  for (let i = 0; i < s.length; i++) {
+    hash = s.charCodeAt(i) + ((hash << 5) - hash);
+    hash |= 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  return hslToHex(hue, 52, 46);
+}
+
+function resolveProfileListColor(layoutColor, displayName) {
+  const fromLayout = normalizeLayoutItemColor(layoutColor);
+  if (fromLayout) return fromLayout;
+  return hashColorFromName(displayName);
+}
+
+function sanitizeStartGroupIdForFile(groupId) {
+  return String(groupId || "group")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 64);
+}
+
+function groupIconAttachmentNameForId(groupId) {
+  return "start-group-" + sanitizeStartGroupIdForFile(groupId) + ".webp";
+}
+
+function normalizeGroupIconFile(raw) {
+  if (raw == null || typeof raw !== "string") return "";
+  const t = raw.trim();
+  if (!/^start-group-[a-zA-Z0-9_.-]+\.(webp|jpe?g|png|gif)$/i.test(t)) return "";
+  return t.slice(0, 128);
+}
+
+async function bufferFromAttachmentGet(result) {
+  if (Buffer.isBuffer(result)) return result;
+  if (result && typeof result.pipe === "function") {
+    const chunks = [];
+    for await (const chunk of result) chunks.push(chunk);
+    return Buffer.concat(chunks);
+  }
+  return Buffer.from(result || []);
+}
+
+async function processStartIconUploadBuffer(fileBuffer, mimeRaw) {
+  const mime =
+    mimeRaw && String(mimeRaw).split(";")[0]
+      ? String(mimeRaw).split(";")[0].trim().toLowerCase()
+      : "";
+  if (!ALLOWED_ENTRY_IMAGE_MIMES.has(mime)) {
+    throw new Error("Unsupported image type. Use JPEG, PNG, WebP, or GIF.");
+  }
+  let meta;
+  try {
+    meta = await sharp(fileBuffer, { failOn: "truncated" }).metadata();
+    if (!meta.width || !meta.height) throw new Error("Invalid image");
+  } catch (_) {
+    throw new Error("Invalid image file.");
+  }
+  const outBuffer = await sharp(fileBuffer)
+    .rotate()
+    .resize(START_ICON_MAX_EDGE, START_ICON_MAX_EDGE, { fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 85 })
+    .toBuffer();
+  return { buffer: outBuffer, contentType: "image/webp", filename: PROFILE_START_ICON_FILENAME };
+}
+
+function profileHasStartIcon(profileDoc) {
+  const fn =
+    profileDoc && typeof profileDoc.startIconFile === "string" ? profileDoc.startIconFile.trim() : "";
+  return !!(fn && profileDoc._attachments && profileDoc._attachments[fn]);
+}
+
+function resolveProfileStartIconColor(profileDoc) {
+  const name = profileDoc.name || profileDoc._id;
+  const stored =
+    profileDoc && profileDoc.startIconColor != null ? String(profileDoc.startIconColor) : "";
+  return resolveProfileListColor(stored, name);
+}
+
+function profileListSectionEntry(profileDoc) {
+  return {
+    doc: profileDoc,
+    listColor: resolveProfileStartIconColor(profileDoc),
+  };
+}
+
+function profileDocFromListSectionEntry(entry) {
+  return entry && entry.doc ? entry.doc : entry;
+}
+
 function normalizeProfileListLayoutItem(raw) {
   if (!raw || typeof raw !== "object") return null;
   if (raw.kind === "group") {
@@ -3773,7 +3982,12 @@ function normalizeProfileListLayoutItem(raw) {
     if (!label) return null;
     let id = typeof raw.id === "string" ? raw.id.trim().slice(0, 64) : "";
     if (!id) id = "group-" + crypto.randomBytes(4).toString("hex");
-    return { kind: "group", id, label };
+    const item = { kind: "group", id, label };
+    const color = normalizeLayoutItemColor(raw.color);
+    if (color) item.color = color;
+    const iconFile = normalizeGroupIconFile(raw.iconFile);
+    if (iconFile) item.iconFile = iconFile;
+    return item;
   }
   if (raw.kind === "profile") {
     const profileId = typeof raw.profileId === "string" ? raw.profileId.trim() : "";
@@ -3824,14 +4038,22 @@ function buildProfileListSections(profiles, layout) {
   for (const item of layoutNorm) {
     if (item.kind === "group") {
       flushLoose();
-      currentGroup = { kind: "group", id: item.id, label: item.label, profiles: [] };
+      currentGroup = {
+        kind: "group",
+        id: item.id,
+        label: item.label,
+        listColor: resolveProfileListColor(item.color, item.label),
+        iconFile: item.iconFile || "",
+        profiles: [],
+      };
       sections.push(currentGroup);
     } else {
       placedIds.add(item.profileId);
       const p = byId.get(item.profileId);
       if (!p) continue;
-      if (currentGroup) currentGroup.profiles.push(p);
-      else ensureLoose().profiles.push(p);
+      const entry = profileListSectionEntry(p);
+      if (currentGroup) currentGroup.profiles.push(entry);
+      else ensureLoose().profiles.push(entry);
     }
   }
   flushLoose();
@@ -3841,7 +4063,10 @@ function buildProfileListSections(profiles, layout) {
     .filter((p) => !placedIds.has(p._id))
     .sort((a, b) => String(a.name || a._id).localeCompare(String(b.name || b._id), undefined, { sensitivity: "base" }));
   if (unlisted.length > 0) {
-    sections.push({ kind: "profiles", profiles: unlisted });
+    sections.push({
+      kind: "profiles",
+      profiles: unlisted.map((p) => profileListSectionEntry(p)),
+    });
   }
 
   return sections.filter((s) => (s.kind === "group" ? s.profiles.length > 0 : s.profiles.length > 0));
@@ -3896,11 +4121,13 @@ function renderGroupedProfileListBody(sections, opts) {
         `<button type="button" class="profile-group-toggle collapsed" data-group-id="${gid}" aria-expanded="false">` +
         `<span class="profile-group-chevron" aria-hidden="true">▶</span> ${label} ` +
         `<span class="profile-group-count">(${count})</span></button></td></tr>`;
-      for (const p of section.profiles) {
+      for (const entry of section.profiles) {
+        const p = profileDocFromListSectionEntry(entry);
         html += renderProfileListTableRow(p, { adminMode, mobileHideDate, groupId: section.id });
       }
     } else {
-      for (const p of section.profiles) {
+      for (const entry of section.profiles) {
+        const p = profileDocFromListSectionEntry(entry);
         html += renderProfileListTableRow(p, { adminMode, mobileHideDate, groupId: "" });
       }
     }
@@ -3932,6 +4159,213 @@ const PROFILE_LIST_GROUP_SCRIPT = `
         });
       });
     });
+`;
+
+function startPageProfileTooltip(profileDoc) {
+  const desc =
+    profileDoc.description && String(profileDoc.description).trim()
+      ? String(profileDoc.description).trim()
+      : "—";
+  const created = profileDoc.createdAt ? formatDateOnly(profileDoc.createdAt) : "—";
+  return desc + "\nCreated: " + created;
+}
+
+function renderStartPageDbIconInner(profileDoc, listColor) {
+  const color = escapeHtml(listColor);
+  if (profileHasStartIcon(profileDoc)) {
+    const url = `/api/profiles/${encodeURIComponent(profileDoc._id)}/start-icon`;
+    return (
+      `<span class="start-db-icon start-db-icon--has-image" style="--start-icon-color:${color}" aria-hidden="true">` +
+      `<img src="${url}" alt="" loading="lazy" decoding="async"></span>`
+    );
+  }
+  return `<span class="start-db-icon" style="background:${color}" aria-hidden="true"></span>`;
+}
+
+function renderStartPageGroupIconInner(section, appConfigAttachments) {
+  const listColor = escapeHtml(section.listColor || hashColorFromName(section.label));
+  const label = escapeHtml(section.label);
+  const iconFile = section.iconFile && String(section.iconFile).trim();
+  const hasImage = !!(iconFile && appConfigAttachments && appConfigAttachments[iconFile]);
+  const gid = escapeHtml(section.id);
+  if (hasImage) {
+    const url = `/api/app-config/start-group-icon/${encodeURIComponent(section.id)}`;
+    return (
+      `<span class="start-group-icon start-group-icon--has-image" style="--start-icon-color:${listColor}">` +
+      `<img class="start-group-photo" src="${url}" alt="" loading="lazy" decoding="async">` +
+      `<span class="start-group-label"><span>${label}</span></span></span>`
+    );
+  }
+  return (
+    `<span class="start-group-icon" style="background:${listColor}">` +
+    `<span class="start-group-label"><span>${label}</span></span></span>`
+  );
+}
+
+function renderStartPageDatabaseTile(entry, opts) {
+  const p = profileDocFromListSectionEntry(entry);
+  const listColor =
+    entry && entry.listColor ? entry.listColor : hashColorFromName(p.name || p._id);
+  const href = `/profile/${encodeURIComponent(p._id)}`;
+  const name = escapeHtml(p.name || p._id);
+  const tip = escapeHtml(startPageProfileTooltip(p));
+  const inGroup = !!(opts && opts.inGroupPanel);
+  const loose = !!(opts && opts.loose);
+  const tileClass =
+    "start-db-tile" +
+    (inGroup ? " start-db-tile--in-group" : "") +
+    (loose ? " start-db-tile--loose" : "");
+  return (
+    `<a class="${tileClass}" href="${href}" title="${tip}">` +
+    renderStartPageDbIconInner(p, listColor) +
+    `<span class="start-db-name">${name}</span></a>`
+  );
+}
+
+function renderStartPageGroupOverlay(section) {
+  const gid = escapeHtml(section.id);
+  const label = escapeHtml(section.label);
+  const listColor = escapeHtml(section.listColor || hashColorFromName(section.label));
+  let grid = "";
+  for (const entry of section.profiles || []) {
+    grid += renderStartPageDatabaseTile(entry, { inGroupPanel: true });
+  }
+  return (
+    `<div class="start-group-panel" id="start-panel-${gid}" role="dialog" aria-modal="true" aria-labelledby="start-panel-title-${gid}" hidden>` +
+    `<button type="button" class="start-panel-close" data-panel-id="${gid}" aria-label="Close folder">✕</button>` +
+    `<div class="start-panel-head" style="background:${listColor}">` +
+    `<h2 class="start-panel-title" id="start-panel-title-${gid}">${label}</h2></div>` +
+    `<div class="start-panel-body"><div class="start-panel-grid">${grid}</div></div></div>`
+  );
+}
+
+function renderStartPageIconGrid(sections, appConfigAttachments) {
+  if (!sections || sections.length === 0) {
+    return '<p class="start-empty empty">No Elenko database profiles yet.</p>';
+  }
+  const attStubs = appConfigAttachments && typeof appConfigAttachments === "object" ? appConfigAttachments : {};
+  let groupsHtml = "";
+  const looseEntries = [];
+  let overlays = "";
+  for (const section of sections) {
+    if (section.kind === "group") {
+      const gid = escapeHtml(section.id);
+      const label = escapeHtml(section.label);
+      groupsHtml +=
+        `<button type="button" class="start-group-tile" data-group-id="${gid}" title="${label}" aria-haspopup="dialog" aria-controls="start-panel-${gid}">` +
+        renderStartPageGroupIconInner(section, attStubs) +
+        `</button>`;
+      overlays += renderStartPageGroupOverlay(section);
+    } else {
+      for (const entry of section.profiles || []) {
+        looseEntries.push(entry);
+      }
+    }
+  }
+  let main = "";
+  if (groupsHtml) {
+    main += `<div class="start-grid start-groups-grid">${groupsHtml}</div>`;
+  }
+  if (looseEntries.length > 0) {
+    main += '<div class="start-loose-row">';
+    for (const entry of looseEntries) {
+      main += renderStartPageDatabaseTile(entry, { loose: true });
+    }
+    main += "</div>";
+  }
+  return main + overlays;
+}
+
+const START_PAGE_ICON_STYLES = `
+    .start-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem 0.75rem; margin-top: 0.5rem; }
+    @media (min-width: 960px) { .start-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1.25rem 1rem; } }
+    .start-loose-row { display: flex; flex-direction: row; flex-wrap: wrap; gap: 1rem 0.85rem; align-items: flex-start; margin-top: 1.25rem; }
+    .start-groups-grid + .start-loose-row { margin-top: 1.5rem; }
+    .start-group-tile { display: block; width: 100%; padding: 0; border: none; background: transparent; cursor: pointer; font: inherit; color: inherit; text-align: left; }
+    .start-group-tile:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 3px; border-radius: 14px; }
+    .start-group-icon { display: block; width: 100%; aspect-ratio: 1; border-radius: 14px; position: relative; overflow: hidden; }
+    .start-group-icon--has-image { border: 2mm solid var(--start-icon-color); box-sizing: border-box; background: var(--start-icon-color); }
+    .start-group-icon--has-image .start-group-photo { position: absolute; left: 0; right: 0; top: 0; bottom: 0; width: 100%; height: calc(100% - 2.85rem); object-fit: cover; display: block; border-radius: 10px 10px 0 0; }
+    .start-group-label { position: absolute; left: 50%; bottom: 0.55rem; transform: translateX(-50%); max-width: calc(100% - 1rem); background: #fff; border-radius: 8px; padding: 0.3rem 0.55rem; box-sizing: border-box; box-shadow: 0 1px 4px rgba(0,0,0,0.12); z-index: 1; }
+    .start-group-label span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; text-align: center; font-size: 0.82rem; font-weight: 600; color: #0f1419; line-height: 1.25; max-width: 100%; }
+    .start-db-tile { display: flex; flex-direction: column; align-items: center; text-decoration: none; color: var(--app-text, #e6edf3); min-width: 0; max-width: 6.5rem; padding: 0.15rem; border-radius: 8px; }
+    .start-db-tile:hover { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .start-db-tile:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    .start-db-icon { width: 3.25rem; height: 3.25rem; border-radius: 50%; flex-shrink: 0; }
+    .start-db-icon--has-image { background: transparent; border: 1mm solid var(--start-icon-color); box-sizing: border-box; overflow: hidden; display: flex; align-items: center; justify-content: center; padding: 0; }
+    .start-db-icon--has-image img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; display: block; }
+    @media (min-width: 960px) { .start-db-icon { width: 3.5rem; height: 3.5rem; } }
+    .start-db-name { margin-top: 0.4rem; font-size: 0.78rem; line-height: 1.25; text-align: center; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; width: 100%; }
+    .start-empty { margin-top: 1rem; }
+    .start-group-panel { position: fixed; z-index: 200; left: 5%; top: 5%; width: 90%; height: 90%; box-sizing: border-box; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,0.45); }
+    .start-group-panel[hidden] { display: none !important; }
+    .start-panel-close { position: absolute; top: 0.65rem; right: 0.75rem; z-index: 2; border: none; background: rgba(255,255,255,0.92); color: #0f1419; width: 2rem; height: 2rem; border-radius: 6px; font-size: 1.1rem; line-height: 1; cursor: pointer; }
+    .start-panel-close:hover { background: #fff; }
+    .start-panel-close:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    .start-panel-head { padding: 1rem 3rem 1rem 1rem; flex-shrink: 0; }
+    .start-panel-title { margin: 0; font-size: 1.1rem; font-weight: 600; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.35); word-break: break-word; }
+    .start-panel-body { flex: 1; overflow: auto; padding: 1rem 1.25rem 1.5rem; }
+    .start-panel-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(4.5rem, 1fr)); gap: 1rem 0.75rem; justify-items: center; }
+`;
+
+const START_PAGE_OPEN_GROUP_KEY = "elenkoStartOpenGroup";
+
+const START_PAGE_ICON_SCRIPT = `
+    (function() {
+      var openPanelId = null;
+      var storageKey = ${JSON.stringify(START_PAGE_OPEN_GROUP_KEY)};
+      function hideAllPanels() {
+        document.querySelectorAll('.start-group-panel').forEach(function(p) { p.hidden = true; });
+        openPanelId = null;
+      }
+      function closeGroupPanel() {
+        hideAllPanels();
+        try { sessionStorage.removeItem(storageKey); } catch (_) {}
+      }
+      function openGroupPanel(gid) {
+        if (!gid) return;
+        hideAllPanels();
+        var panel = document.getElementById('start-panel-' + gid);
+        if (!panel) return;
+        panel.hidden = false;
+        openPanelId = gid;
+        try { sessionStorage.setItem(storageKey, gid); } catch (_) {}
+        var closeBtn = panel.querySelector('.start-panel-close');
+        if (closeBtn) closeBtn.focus();
+      }
+      document.querySelectorAll('.start-group-tile').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          openGroupPanel(btn.getAttribute('data-group-id'));
+        });
+      });
+      document.querySelectorAll('.start-panel-close').forEach(function(btn) {
+        btn.addEventListener('click', function() { closeGroupPanel(); });
+      });
+      document.querySelectorAll('.start-db-tile--loose').forEach(function(link) {
+        link.addEventListener('click', function() {
+          try { sessionStorage.removeItem(storageKey); } catch (_) {}
+        });
+      });
+      document.querySelectorAll('.start-db-tile--in-group').forEach(function(link) {
+        link.addEventListener('click', function() {
+          if (openPanelId) {
+            try { sessionStorage.setItem(storageKey, openPanelId); } catch (_) {}
+          }
+        });
+      });
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') closeGroupPanel();
+      });
+      function restoreOpenGroupFromStorage() {
+        var storedGroup = null;
+        try { storedGroup = sessionStorage.getItem(storageKey); } catch (_) {}
+        if (storedGroup) openGroupPanel(storedGroup);
+      }
+      restoreOpenGroupFromStorage();
+      window.addEventListener('pageshow', function(ev) {
+        if (ev.persisted) restoreOpenGroupFromStorage();
+      });
+    })();
 `;
 
 async function saveProfileListLayoutToAppConfig(layout) {
@@ -4205,7 +4639,8 @@ function augmentFlowLogMessageTimestamps(msg) {
   if (disp) msg.tsDisplay = disp;
 }
 
-const CONFIG_EXPORT_VERSION = 1;
+const CONFIG_EXPORT_VERSION = 2;
+const CONFIG_EXPORT_VERSION_LEGACY = 1;
 const EXPORTABLE_DB_TYPES = new Set(["elenko_profile", "elenko_entry_form"]);
 const EXPORTABLE_CONFIG_TYPES = new Set([
   "elenko_app_config",
@@ -4220,6 +4655,8 @@ function stripForExport(doc, type) {
   if (!doc || typeof doc !== "object") return null;
   const out = { ...doc };
   delete out._rev;
+  /** Binary lives in export `attachments`; stubs must not be re-inserted into CouchDB. */
+  delete out._attachments;
   if (type === "elenko_api") {
     out.apiKeyRef = "";
     out.apiUserRef = "";
@@ -4269,8 +4706,8 @@ function getApiAndJsIdsFromFlowDocs(flowDocs) {
     for (const step of steps) {
       const target = step && step.target;
       const param = (step && typeof step.param === "string") ? step.param.trim() : "";
-      if (target === "api" && param) apiIds.add(param);
-      if (target === "script" && param) jsIds.add(param);
+      if (target === "api" && param && !urlHasFieldPlaceholders(param)) apiIds.add(param);
+      if (target === "script" && param && !urlHasFieldPlaceholders(param)) jsIds.add(param);
     }
   }
   return { apiIds: [...apiIds], jsIds: [...jsIds] };
@@ -4295,6 +4732,107 @@ async function resolveConfigDocIds(configDbInstance, ids, type, nameField) {
     if (doc && doc._id) result.push(doc._id);
   }
   return [...new Set(result)];
+}
+
+async function pushExportAttachment(attachments, dbInstance, store, docId, attachmentName) {
+  if (!dbInstance || !docId || !attachmentName) return;
+  try {
+    const raw = await dbInstance.attachment.get(docId, attachmentName);
+    const buf = await bufferFromAttachmentGet(raw);
+    const meta = await dbInstance.get(docId);
+    const stub = meta._attachments && meta._attachments[attachmentName];
+    attachments.push({
+      store,
+      docId,
+      name: attachmentName,
+      contentType: (stub && stub.content_type) || "application/octet-stream",
+      dataBase64: buf.toString("base64"),
+    });
+  } catch (e) {
+    if (e.statusCode !== 404) {
+      console.warn("pushExportAttachment:", store, docId, attachmentName, e.message || e);
+    }
+  }
+}
+
+async function collectStartIconExportAttachments(attachments, scope, docsDb, docsConfig, profileIdForScope) {
+  const profileScopeId = profileIdForScope != null ? String(profileIdForScope) : "";
+  for (const doc of docsDb || []) {
+    if (!doc || doc.type !== "elenko_profile") continue;
+    if (scope === "profile" && doc._id !== profileScopeId) continue;
+    const fn = typeof doc.startIconFile === "string" ? doc.startIconFile.trim() : "";
+    if (fn) await pushExportAttachment(attachments, db, "db", doc._id, fn);
+  }
+  if (scope !== "all") return;
+  for (const doc of docsConfig || []) {
+    if (!doc || doc.type !== "elenko_app_config" || !configDb) continue;
+    const layout = normalizeProfileListLayout(doc.profileListLayout);
+    const seen = new Set();
+    for (const item of layout) {
+      if (item.kind !== "group" || !item.iconFile || seen.has(item.iconFile)) continue;
+      seen.add(item.iconFile);
+      await pushExportAttachment(attachments, configDb, "configDb", doc._id, item.iconFile);
+    }
+  }
+}
+
+function stripImportDocAttachments(doc) {
+  if (!doc || typeof doc !== "object") return doc;
+  const out = { ...doc };
+  delete out._attachments;
+  return out;
+}
+
+async function getDocRevForAttachmentWrite(store, docId) {
+  const doc = await store.get(docId, { attachments: false });
+  return doc && doc._rev ? doc._rev : null;
+}
+
+async function applyExportAttachments(attachments, errors) {
+  if (!Array.isArray(attachments) || attachments.length === 0) return 0;
+  let applied = 0;
+  for (const att of attachments) {
+    if (!att || typeof att !== "object") continue;
+    const store = att.store === "configDb" ? configDb : db;
+    const docId = att.docId != null ? String(att.docId) : "";
+    const name = att.name != null ? String(att.name) : "";
+    const dataBase64 = att.dataBase64 != null ? String(att.dataBase64) : "";
+    if (!store || !docId || !name || !dataBase64) continue;
+    try {
+      let rev;
+      try {
+        rev = await getDocRevForAttachmentWrite(store, docId);
+      } catch (e) {
+        if (e.statusCode === 404) continue;
+        throw e;
+      }
+      if (!rev) continue;
+      const buf = Buffer.from(dataBase64, "base64");
+      const contentType =
+        typeof att.contentType === "string" && att.contentType.trim()
+          ? att.contentType.trim()
+          : "application/octet-stream";
+      try {
+        const meta = await store.get(docId);
+        if (meta._attachments && meta._attachments[name]) {
+          await store.attachment.destroy(docId, name, { rev: meta._rev });
+          rev = await getDocRevForAttachmentWrite(store, docId);
+        }
+      } catch (_) {
+        rev = await getDocRevForAttachmentWrite(store, docId);
+      }
+      if (!rev) continue;
+      await store.attachment.insert(docId, name, buf, contentType, { rev });
+      applied++;
+    } catch (err) {
+      errors.push({
+        id: docId,
+        type: "attachment:" + name,
+        message: err.message || String(err),
+      });
+    }
+  }
+  return applied;
 }
 
 async function buildConfigExport(scope, profileId) {
@@ -4331,12 +4869,15 @@ async function buildConfigExport(scope, profileId) {
       const appDoc = appResult.docs && appResult.docs[0];
       if (appDoc) addConfig(appDoc);
     }
+    const attachments = [];
+    await collectStartIconExportAttachments(attachments, scope, docsDb, docsConfig, profileId);
     return {
       version: CONFIG_EXPORT_VERSION,
       scope: "profile",
       profileId: "__app__",
       exportedAt: new Date().toISOString(),
       documents: { db: docsDb, configDb: docsConfig },
+      attachments: attachments.length > 0 ? attachments : undefined,
     };
   }
 
@@ -4492,12 +5033,15 @@ async function buildConfigExport(scope, profileId) {
     }
   }
 
+  const attachments = [];
+  await collectStartIconExportAttachments(attachments, scope, docsDb, docsConfig, profileId);
   return {
     version: CONFIG_EXPORT_VERSION,
     scope,
     profileId: scope === "profile" ? profileId || null : null,
     exportedAt: new Date().toISOString(),
     documents: { db: docsDb, configDb: docsConfig },
+    attachments: attachments.length > 0 ? attachments : undefined,
   };
 }
 
@@ -4510,7 +5054,7 @@ async function buildConfigExport(scope, profileId) {
 async function upsertAppConfigFromImport(rawDoc, overwrite) {
   if (!configDb) return 0;
   if (!overwrite) return 0;
-  const incoming = { ...rawDoc };
+  const incoming = stripImportDocAttachments(rawDoc);
   delete incoming._rev;
   const incomingId = incoming._id != null ? String(incoming._id) : "";
 
@@ -4574,7 +5118,7 @@ async function applyConfigImport(data, overwrite) {
   for (const doc of docsDb) {
     if (!doc || typeof doc !== "object" || !EXPORTABLE_DB_TYPES.has(doc.type)) continue;
     const id = doc._id;
-    const toInsert = { ...doc };
+    const toInsert = stripImportDocAttachments(doc);
     delete toInsert._rev;
     try {
       if (id) {
@@ -4603,7 +5147,7 @@ async function applyConfigImport(data, overwrite) {
   for (const doc of docsConfig) {
     if (!doc || typeof doc !== "object" || !EXPORTABLE_CONFIG_TYPES.has(doc.type)) continue;
     const id = doc._id;
-    const toInsert = { ...doc };
+    const toInsert = stripImportDocAttachments(doc);
     delete toInsert._rev;
     if (toInsert.type === "elenko_api") {
       toInsert.apiKeyRef = toInsert.apiKeyRef || "";
@@ -4646,10 +5190,15 @@ async function applyConfigImport(data, overwrite) {
   if (importedConfig > 0 || docsConfig.some((d) => d && d.type === "elenko_app_config")) {
     invalidateAppUiConfigCache();
   }
+  const importedAttachments = await applyExportAttachments(
+    data && data.attachments,
+    errors
+  );
   return {
     ok: errors.length === 0,
     importedDb,
     importedConfig,
+    importedAttachments,
     errors: errors.length > 0 ? errors : undefined,
   };
 }
@@ -4884,16 +5433,13 @@ function startFlowWorker() {
               return;
             }
           }
-          sendFlowMessage("api.request", {
+          logApiRequestForFlow(apiDoc, msg.dataset, {
             apiDocId,
             apiName: apiDoc.name,
             entryId: msg.entryId,
             profileId: msg.profileId,
-            url: apiDoc.url,
-            method: apiDoc.method || "GET",
-            responseTarget: apiDoc.responseTarget || "update",
-            dataset: msg.dataset,
             authType: bundle.authType,
+            includeDataset: true,
           });
           const apiKeyPreview = previewApiCredentialsForFlow(bundle);
           apiWorker.postMessage({
@@ -6432,15 +6978,25 @@ app.get("/", async (req, res) => {
   try {
     const result = await db.find({
       selector: { type: "elenko_profile" },
-      fields: ["_id", "_rev", "name", "description", "createdAt", "encryption"],
       sort: [{ name: "asc" }],
     });
     const profiles = filterProfilesVisibleToUser(req, result.docs || []);
     const appUi = await getAppUiConfig();
+    let appConfigAttachments = {};
+    if (configDb) {
+      try {
+        const appFind = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+        const appStub = appFind.docs && appFind.docs[0];
+        if (appStub && appStub._id) {
+          const appFull = await configDb.get(appStub._id);
+          appConfigAttachments = appFull._attachments || {};
+        }
+      } catch (_) {}
+    }
     const role = (req.session && req.session.role) || "editor";
     const keyFileNotice = buildKeyFileNoticeHtml(req.session);
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderStartPage(profiles, role, appUi, keyFileNotice));
+    res.send(renderStartPage(profiles, role, appUi, keyFileNotice, appConfigAttachments));
   } catch (err) {
     console.error("Error loading profiles:", err);
     res.status(500).send(renderErrorPage(err.message));
@@ -6618,6 +7174,199 @@ app.post("/api/profile-list-layout", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("Error saving profile list layout:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/profiles/:id/start-icon", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const doc = await db.get(id);
+    if (!doc || doc.type !== "elenko_profile") return res.status(404).end();
+    const fn = typeof doc.startIconFile === "string" ? doc.startIconFile.trim() : "";
+    if (!fn || !doc._attachments || !doc._attachments[fn]) return res.status(404).end();
+    const stub = doc._attachments[fn];
+    const buf = await bufferFromAttachmentGet(await db.attachment.get(id, fn));
+    res.set("Content-Type", stub.content_type || "image/webp");
+    res.set("Cache-Control", "private, max-age=300");
+    res.send(buf);
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).end();
+    console.error("start-icon GET:", err);
+    res.status(500).end();
+  }
+});
+
+app.post(
+  "/api/profiles/:id/start-icon",
+  requireAdmin,
+  startIconUpload.single("file"),
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ error: "file is required (multipart field name: file)." });
+      }
+      const doc = await db.get(id);
+      if (!doc || doc.type !== "elenko_profile") {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+      const processed = await processStartIconUploadBuffer(req.file.buffer, req.file.mimetype);
+      const oldFn = typeof doc.startIconFile === "string" ? doc.startIconFile.trim() : "";
+      if (oldFn && oldFn !== processed.filename && doc._attachments && doc._attachments[oldFn]) {
+        await db.attachment.destroy(id, oldFn, { rev: doc._rev });
+        doc._rev = (await db.get(id))._rev;
+      }
+      await db.attachment.insert(id, processed.filename, processed.buffer, processed.contentType, {
+        rev: doc._rev,
+      });
+      const updated = await db.get(id);
+      updated.startIconFile = processed.filename;
+      updated.updatedAt = new Date().toISOString();
+      const ins = await db.insert(updated);
+      clearProfileListCache(id);
+      res.json({ ok: true, startIconFile: processed.filename, rev: ins.rev });
+    } catch (err) {
+      if (err?.statusCode === 404) return res.status(404).json({ error: "Not found" });
+      console.error("start-icon POST:", err);
+      res.status(400).json({ error: err.message || "Upload failed" });
+    }
+  }
+);
+
+app.delete("/api/profiles/:id/start-icon", requireAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const doc = await db.get(id);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const fn = typeof doc.startIconFile === "string" ? doc.startIconFile.trim() : "";
+    if (fn && doc._attachments && doc._attachments[fn]) {
+      await db.attachment.destroy(id, fn, { rev: doc._rev });
+      doc._rev = (await db.get(id))._rev;
+    }
+    delete doc.startIconFile;
+    doc.updatedAt = new Date().toISOString();
+    const ins = await db.insert(doc);
+    clearProfileListCache(id);
+    res.json({ ok: true, rev: ins.rev });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Not found" });
+    console.error("start-icon DELETE:", err);
+    res.status(500).json({ error: err.message || "Delete failed" });
+  }
+});
+
+app.get("/api/app-config/start-group-icon/:groupId", requireAuth, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).end();
+    let groupId = req.params.groupId != null ? String(req.params.groupId) : "";
+    try {
+      groupId = decodeURIComponent(groupId);
+    } catch (_) {}
+    if (!groupId.trim()) return res.status(400).end();
+    const appFind = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+    const appStub = appFind.docs && appFind.docs[0];
+    if (!appStub) return res.status(404).end();
+    const appDoc = await configDb.get(appStub._id);
+    const layout = normalizeProfileListLayout(appDoc.profileListLayout);
+    const item = layout.find((x) => x.kind === "group" && x.id === groupId);
+    const fn = item && item.iconFile ? item.iconFile : "";
+    if (!fn || !appDoc._attachments || !appDoc._attachments[fn]) return res.status(404).end();
+    const stub = appDoc._attachments[fn];
+    const buf = await bufferFromAttachmentGet(await configDb.attachment.get(appDoc._id, fn));
+    res.set("Content-Type", stub.content_type || "image/webp");
+    res.set("Cache-Control", "private, max-age=300");
+    res.send(buf);
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).end();
+    console.error("start-group-icon GET:", err);
+    res.status(500).end();
+  }
+});
+
+app.post(
+  "/api/profile-list-layout/group-icon",
+  requireAdmin,
+  startIconUpload.single("file"),
+  async (req, res) => {
+    try {
+      if (!configDb) return res.status(503).json({ error: "Config store not available" });
+      const groupId =
+        req.body && typeof req.body.groupId === "string" ? req.body.groupId.trim() : "";
+      if (!groupId) return res.status(400).json({ error: "groupId is required." });
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ error: "file is required (multipart field name: file)." });
+      }
+      const processed = await processStartIconUploadBuffer(req.file.buffer, req.file.mimetype);
+      const iconFile = groupIconAttachmentNameForId(groupId);
+      const appFind = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+      let appDoc = appFind.docs && appFind.docs[0];
+      if (!appDoc) {
+        appDoc = { type: "elenko_app_config", theme: { ...DEFAULT_APP_THEME }, profileListLayout: [] };
+        const ins = await configDb.insert(appDoc);
+        appDoc = await configDb.get(ins.id);
+      } else {
+        appDoc = await configDb.get(appDoc._id);
+      }
+      const layout = normalizeProfileListLayout(appDoc.profileListLayout);
+      const idx = layout.findIndex((x) => x.kind === "group" && x.id === groupId);
+      if (idx === -1) {
+        return res.status(404).json({ error: "Folder not found in layout. Save the layout first." });
+      }
+      const prevFn = layout[idx].iconFile;
+      if (prevFn && prevFn !== iconFile && appDoc._attachments && appDoc._attachments[prevFn]) {
+        await configDb.attachment.destroy(appDoc._id, prevFn, { rev: appDoc._rev });
+        appDoc = await configDb.get(appDoc._id);
+      }
+      await configDb.attachment.insert(appDoc._id, iconFile, processed.buffer, processed.contentType, {
+        rev: appDoc._rev,
+      });
+      appDoc = await configDb.get(appDoc._id);
+      layout[idx] = { ...layout[idx], iconFile };
+      appDoc.profileListLayout = layout;
+      await configDb.insert(appDoc);
+      invalidateAppUiConfigCache();
+      res.json({ ok: true, groupId, iconFile, profileListLayout: layout });
+    } catch (err) {
+      console.error("group-icon POST:", err);
+      res.status(400).json({ error: err.message || "Upload failed" });
+    }
+  }
+);
+
+app.delete("/api/profile-list-layout/group-icon", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const groupId =
+      req.body && typeof req.body.groupId === "string"
+        ? req.body.groupId.trim()
+        : req.query && typeof req.query.groupId === "string"
+        ? req.query.groupId.trim()
+        : "";
+    if (!groupId) return res.status(400).json({ error: "groupId is required." });
+    const appFind = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
+    const appStub = appFind.docs && appFind.docs[0];
+    if (!appStub) return res.status(404).json({ error: "App config not found" });
+    let appDoc = await configDb.get(appStub._id);
+    const layout = normalizeProfileListLayout(appDoc.profileListLayout);
+    const idx = layout.findIndex((x) => x.kind === "group" && x.id === groupId);
+    if (idx === -1) return res.status(404).json({ error: "Folder not found in layout" });
+    const fn = layout[idx].iconFile;
+    if (fn && appDoc._attachments && appDoc._attachments[fn]) {
+      await configDb.attachment.destroy(appDoc._id, fn, { rev: appDoc._rev });
+      appDoc = await configDb.get(appDoc._id);
+    }
+    const nextItem = { ...layout[idx] };
+    delete nextItem.iconFile;
+    layout[idx] = nextItem;
+    appDoc.profileListLayout = layout;
+    await configDb.insert(appDoc);
+    invalidateAppUiConfigCache();
+    res.json({ ok: true, profileListLayout: layout });
+  } catch (err) {
+    console.error("group-icon DELETE:", err);
+    res.status(500).json({ error: err.message || "Delete failed" });
   }
 });
 
@@ -7291,7 +8040,11 @@ app.post("/api/config-import", requireAdmin, async (req, res) => {
     if (!data || typeof data !== "object") {
       return res.status(400).json({ error: "Invalid import: missing data. Upload an export JSON file." });
     }
-    if (data.version !== CONFIG_EXPORT_VERSION || !data.documents) {
+    const exportVer = data.version;
+    if (
+      (exportVer !== CONFIG_EXPORT_VERSION && exportVer !== CONFIG_EXPORT_VERSION_LEGACY) ||
+      !data.documents
+    ) {
       return res.status(400).json({ error: "Invalid export format. Use a file exported from this Export / Import configuration page." });
     }
     const result = await applyConfigImport(data, true);
@@ -9228,6 +9981,7 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       primaryKeySegmentLengths: rawPrimaryKeySegmentLengths,
       primaryKeyImportPolicy: rawPrimaryKeyImportPolicy,
       encryption: rawEncryption,
+      startIconColor: rawStartIconColor,
     } = req.body || {};
     if (!_rev || !name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Name and _rev are required" });
@@ -9245,6 +9999,8 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       : (Array.isArray(doc.fieldNames) ? doc.fieldNames : []);
     doc.name = name.trim();
     doc.description = description != null ? String(description).trim() : "";
+    doc.startIconColor =
+      normalizeLayoutItemColor(rawStartIconColor) || hashColorFromName(doc.name || doc._id);
     doc.customCss = customCss != null ? String(customCss) : "";
     doc.fieldNames = fields;
     doc.fieldDefaultSources = normalizeFieldDefaultSources(fields, req.body.fieldDefaultSources);
@@ -10676,6 +11432,23 @@ app.post("/api/profiles/:id/copy", requireAdmin, async (req, res) => {
     const newDoc = buildProfileDocFromSource(baseDoc, newName);
     const result = await db.insert(newDoc);
     let created = await db.get(result.id);
+    const iconFn =
+      typeof baseDoc.startIconFile === "string" ? baseDoc.startIconFile.trim() : "";
+    if (iconFn && baseDoc._attachments && baseDoc._attachments[iconFn]) {
+      try {
+        const buf = await bufferFromAttachmentGet(await db.attachment.get(id, iconFn));
+        const stub = baseDoc._attachments[iconFn];
+        await db.attachment.insert(result.id, iconFn, buf, stub.content_type || "image/webp", {
+          rev: created._rev,
+        });
+        created = await db.get(result.id);
+        created.startIconFile = iconFn;
+        const iconIns = await db.insert(created);
+        created._rev = iconIns.rev;
+      } catch (e) {
+        console.warn("Profile copy: start icon not copied:", e.message || e);
+      }
+    }
     created = await ensureProfileDbCode8(db, created);
     res.status(201).json({ ok: true, id: result.id, rev: created._rev, name: newName });
   } catch (err) {
@@ -14729,6 +15502,8 @@ function renderEditFlowPage(doc, err, appUi) {
     .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
     .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; }
     .btn-remove { background: transparent; color: #f85149; padding: 0.25rem 0.5rem; }
+    .btn-insert { background: transparent; color: var(--app-link, #58a6ff); padding: 0.25rem 0.5rem; }
+    .step-actions { white-space: nowrap; }
     .flow-steps-table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
     .flow-steps-table th, .flow-steps-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     .flow-steps-table th { color: var(--app-table-header-text, #8b949e); font-weight: 600; font-size: 0.875rem; }
@@ -14754,8 +15529,9 @@ function renderEditFlowPage(doc, err, appUi) {
     <label for="description">Description</label>
     <input type="text" id="description" name="description" placeholder="Optional" value="${descVal}">
     <label style="margin-top:1.5rem;">Steps</label>
+    <p class="sub" style="margin-top:0.25rem;">For Call API, Run script, and Send to Local DB, Param may use <code>#fieldName#</code> placeholders filled from the entry or from earlier script output (e.g. <code>#_apiDoc#</code>). Underscore fields are pipeline-only and are not saved on Update.</p>
     <table class="flow-steps-table">
-      <thead><tr><th>#</th><th>Target</th><th>Label</th><th>Param (API id or Profile id)</th><th></th></tr></thead>
+      <thead><tr><th>#</th><th>Target</th><th>Label</th><th>Param</th><th></th></tr></thead>
       <tbody id="flow-steps-tbody"></tbody>
     </table>
     <button type="button" id="add-step" class="btn btn-secondary" style="margin-top:0.5rem;">+ Add step</button>
@@ -14773,7 +15549,7 @@ function renderEditFlowPage(doc, err, appUi) {
       initialSteps = [{ target: 'log', param: '', label: 'Log' }];
     }
     if (!Array.isArray(initialSteps) || initialSteps.length === 0) initialSteps = [{ target: 'log', param: '', label: 'Log' }];
-    function addStepRow(step) {
+    function addStepRow(step, beforeTr) {
       if (!tbody) return;
       const tr = document.createElement('tr');
       tr.className = 'flow-step-row';
@@ -14801,11 +15577,11 @@ function renderEditFlowPage(doc, err, appUi) {
       const param = (step && step.param != null) ? String(step.param).replace(/"/g, '&quot;') : '';
       const paramPlaceholder =
         target === 'script'
-          ? 'JS Processing doc id or name'
+          ? 'JS doc id/name or #fieldName#'
           : target === 'api'
-          ? 'API id or name'
+          ? 'API id/name or #fieldName#'
           : target === 'localDb'
-          ? 'Profile id or name'
+          ? 'Profile id/name or #fieldName#'
           : target === 'response'
           ? 'Not used'
           : target === 'update'
@@ -14835,7 +15611,9 @@ function renderEditFlowPage(doc, err, appUi) {
         '</select></td>' +
         '<td><input type="text" class="step-label" placeholder="Step label" value="' + label + '"></td>' +
         '<td><input type="text" class="step-param" placeholder="' + paramPlaceholder + '" value="' + param + '"></td>' +
-        '<td><button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
+        '<td class="step-actions"><button type="button" class="btn btn-insert" aria-label="Insert step before">Insert</button> <button type="button" class="btn btn-remove" aria-label="Remove">Remove</button></td>';
+      const insertBtn = tr.querySelector('.btn-insert');
+      if (insertBtn) insertBtn.onclick = function() { addStepRow({ target: 'log', param: '', label: '' }, tr); };
       const removeBtn = tr.querySelector('.btn-remove');
       if (removeBtn) removeBtn.onclick = function() { tr.remove(); updateStepNums(); };
       const stepTarget = tr.querySelector('.step-target');
@@ -14843,11 +15621,11 @@ function renderEditFlowPage(doc, err, appUi) {
       if (stepTarget && stepParam) {
         stepTarget.addEventListener('change', function() {
           if (this.value === 'script') {
-            stepParam.placeholder = 'JS Processing doc id or name';
+            stepParam.placeholder = 'JS doc id/name or #fieldName#';
           } else if (this.value === 'api') {
-            stepParam.placeholder = 'API id or name';
+            stepParam.placeholder = 'API id/name or #fieldName#';
           } else if (this.value === 'localDb') {
-            stepParam.placeholder = 'Profile id or name';
+            stepParam.placeholder = 'Profile id/name or #fieldName#';
           } else if (this.value === 'response') {
             stepParam.placeholder = 'Not used';
           } else if (this.value === 'update') {
@@ -14865,7 +15643,8 @@ function renderEditFlowPage(doc, err, appUi) {
           }
         });
       }
-      tbody.appendChild(tr);
+      if (beforeTr && beforeTr.parentNode === tbody) tbody.insertBefore(tr, beforeTr);
+      else tbody.appendChild(tr);
       updateStepNums();
     }
     function updateStepNums() {
@@ -17324,7 +18103,7 @@ function renderAllDocumentsPage(docs, appUi) {
 </html>`;
 }
 
-function renderStartPage(profiles, role, appUi, keyFileNotice) {
+function renderStartPage(profiles, role, appUi, keyFileNotice, appConfigAttachments) {
   const keyFileBanner = keyFileNotice ? String(keyFileNotice) : "";
   const isAdmin = role === "admin";
   const theme = normalizeAppTheme(appUi && appUi.theme);
@@ -17347,19 +18126,15 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
       --app-table-border: ${escapeHtml(theme.tableBorder)};
     }`;
   const sections = buildProfileListSections(profiles, appUi && appUi.profileListLayout);
-  const rows = profiles.length
-    ? renderGroupedProfileListBody(sections, { adminMode: false, mobileHideDate: true })
-    : `
-        <tr>
-          <td colspan="3" class="empty">No Elenko database profiles yet.${isAdmin ? ' Add documents with <code>type: "elenko_profile"</code> in CouchDB.' : ""}</td>
-        </tr>`;
+  const iconGridHtml = profiles.length
+    ? renderStartPageIconGrid(sections, appConfigAttachments)
+    : `<p class="start-empty empty">No Elenko database profiles yet.${isAdmin ? ' Add documents with <code>type: "elenko_profile"</code> in CouchDB.' : ""}</p>`;
 
-    const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
+  const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
   const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option><option value="/account/unlock-keyfile">Provide key file</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
   const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/debug">Debug / flow log</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
-  const thead = '<tr><th>Name</th><th>Description</th><th class="col-mobile-hidden">Creation date</th></tr>';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -17375,10 +18150,6 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
     body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); min-height: 100vh; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
     .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
-    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
-    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
-    tr:last-child td { border-bottom: none; }
     a { color: var(--app-link, #58a6ff); text-decoration: none; }
     a:hover { text-decoration: underline; }
     code { font-size: 0.9em; background: var(--app-table-bg, #21262d); color: var(--app-label, #8b949e); padding: 0.2em 0.4em; border-radius: 4px; }
@@ -17390,15 +18161,11 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
     .btn-logout { display: inline-block; margin-left: 0.5rem; padding: 0.35rem 0.75rem; background: #0d1117; color: #fff; border: 1px solid #30363d; border-radius: 6px; font-size: 0.9rem; text-decoration: none; vertical-align: middle; }
     .btn-logout:hover { background: #21262d; color: #fff; text-decoration: none; }
     .nav-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; margin-bottom: 1rem; }
-    .edit-link { color: var(--app-link, #58a6ff); }
-    .delete-link { color: #f85149; margin-left: 0.5rem; }
-    .delete-link:hover { color: #ff7b72; }
     .nav-select { margin-left: 0; padding: 0.35rem 0.5rem; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.9rem; cursor: pointer; vertical-align: middle; }
     .nav-select:hover { border-color: #58a6ff; }
     .nav-select:focus { outline: none; border-color: #58a6ff; }
-    .col-mobile-hidden { display: table-cell; }
     @media (max-width: 768px) {
-      .col-mobile-hidden { display: none; }
+      body { padding: 1rem; }
       .nav-bar { gap: 0.25rem; margin-bottom: 0.75rem; }
       .btn { padding: 0.35rem 0.75rem; font-size: 0.875rem; }
       .btn-logout { padding: 0.25rem 0.55rem; font-size: 0.82rem; }
@@ -17407,7 +18174,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
       .nav-select-flow { width: 4.4rem; max-width: 4.4rem; min-width: 4.4rem; }
       .nav-select-special { width: 4.4rem; max-width: 4.4rem; min-width: 4.4rem; }
     }
-    ${PROFILE_LIST_GROUP_STYLES}
+    ${START_PAGE_ICON_STYLES}
   </style>
 </head>
 <body>
@@ -17421,11 +18188,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
     ${isAdmin ? '<select id="nav-flow-processing" class="nav-select nav-select-flow" aria-label="Flow"><option value="" disabled selected>Flow</option><option value="/flows">Flows</option><option value="/timers">Timers</option><option value="/apis">REST APIs</option><option value="/js-processing">JS Processing</option></select>' : ''}
     ${isAdmin ? `<select id="nav-special" class="nav-select nav-select-special" aria-label="Special functions">${specialOptions}</select>` : ""}
   </p>
-  <table>
-    <thead>${thead}</thead>
-    <tbody>${rows}
-    </tbody>
-  </table>
+  ${iconGridHtml}
   <script>
     document.getElementById('nav-user-admin').addEventListener('change', function() {
       var v = this.value;
@@ -17441,7 +18204,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice) {
       var v = this.value;
       if (v) { window.location.href = v; }
     });
-    ${PROFILE_LIST_GROUP_SCRIPT}
+    ${START_PAGE_ICON_SCRIPT}
   </script>
 </body>
 </html>`;
@@ -17486,6 +18249,14 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
     .layout-actions button:hover { color: var(--app-link, #58a6ff); }
     .layout-actions button:disabled { opacity: 0.35; cursor: not-allowed; }
     .layout-label-input { width: 100%; max-width: 20rem; padding: 0.35rem 0.5rem; background: var(--app-bg, #0f1419); border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; color: var(--app-text, #e6edf3); font: inherit; }
+    .layout-color-cell { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+    .layout-color-cell--folder { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+    .layout-color-cell--profile { color: var(--app-label, #8b949e); font-size: 0.9rem; }
+    .layout-color-row { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+    .layout-color-cell input[type="color"] { width: 2.25rem; height: 2rem; padding: 0; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; cursor: pointer; background: transparent; }
+    .layout-color-hex { width: 5.5rem; padding: 0.3rem 0.4rem; background: var(--app-bg, #0f1419); border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; color: var(--app-text, #e6edf3); font: inherit; font-size: 0.85rem; }
+    .layout-folder-icon-block { display: flex; flex-direction: column; align-items: flex-start; gap: 0.35rem; }
+    .layout-group-icon-preview { width: 3rem; height: 2.25rem; object-fit: cover; border-radius: 6px; border: 1px solid var(--app-table-border, #30363d); }
     .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 1rem; }
     select { padding: 0.4rem 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font: inherit; max-width: 18rem; }
     .btn { display: inline-block; padding: 0.45rem 0.85rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
@@ -17504,10 +18275,10 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
     <a href="/profiles" class="btn btn-secondary">Elenko profiles</a>
   </div>
   <h1>Database list layout</h1>
-  <p class="sub">Define folders and order for the start page and <a href="/profiles">Elenko profiles</a> list. Folders are collapsed by default. Each database appears at most once; databases not listed appear at the end (ungrouped). Empty folders are hidden on the start page.</p>
+  <p class="sub">Define folders, order, and folder icon colours for the <a href="/">start page</a>. Database icon colours are set on each <a href="/profiles">profile edit</a> page. Colours default from the name (hash). Each database appears at most once; unlisted databases appear at the end (ungrouped). Empty folders are hidden on the start page.</p>
   ${msgErr}
   <table>
-    <thead><tr><th>#</th><th>Type</th><th>Name</th><th>Move</th></tr></thead>
+    <thead><tr><th>#</th><th>Type</th><th>Name</th><th>Colour</th><th>Move</th></tr></thead>
     <tbody id="layout-body"></tbody>
   </table>
   <div id="layout-empty" class="empty-layout" style="display:none;">No layout entries yet. Add a folder or database below.</div>
@@ -17527,6 +18298,50 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
       var emptyEl = document.getElementById('layout-empty');
       var msgEl = document.getElementById('msg');
       var addSelect = document.getElementById('add-profile-select');
+
+      function hslToHex(h, s, l) {
+        s /= 100; l /= 100;
+        var c = (1 - Math.abs(2 * l - 1)) * s;
+        var x = c * (1 - Math.abs((h / 60) % 2 - 1));
+        var m = l - c / 2;
+        var r = 0, g = 0, b = 0;
+        if (h < 60) { r = c; g = x; }
+        else if (h < 120) { r = x; g = c; }
+        else if (h < 180) { g = c; b = x; }
+        else if (h < 240) { g = x; b = c; }
+        else if (h < 300) { r = x; b = c; }
+        else { r = c; b = x; }
+        function byte(v) {
+          return Math.round((v + m) * 255).toString(16).padStart(2, '0');
+        }
+        return '#' + byte(r) + byte(g) + byte(b);
+      }
+
+      function hashColorFromName(name) {
+        var s = (name || '').trim() || 'default';
+        var hash = 0;
+        for (var i = 0; i < s.length; i++) {
+          hash = s.charCodeAt(i) + ((hash << 5) - hash);
+          hash |= 0;
+        }
+        return hslToHex(Math.abs(hash) % 360, 52, 46);
+      }
+
+      function layoutItemDisplayName(item) {
+        if (item.kind === 'group') return item.label || 'Folder';
+        var p = profileById[item.profileId];
+        return p ? (p.name || p._id) : item.profileId;
+      }
+
+      function ensureLayoutItemColor(item) {
+        if (item.kind !== 'group') return;
+        var c = item.color && String(item.color).trim();
+        if (!/^#?[0-9A-Fa-f]{3}([0-9A-Fa-f]{3})?$/.test(c || '')) {
+          item.color = hashColorFromName(layoutItemDisplayName(item));
+        } else if (c.charAt(0) !== '#') {
+          item.color = '#' + c;
+        }
+      }
 
       function layoutProfileIds() {
         var ids = {};
@@ -17566,6 +18381,7 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
         bodyEl.innerHTML = '';
         emptyEl.style.display = layout.length ? 'none' : 'block';
         layout.forEach(function(item, index) {
+          ensureLayoutItemColor(item);
           var tr = document.createElement('tr');
           if (item.kind === 'group') tr.className = 'layout-folder';
           var numTd = document.createElement('td');
@@ -17587,6 +18403,105 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
             nameTd.textContent = p ? (p.name || p._id) : ('(missing: ' + item.profileId + ')');
           }
           tr.appendChild(nameTd);
+          var colorTd = document.createElement('td');
+          if (item.kind === 'group') {
+            colorTd.className = 'layout-color-cell layout-color-cell--folder';
+            var colorRow = document.createElement('div');
+            colorRow.className = 'layout-color-row';
+            var colorPick = document.createElement('input');
+            colorPick.type = 'color';
+            colorPick.value = item.color;
+            colorPick.title = 'Folder icon colour on start page';
+            var colorHex = document.createElement('input');
+            colorHex.type = 'text';
+            colorHex.className = 'layout-color-hex';
+            colorHex.value = item.color;
+            colorHex.maxLength = 7;
+            colorHex.title = 'Hex colour';
+            colorPick.addEventListener('input', function() {
+              item.color = colorPick.value;
+              colorHex.value = colorPick.value;
+            });
+            colorHex.addEventListener('change', function() {
+              var v = (colorHex.value || '').trim();
+              if (/^#?[0-9A-Fa-f]{6}$/.test(v)) {
+                if (v.charAt(0) !== '#') v = '#' + v;
+                item.color = v;
+                colorPick.value = v;
+              } else {
+                colorHex.value = item.color;
+              }
+            });
+            colorRow.appendChild(colorPick);
+            colorRow.appendChild(colorHex);
+            colorTd.appendChild(colorRow);
+            var iconBlock = document.createElement('div');
+            iconBlock.className = 'layout-folder-icon-block';
+            if (item.iconFile) {
+              var prevImg = document.createElement('img');
+              prevImg.className = 'layout-group-icon-preview';
+              prevImg.src = '/api/app-config/start-group-icon/' + encodeURIComponent(item.id) + '?t=' + String(Date.now());
+              prevImg.alt = '';
+              iconBlock.appendChild(prevImg);
+            }
+            var iconFileIn = document.createElement('input');
+            iconFileIn.type = 'file';
+            iconFileIn.accept = 'image/jpeg,image/png,image/webp,image/gif';
+            iconFileIn.title = 'Upload folder icon';
+            iconFileIn.addEventListener('change', async function() {
+              var f = iconFileIn.files && iconFileIn.files[0];
+              iconFileIn.value = '';
+              if (!f) return;
+              var fd = new FormData();
+              fd.append('groupId', item.id);
+              fd.append('file', f);
+              try {
+                var r = await fetch('/api/profile-list-layout/group-icon', { method: 'POST', body: fd });
+                var data = await r.json();
+                if (!r.ok) throw new Error(data.error || 'Upload failed');
+                if (Array.isArray(data.profileListLayout)) layout = data.profileListLayout;
+                render();
+                msgEl.textContent = 'Folder icon saved.';
+                msgEl.className = 'msg ok';
+                msgEl.style.display = 'block';
+              } catch (e) {
+                msgEl.textContent = e.message || 'Upload failed';
+                msgEl.className = 'msg err';
+                msgEl.style.display = 'block';
+              }
+            });
+            iconBlock.appendChild(iconFileIn);
+            var rmIconBtn = document.createElement('button');
+            rmIconBtn.type = 'button';
+            rmIconBtn.className = 'btn btn-secondary';
+            rmIconBtn.style.padding = '0.2rem 0.45rem';
+            rmIconBtn.style.fontSize = '0.75rem';
+            rmIconBtn.textContent = 'Remove icon';
+            rmIconBtn.disabled = !item.iconFile;
+            rmIconBtn.addEventListener('click', async function() {
+              try {
+                var r = await fetch('/api/profile-list-layout/group-icon', {
+                  method: 'DELETE',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ groupId: item.id })
+                });
+                var data = await r.json();
+                if (!r.ok) throw new Error(data.error || 'Remove failed');
+                if (Array.isArray(data.profileListLayout)) layout = data.profileListLayout;
+                render();
+              } catch (e) {
+                msgEl.textContent = e.message || 'Remove failed';
+                msgEl.className = 'msg err';
+                msgEl.style.display = 'block';
+              }
+            });
+            iconBlock.appendChild(rmIconBtn);
+            colorTd.appendChild(iconBlock);
+          } else {
+            colorTd.className = 'layout-color-cell layout-color-cell--profile';
+            colorTd.textContent = '—';
+          }
+          tr.appendChild(colorTd);
           var actTd = document.createElement('td');
           actTd.className = 'layout-actions';
           var up = document.createElement('button');
@@ -17616,13 +18531,21 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
       }
 
       document.getElementById('add-folder-btn').addEventListener('click', function() {
-        layout.push({ kind: 'group', id: 'group-' + Date.now().toString(36), label: 'New folder' });
+        var label = 'New folder';
+        layout.push({
+          kind: 'group',
+          id: 'group-' + Date.now().toString(36),
+          label: label,
+          color: hashColorFromName(label)
+        });
         render();
       });
 
       document.getElementById('add-profile-btn').addEventListener('click', function() {
         var id = addSelect.value;
         if (!id) return;
+        var p = profileById[id];
+        var name = p ? (p.name || p._id) : id;
         layout.push({ kind: 'profile', profileId: id });
         render();
       });
@@ -17675,6 +18598,13 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
   const appThemeVars = getAppThemeVars(appTheme);
   const name = escapeHtml(doc.name || "");
   const description = escapeHtml(doc.description || "");
+  const hasStartIcon = profileHasStartIcon(doc);
+  const startIconPreviewUrl = hasStartIcon
+    ? `/api/profiles/${encodeURIComponent(doc._id)}/start-icon?t=${encodeURIComponent(doc._rev || "")}`
+    : "";
+  const startIconColorVal = escapeHtml(
+    normalizeLayoutItemColor(doc.startIconColor) || hashColorFromName(doc.name || doc._id)
+  );
   const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
   const fieldDefaultSources = Array.isArray(doc.fieldDefaultSources) ? doc.fieldDefaultSources : [];
   const initialDefaultSources = fieldNames.map((_, i) => (fieldDefaultSources[i] !== undefined && DEFAULT_VALUE_SOURCES.includes(fieldDefaultSources[i]) ? fieldDefaultSources[i] : ""));
@@ -17849,6 +18779,11 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
     .btn-remove { background: transparent; color: #f85149; padding: 0.25rem 0.5rem; }
     .btn-remove:hover { color: #ff7b72; }
     .field-row .btn-remove { font-size: 1.15rem; line-height: 1; min-width: 2rem; padding: 0.2rem 0.4rem; }
+    .profile-start-icon-block { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 1rem 1.25rem; margin: 0.5rem 0 0.25rem; }
+    .profile-start-icon-colours { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+    .profile-start-icon-colours input[type="color"] { width: 2.5rem; height: 2.5rem; padding: 0; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; cursor: pointer; background: transparent; }
+    .profile-start-icon-hex { width: 5.5rem; padding: 0.35rem 0.45rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; color: var(--app-text, #e6edf3); font: inherit; font-size: 0.9rem; }
+    .profile-start-icon-media { display: flex; flex-direction: column; align-items: flex-start; gap: 0.35rem; }
     .flow-config-table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
     .flow-config-table th, .flow-config-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
     .flow-config-table th { color: var(--app-table-header-text, #8b949e); font-weight: 600; font-size: 0.875rem; }
@@ -17940,6 +18875,22 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
     <input type="text" id="name" name="name" required placeholder="Profile name" value="${name}">
     <label for="description">Description</label>
     <textarea id="description" name="description" placeholder="Optional description">${description}</textarea>
+    <label style="margin-top:1rem;">Start page icon</label>
+    <p class="sub" style="margin-top:0.25rem;">Round icon on the home page. Colour fills the circle or becomes a 1&nbsp;mm border when an image is set. Defaults from the profile name (hash).</p>
+    <div class="profile-start-icon-block">
+      <div class="profile-start-icon-colours">
+        <input type="color" id="start-icon-color" value="${startIconColorVal}" aria-label="Start page icon colour" title="Icon colour">
+        <input type="text" id="start-icon-color-hex" class="profile-start-icon-hex" value="${startIconColorVal}" maxlength="7" title="Hex colour">
+      </div>
+      <div class="profile-start-icon-media">
+        <div id="start-icon-preview-wrap" style="${hasStartIcon ? "" : "display:none;"}">
+          <img id="start-icon-preview" src="${escapeHtml(startIconPreviewUrl)}" alt="" style="width:4rem;height:4rem;border-radius:50%;object-fit:cover;border:1mm solid ${startIconColorVal};">
+        </div>
+        <input type="file" id="start-icon-file" accept="image/jpeg,image/png,image/webp,image/gif">
+        <button type="button" class="btn btn-secondary" id="start-icon-remove" style="${hasStartIcon ? "" : "display:none;"}">Remove icon</button>
+      </div>
+    </div>
+    <span id="start-icon-msg" class="sub"></span>
     <label class="field-list-label">Field names</label>
     <p class="sub" style="margin-top:0.25rem;"><strong>Type</strong> is stored on the profile: <em>Text</em> values live in the entry document; <em>File</em> stores the filename on the entry and the bytes as a CouchDB attachment (images, PDF, or plain text for now—same size limit as entry images). Optional default value is used when creating a new entry. <strong>Display</strong> sets desktop list column width: <em>Auto</em> shares leftover space; <em>Hide</em> hides the column on desktop (still visible on mobile if selected in the mobile list below); percentage widths are scaled so they sum to 100% together.</p>
     <div class="field-list" id="field-list">
@@ -18078,6 +19029,79 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
     const form = document.getElementById('edit-form');
     const msgEl = document.getElementById('msg');
     const profileId = ${JSON.stringify(doc._id)};
+    (function() {
+      var fileIn = document.getElementById('start-icon-file');
+      var previewWrap = document.getElementById('start-icon-preview-wrap');
+      var previewImg = document.getElementById('start-icon-preview');
+      var removeBtn = document.getElementById('start-icon-remove');
+      var iconMsg = document.getElementById('start-icon-msg');
+      var iconColor = document.getElementById('start-icon-color');
+      var iconColorHex = document.getElementById('start-icon-color-hex');
+      function normIconHex(val) {
+        var m = (val || '').trim().match(/^#?([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$/);
+        if (!m) return null;
+        var s = m[1];
+        if (s.length === 3) s = s[0] + s[0] + s[1] + s[1] + s[2] + s[2];
+        return '#' + s.toLowerCase();
+      }
+      function syncPreviewBorder() {
+        if (!previewImg || !iconColorHex) return;
+        var c = normIconHex(iconColorHex.value) || iconColorHex.value;
+        if (c) previewImg.style.borderColor = c;
+      }
+      if (iconColor && iconColorHex) {
+        iconColor.addEventListener('input', function() {
+          iconColorHex.value = iconColor.value;
+          syncPreviewBorder();
+        });
+        iconColorHex.addEventListener('change', function() {
+          var v = normIconHex(iconColorHex.value);
+          if (v) { iconColorHex.value = v; iconColor.value = v; syncPreviewBorder(); }
+        });
+      }
+      function setIconMsg(text, isErr) {
+        if (!iconMsg) return;
+        iconMsg.textContent = text || '';
+        iconMsg.style.color = isErr ? '#f85149' : '#3fb950';
+      }
+      if (fileIn) {
+        fileIn.addEventListener('change', async function() {
+          var f = fileIn.files && fileIn.files[0];
+          if (!f) return;
+          setIconMsg('Uploading…', false);
+          var fd = new FormData();
+          fd.append('file', f);
+          try {
+            var r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/start-icon', { method: 'POST', body: fd });
+            var data = await r.json();
+            if (!r.ok) throw new Error(data.error || 'Upload failed');
+            if (previewImg) previewImg.src = '/api/profiles/' + encodeURIComponent(profileId) + '/start-icon?t=' + Date.now();
+            if (previewWrap) previewWrap.style.display = '';
+            if (removeBtn) removeBtn.style.display = '';
+            setIconMsg('Icon saved.', false);
+          } catch (e) {
+            setIconMsg(e.message || 'Upload failed', true);
+          }
+          fileIn.value = '';
+        });
+      }
+      if (removeBtn) {
+        removeBtn.addEventListener('click', async function() {
+          if (!confirm('Remove start page icon?')) return;
+          setIconMsg('', false);
+          try {
+            var r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/start-icon', { method: 'DELETE' });
+            var data = await r.json();
+            if (!r.ok) throw new Error(data.error || 'Remove failed');
+            if (previewWrap) previewWrap.style.display = 'none';
+            removeBtn.style.display = 'none';
+            setIconMsg('Icon removed.', false);
+          } catch (e) {
+            setIconMsg(e.message || 'Remove failed', true);
+          }
+        });
+      }
+    })();
     const deleteBtn = document.getElementById('delete-profile-btn');
     if (deleteBtn) {
       deleteBtn.onclick = async () => {
@@ -18386,6 +19410,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
             _rev,
             name,
             description,
+            startIconColor: (document.getElementById('start-icon-color-hex') && document.getElementById('start-icon-color-hex').value.trim()) || '',
             customCss,
             fieldNames,
             fieldKinds,

@@ -565,6 +565,55 @@ async function fetchWithElenkoAuth(finalUrl, method, bodyPayload, authType, apiK
   return fetch(finalUrl, { method, headers: Object.assign({}, baseHeaders), body: bodyPayload });
 }
 
+/** Resolve final URL and body for an API call (same rules as the worker request handler). */
+function buildApiRequestTarget(apiDoc, dataset) {
+  const url = apiDoc && apiDoc.url ? String(apiDoc.url).trim() : "";
+  const method = apiDoc && apiDoc.method ? String(apiDoc.method).toUpperCase() : "GET";
+  const template = apiDoc && typeof apiDoc.template === "string" ? apiDoc.template.trim() : "";
+  const appendEntryFieldsToGet =
+    typeof apiDoc.getQueryFromEntry === "boolean" ? apiDoc.getQueryFromEntry : true;
+
+  if (!url && !template) {
+    return { finalUrl: "", method, bodyPayload: undefined, error: "Missing URL and Template in API doc" };
+  }
+
+  let finalUrl;
+  let bodyPayload = undefined;
+  if (template) {
+    const substituted = applyTemplate(template, dataset, { forUrl: method === "GET" });
+    if (method === "GET") {
+      finalUrl = substituted || url;
+    } else {
+      let baseUrl = url;
+      if (urlHasFieldPlaceholders(baseUrl)) {
+        baseUrl = applyTemplate(baseUrl, dataset, { forUrl: true });
+      }
+      finalUrl = baseUrl;
+      bodyPayload = substituted;
+    }
+  } else {
+    let baseUrl = url;
+    const hadPlaceholders = urlHasFieldPlaceholders(baseUrl);
+    if (hadPlaceholders) {
+      baseUrl = applyTemplate(baseUrl, dataset, { forUrl: true });
+    }
+    finalUrl =
+      method === "GET"
+        ? appendEntryFieldsToGet && !hadPlaceholders
+          ? buildUrlWithQuery(baseUrl, dataset)
+          : baseUrl
+        : baseUrl;
+    if ((method === "POST" || method === "PUT" || method === "PATCH") && dataset && typeof dataset === "object") {
+      bodyPayload = JSON.stringify(dataset);
+    }
+  }
+
+  if (!finalUrl) {
+    return { finalUrl: "", method, bodyPayload, error: "Missing URL in API doc" };
+  }
+  return { finalUrl, method, bodyPayload, error: null };
+}
+
 if (parentPort) parentPort.on("message", (msg) => {
   if (msg.type !== "apiRequest") return;
   const { apiDoc, dataset, entryId, profileId, requestId } = msg;
@@ -585,15 +634,14 @@ if (parentPort) parentPort.on("message", (msg) => {
   const apiPassword = msg.apiPassword != null ? msg.apiPassword : null;
 
   const responseTarget = (apiDoc && (apiDoc.responseTarget === "create" ? "create" : apiDoc.responseTarget === "forward" ? "forward" : "update")) || "update";
-  const url = apiDoc && apiDoc.url ? String(apiDoc.url).trim() : "";
-  const method = (apiDoc && apiDoc.method) ? String(apiDoc.method).toUpperCase() : "GET";
-  const template = apiDoc && typeof apiDoc.template === "string" ? apiDoc.template.trim() : "";
-  const appendEntryFieldsToGet =
-    typeof apiDoc.getQueryFromEntry === "boolean" ? apiDoc.getQueryFromEntry : true;
   const responseField = (apiDoc && typeof apiDoc.responseField === "string") ? apiDoc.responseField.trim() : "";
   const responseStart = (apiDoc && typeof apiDoc.responseStart === "string") ? apiDoc.responseStart : "";
   const responseEnd = (apiDoc && typeof apiDoc.responseEnd === "string") ? apiDoc.responseEnd : "";
-  if (!url && !template) {
+  const built = buildApiRequestTarget(apiDoc, dataset);
+  const finalUrl = built.finalUrl;
+  const method = built.method;
+  const bodyPayload = built.bodyPayload;
+  if (built.error) {
     parentPort.postMessage({
       type: "apiResponse",
       entryId,
@@ -602,48 +650,7 @@ if (parentPort) parentPort.on("message", (msg) => {
       success: false,
       statusCode: null,
       body: null,
-      error: "Missing URL and Template in API doc",
-      responseTarget,
-      responseField,
-      responseStart,
-      responseEnd,
-    });
-    return;
-  }
-  let finalUrl;
-  let bodyPayload = undefined;
-  if (template) {
-    const substituted = applyTemplate(template, dataset, { forUrl: method === "GET" });
-    if (method === "GET") {
-      finalUrl = substituted || url;
-    } else {
-      finalUrl = url;
-      bodyPayload = substituted;
-    }
-  } else {
-    let baseUrl = url;
-    const hadPlaceholders = urlHasFieldPlaceholders(baseUrl);
-    if (hadPlaceholders) {
-      baseUrl = applyTemplate(baseUrl, dataset, { forUrl: true });
-    }
-    finalUrl =
-      method === "GET"
-        ? (appendEntryFieldsToGet && !hadPlaceholders ? buildUrlWithQuery(baseUrl, dataset) : baseUrl)
-        : baseUrl;
-    if ((method === "POST" || method === "PUT" || method === "PATCH") && dataset && typeof dataset === "object") {
-      bodyPayload = JSON.stringify(dataset);
-    }
-  }
-  if (!finalUrl) {
-    parentPort.postMessage({
-      type: "apiResponse",
-      entryId,
-      profileId,
-      requestId,
-      success: false,
-      statusCode: null,
-      body: null,
-      error: "Missing URL in API doc",
+      error: built.error,
       responseTarget,
       responseField,
       responseStart,
@@ -698,10 +705,12 @@ if (parentPort) parentPort.on("message", (msg) => {
 
 module.exports = {
   applyTemplate,
+  buildApiRequestTarget,
   expandRepeatBlocks,
   parseFieldTemplateToken,
   resolveTemplateFieldValue,
   parseRepeatScalarRows,
   dialogRowCount,
   escapeTemplateValue,
+  urlHasFieldPlaceholders,
 };
