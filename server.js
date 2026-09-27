@@ -4650,6 +4650,8 @@ const EXPORTABLE_CONFIG_TYPES = new Set([
   "elenko_query",
   "elenko_timer",
 ]);
+/** Config DB types listed on All documents (includes API key docs; keys are never exported). */
+const ALL_DOCUMENTS_CONFIG_TYPES = [...EXPORTABLE_CONFIG_TYPES, "elenko_api_key"];
 
 function stripForExport(doc, type) {
   if (!doc || typeof doc !== "object") return null;
@@ -5104,6 +5106,21 @@ async function upsertAppConfigFromImport(rawDoc, overwrite) {
   return 1;
 }
 
+/** Export strips api*Ref; on overwrite keep target secrets when import carries no refs. */
+function preserveElenkoApiCredentialRefsOnImport(incoming, existing) {
+  if (!incoming || incoming.type !== "elenko_api" || !existing || existing.type !== "elenko_api") {
+    return incoming;
+  }
+  const out = { ...incoming };
+  for (const field of ["apiKeyRef", "apiUserRef", "apiPasswordRef"]) {
+    const fromImport = out[field] != null ? String(out[field]).trim() : "";
+    const onTarget = existing[field] != null ? String(existing[field]).trim() : "";
+    if (!fromImport && onTarget) out[field] = existing[field];
+    else out[field] = fromImport;
+  }
+  return out;
+}
+
 async function applyConfigImport(data, overwrite) {
   const errors = [];
   let importedDb = 0;
@@ -5147,13 +5164,8 @@ async function applyConfigImport(data, overwrite) {
   for (const doc of docsConfig) {
     if (!doc || typeof doc !== "object" || !EXPORTABLE_CONFIG_TYPES.has(doc.type)) continue;
     const id = doc._id;
-    const toInsert = stripImportDocAttachments(doc);
+    let toInsert = stripImportDocAttachments(doc);
     delete toInsert._rev;
-    if (toInsert.type === "elenko_api") {
-      toInsert.apiKeyRef = toInsert.apiKeyRef || "";
-      toInsert.apiUserRef = toInsert.apiUserRef || "";
-      toInsert.apiPasswordRef = toInsert.apiPasswordRef || "";
-    }
     try {
       if (!configDb) {
         errors.push({ id: id || "(new)", type: doc.type, message: "Config store not available" });
@@ -5168,17 +5180,32 @@ async function applyConfigImport(data, overwrite) {
         try {
           const existing = await configDb.get(id);
           if (existing && overwrite) {
+            if (toInsert.type === "elenko_api") {
+              toInsert = preserveElenkoApiCredentialRefsOnImport(toInsert, existing);
+            }
             toInsert._rev = existing._rev;
             await configDb.insert(toInsert);
             importedConfig++;
           }
         } catch (e) {
           if (e.statusCode === 404) {
+            if (toInsert.type === "elenko_api") {
+              toInsert.apiKeyRef = toInsert.apiKeyRef != null ? String(toInsert.apiKeyRef).trim() : "";
+              toInsert.apiUserRef = toInsert.apiUserRef != null ? String(toInsert.apiUserRef).trim() : "";
+              toInsert.apiPasswordRef =
+                toInsert.apiPasswordRef != null ? String(toInsert.apiPasswordRef).trim() : "";
+            }
             await configDb.insert(toInsert);
             importedConfig++;
           } else throw e;
         }
       } else {
+        if (toInsert.type === "elenko_api") {
+          toInsert.apiKeyRef = toInsert.apiKeyRef != null ? String(toInsert.apiKeyRef).trim() : "";
+          toInsert.apiUserRef = toInsert.apiUserRef != null ? String(toInsert.apiUserRef).trim() : "";
+          toInsert.apiPasswordRef =
+            toInsert.apiPasswordRef != null ? String(toInsert.apiPasswordRef).trim() : "";
+        }
         await configDb.insert(toInsert);
         importedConfig++;
       }
@@ -8406,10 +8433,33 @@ app.get("/documents", requireAdmin, async (req, res) => {
       sort: [{ type: "asc" }, { _id: "asc" }],
       limit: MAX_ENTRIES_PER_PROFILE * 2,
     });
-    const docs = result.docs || [];
+    const mainDocs = (result.docs || []).map((d) => ({ ...d, _elenkoDocStore: "main" }));
+    let configDocs = [];
+    if (configDb) {
+      try {
+        const cfgResult = await configDb.find({
+          selector: { type: { $in: ALL_DOCUMENTS_CONFIG_TYPES } },
+          limit: 5000,
+        });
+        configDocs = (cfgResult.docs || []).map((d) => ({ ...d, _elenkoDocStore: "config" }));
+      } catch (cfgErr) {
+        console.warn("All documents: config DB list failed:", cfgErr.message || cfgErr);
+      }
+    }
+    const docs = mainDocs
+      .concat(configDocs)
+      .sort((a, b) => {
+        const sa = a._elenkoDocStore === "config" ? 1 : 0;
+        const sb = b._elenkoDocStore === "config" ? 1 : 0;
+        if (sa !== sb) return sa - sb;
+        const ta = String(a.type || "");
+        const tb = String(b.type || "");
+        if (ta !== tb) return ta.localeCompare(tb);
+        return String(a._id || "").localeCompare(String(b._id || ""));
+      });
     const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderAllDocumentsPage(docs, appUi));
+    res.send(renderAllDocumentsPage(docs, appUi, ELENKO_CONFIG_DB));
   } catch (err) {
     console.error("Error loading documents:", err);
     res.status(500).send(renderErrorPage(err.message));
@@ -17946,9 +17996,77 @@ function renderDeleteProfilePage(doc) {
 </html>`;
 }
 
-function renderAllDocumentsPage(docs, appUi) {
+function summarizeAllDocumentsRow(d, profileMap) {
+  if (d.type === "elenko_profile") {
+    return escapeHtml(d.name || "—");
+  }
+  if (d.type === "elenko_pending_deletions") {
+    return (
+      (d.profileName ? escapeHtml(d.profileName) + " · " : "") +
+      (Array.isArray(d.entries) ? d.entries.length + " entries" : "batch")
+    );
+  }
+  if (d.type === "elenko_record" && d.profileId) {
+    const profile = profileMap[d.profileId];
+    const profileName = profile ? profile.name || d.profileId : d.profileId;
+    return (
+      escapeHtml(profileName) +
+      ' <span class="profile-id-hint" title="Profile ID on this entry">(ID: ' +
+      escapeHtml(d.profileId) +
+      ")</span>"
+    );
+  }
+  if (d.type === "elenko_entry_form") {
+    return escapeHtml(d.name || "—");
+  }
+  if (d.type === "elenko_api") {
+    const apiId = d._id != null ? String(d._id) : "";
+    const parts = [
+      '<a href="/apis/' + encodeURIComponent(apiId) + '/edit">' + escapeHtml(d.name || "—") + "</a>",
+    ];
+    const kr = typeof d.apiKeyRef === "string" ? d.apiKeyRef.trim() : "";
+    const ur = typeof d.apiUserRef === "string" ? d.apiUserRef.trim() : "";
+    const pr = typeof d.apiPasswordRef === "string" ? d.apiPasswordRef.trim() : "";
+    if (kr) parts.push('apiKeyRef: <code>' + escapeHtml(kr) + "</code>");
+    if (ur) parts.push('apiUserRef: <code>' + escapeHtml(ur) + "</code>");
+    if (pr) parts.push('apiPasswordRef: <code>' + escapeHtml(pr) + "</code>");
+    if (!kr && !ur && !pr) {
+      parts.push(
+        '<span class="profile-id-hint">no credential refs — open edit, set Secret key document ID to the <code>elenko_api_key</code> Document ID (not the token), Save</span>'
+      );
+    }
+    return parts.join(" · ");
+  }
+  if (d.type === "elenko_api_key") {
+    const keyId = d._id != null ? String(d._id) : "";
+    const hasSecret = !!(credentialFromElenkoKeyDoc(d) || "").trim();
+    return (
+      '<a href="/apis/keys/' +
+      encodeURIComponent(keyId) +
+      '/edit">' +
+      escapeHtml(d.name || "—") +
+      "</a>" +
+      ' · <span class="profile-id-hint">' +
+      (hasSecret ? "secret stored" : "no secret — paste token on key edit page") +
+      "</span>"
+    );
+  }
+  if (d.type === "elenko_flow" || d.type === "elenko_js_processing" || d.type === "elenko_query") {
+    return escapeHtml(d.name || "—");
+  }
+  if (d.type === "elenko_timer") {
+    return escapeHtml(d.name || d.label || "—");
+  }
+  if (d.type === "elenko_app_config") {
+    return "Application design / theme";
+  }
+  return d.profileId ? "profile: " + escapeHtml(d.profileId) : "—";
+}
+
+function renderAllDocumentsPage(docs, appUi, configDbName) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
+  const configDbLabel = configDbName != null ? String(configDbName) : "config";
   const profileMap = {};
   for (const d of docs) {
     if (d.type === "elenko_profile") {
@@ -17964,30 +18082,23 @@ function renderAllDocumentsPage(docs, appUi) {
             const id = escapeHtml(d._id);
             const rev = escapeHtml(d._rev || "");
             const type = escapeHtml(d.type || "—");
-            let summary;
-            if (d.type === "elenko_profile") {
-              summary = escapeHtml(d.name || "—");
-            } else if (d.type === "elenko_pending_deletions") {
-              summary = (d.profileName ? escapeHtml(d.profileName) + " · " : "") + (Array.isArray(d.entries) ? d.entries.length + " entries" : "batch");
-            } else if (d.type === "elenko_record" && d.profileId) {
-              const profile = profileMap[d.profileId];
-              const profileName = profile ? (profile.name || d.profileId) : d.profileId;
-              summary = escapeHtml(profileName) + " <span class=\"profile-id-hint\" title=\"Profile ID on this entry\">(ID: " + escapeHtml(d.profileId) + ")</span>";
-            } else if (d.type === "elenko_entry_form") {
-              summary = escapeHtml(d.name || "—");
-            } else {
-              summary = d.profileId ? "profile: " + escapeHtml(d.profileId) : "—";
-            }
+            const isMain = d._elenkoDocStore !== "config";
+            const dbLabel = isMain ? escapeHtml(COUCHDB_DB) : escapeHtml(configDbLabel);
+            const summary = summarizeAllDocumentsRow(d, profileMap);
+            const deleteCell = isMain
+              ? `<input type="checkbox" class="doc-delete-cb" data-id="${id}" data-rev="${rev}" aria-label="Delete">`
+              : "";
             return `
         <tr>
-          <td><input type="checkbox" class="doc-delete-cb" data-id="${id}" data-rev="${rev}" aria-label="Delete"></td>
+          <td>${deleteCell}</td>
+          <td><code>${dbLabel}</code></td>
           <td><code>${id}</code></td>
           <td>${type}</td>
           <td>${summary}</td>
         </tr>`;
           })
           .join("")
-      : `<tr><td colspan="4" class="empty">No application documents in the database.</td></tr>`;
+      : `<tr><td colspan="5" class="empty">No application documents in the database.</td></tr>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -18040,13 +18151,14 @@ function renderAllDocumentsPage(docs, appUi) {
 <body>
   <div class="actions"><a href="/">← Profiles</a></div>
   <h1>All documents</h1>
-  <p class="sub">CouchDB documents created by the application (profiles, entries, pending-deletion batches).</p>
-  <p><label for="doc-summary-search" style="margin-right:0.5rem;">Search Summary:</label><input type="search" id="doc-summary-search" placeholder="Filter by summary…" style="padding:0.5rem 0.75rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);font-size:1rem;min-width:16rem;"></p>
+  <p class="sub">Main database (${escapeHtml(COUCHDB_DB)}): profiles, entries, forms. Config database (${escapeHtml(configDbLabel)}): REST APIs, API keys, flows, timers, and other configuration (config rows cannot be deleted here).</p>
+  <p><label for="doc-summary-search" style="margin-right:0.5rem;">Search:</label><input type="search" id="doc-summary-search" placeholder="Filter by database, ID, type, or summary…" style="padding:0.5rem 0.75rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);font-size:1rem;min-width:16rem;"></p>
   <p><button type="button" class="btn" id="delete-marked-btn">Delete marked entries</button></p>
   <table>
     <thead>
       <tr>
         <th style="width:2.5rem">Delete</th>
+        <th>Database</th>
         <th>Document ID</th>
         <th>Type</th>
         <th>Summary</th>
@@ -18067,8 +18179,14 @@ function renderAllDocumentsPage(docs, appUi) {
         const rows = tbody.querySelectorAll('tr');
         rows.forEach(tr => {
           if (tr.classList.contains('empty')) { tr.style.display = q ? 'none' : ''; return; }
-          const summaryCell = tr.cells[3];
-          const text = summaryCell ? (summaryCell.textContent || '').toLowerCase() : '';
+          const dbCell = tr.cells[1];
+          const idCell = tr.cells[2];
+          const typeCell = tr.cells[3];
+          const summaryCell = tr.cells[4];
+          const text =
+            ((dbCell ? dbCell.textContent : '') + ' ' + (idCell ? idCell.textContent : '') + ' ' +
+              (typeCell ? typeCell.textContent : '') + ' ' + (summaryCell ? summaryCell.textContent : ''))
+              .toLowerCase();
           tr.style.display = !q || text.indexOf(q) !== -1 ? '' : 'none';
         });
       });
