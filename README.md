@@ -100,11 +100,23 @@ If you access any app page without being logged in, an **“Login required”** 
    npm start
    ```
 
-3. Open `http://localhost:3000`.
+3. Open `http://localhost:3000/setup` on first run (CouchDB bootstrap), then `http://localhost:3000`.
+
+### AlmaLinux / RHEL (systemd)
+
+From a clone or copy of this repository:
+
+```shell
+sudo chmod +x install/install-almalinux.sh install/upgrade-almalinux.sh
+sudo ./install/install-almalinux.sh --install-dir "$(pwd)"
+```
+
+See `install/README-almalinux.txt` for options, upgrade, and firewall notes.
 
 Environment variables (optional):
 
 - `PORT` – server port (default `3000`)
 - `COUCHDB_URL` – e.g. `http://admin:admin@localhost:5984`
 - `COUCHDB_DB` – database name (default `elenko`)
+- `ELENKO_CONFIG_DB` – config database (default `elenko_config`)
 

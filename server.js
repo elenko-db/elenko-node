@@ -18142,6 +18142,11 @@ function renderAllDocumentsPage(docs, appUi, configDbName) {
     .btn { display: inline-block; background: #da3633; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; margin-bottom: 1rem; }
     .btn:hover { background: #f85149; }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-doc-search { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }
+    .btn-doc-search:hover { background: #2ea043; }
+    .btn-doc-clear { display: inline-block; background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); padding: 0.5rem 1rem; border-radius: 6px; border: 1px solid var(--app-table-border, #30363d); cursor: pointer; font-size: 0.875rem; }
+    .btn-doc-clear:hover { background: var(--app-table-border, #30363d); }
+    .doc-search-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2f1a; color: #3fb950; }
@@ -18152,7 +18157,12 @@ function renderAllDocumentsPage(docs, appUi, configDbName) {
   <div class="actions"><a href="/">← Profiles</a></div>
   <h1>All documents</h1>
   <p class="sub">Main database (${escapeHtml(COUCHDB_DB)}): profiles, entries, forms. Config database (${escapeHtml(configDbLabel)}): REST APIs, API keys, flows, timers, and other configuration (config rows cannot be deleted here).</p>
-  <p><label for="doc-summary-search" style="margin-right:0.5rem;">Search:</label><input type="search" id="doc-summary-search" placeholder="Filter by database, ID, type, or summary…" style="padding:0.5rem 0.75rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);font-size:1rem;min-width:16rem;"></p>
+  <div class="doc-search-row">
+    <label for="doc-summary-search">Search:</label>
+    <input type="text" id="doc-summary-search" placeholder="Database, ID, type, or summary…" autocomplete="off" style="padding:0.5rem 0.75rem;background:var(--app-table-bg, #161b22);border:1px solid var(--app-table-border, #30363d);border-radius:6px;color:var(--app-text, #e6edf3);font-size:1rem;min-width:16rem;flex:1;max-width:28rem;">
+    <button type="button" class="btn-doc-search" id="doc-search-btn">Search</button>
+    <button type="button" class="btn-doc-clear" id="doc-search-clear-btn">Clear</button>
+  </div>
   <p><button type="button" class="btn" id="delete-marked-btn">Delete marked entries</button></p>
   <table>
     <thead>
@@ -18172,23 +18182,37 @@ function renderAllDocumentsPage(docs, appUi, configDbName) {
     const deleteBtn = document.getElementById('delete-marked-btn');
     const msgEl = document.getElementById('msg');
     const searchInput = document.getElementById('doc-summary-search');
+    const searchBtn = document.getElementById('doc-search-btn');
+    const searchClearBtn = document.getElementById('doc-search-clear-btn');
     const tbody = document.querySelector('table tbody');
-    if (searchInput && tbody) {
-      searchInput.addEventListener('input', () => {
-        const q = (searchInput.value || '').trim().toLowerCase();
-        const rows = tbody.querySelectorAll('tr');
-        rows.forEach(tr => {
-          if (tr.classList.contains('empty')) { tr.style.display = q ? 'none' : ''; return; }
-          const dbCell = tr.cells[1];
-          const idCell = tr.cells[2];
-          const typeCell = tr.cells[3];
-          const summaryCell = tr.cells[4];
-          const text =
-            ((dbCell ? dbCell.textContent : '') + ' ' + (idCell ? idCell.textContent : '') + ' ' +
-              (typeCell ? typeCell.textContent : '') + ' ' + (summaryCell ? summaryCell.textContent : ''))
-              .toLowerCase();
-          tr.style.display = !q || text.indexOf(q) !== -1 ? '' : 'none';
-        });
+    function applyDocSearchFilter() {
+      if (!searchInput || !tbody) return;
+      const q = (searchInput.value || '').trim().toLowerCase();
+      const rows = tbody.querySelectorAll('tr');
+      rows.forEach(tr => {
+        if (tr.classList.contains('empty')) { tr.style.display = q ? 'none' : ''; return; }
+        const dbCell = tr.cells[1];
+        const idCell = tr.cells[2];
+        const typeCell = tr.cells[3];
+        const summaryCell = tr.cells[4];
+        const text =
+          ((dbCell ? dbCell.textContent : '') + ' ' + (idCell ? idCell.textContent : '') + ' ' +
+            (typeCell ? typeCell.textContent : '') + ' ' + (summaryCell ? summaryCell.textContent : ''))
+            .toLowerCase();
+        tr.style.display = !q || text.indexOf(q) !== -1 ? '' : 'none';
+      });
+    }
+    if (searchBtn) searchBtn.addEventListener('click', applyDocSearchFilter);
+    if (searchClearBtn) {
+      searchClearBtn.addEventListener('click', () => {
+        if (searchInput) searchInput.value = '';
+        applyDocSearchFilter();
+        if (searchInput) searchInput.focus();
+      });
+    }
+    if (searchInput) {
+      searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); applyDocSearchFilter(); }
       });
     }
 
