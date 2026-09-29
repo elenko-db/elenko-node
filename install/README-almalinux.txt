@@ -14,8 +14,10 @@ Install from a git clone
   cd /opt
   sudo git clone https://github.com/elenko-db/elenko-node.git elenko
   cd elenko
-  sudo chmod +x install/install-almalinux.sh install/upgrade-almalinux.sh
   sudo ./install/install-almalinux.sh --install-dir /opt/elenko
+
+  Allow your login user to git pull without chmod 770 (log out/in after install):
+  sudo ./install/install-almalinux.sh --install-dir /opt/elenko --deploy-user YOUR_USER
 
 Custom CouchDB URL (password with special characters: use single quotes):
   sudo ./install/install-almalinux.sh \
@@ -54,8 +56,12 @@ Upgrade
    - couchdb.bootstrap.json
    - logs/
    - io/
-2. Run:
-     sudo ./install/upgrade-almalinux.sh --install-dir /opt/elenko
+   If the tree is owned by user "elenko", either:
+   - git pull as root: sudo git -C /opt/elenko pull
+   - or install once with --deploy-user YOUR_USER (see above), then git pull as that user
+2. Run (use bash if execute bit missing after git pull on Windows):
+     sudo bash install/upgrade-almalinux.sh --install-dir /opt/elenko
+   Do not chmod 770 manually; the upgrade script runs npm as the service user and fixes ownership.
 
 Configuration
 -------------

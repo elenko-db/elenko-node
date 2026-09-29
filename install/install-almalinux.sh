@@ -20,9 +20,13 @@ COUCHDB_DB="elenko"
 CONFIG_DB="elenko_config"
 SERVICE_USER="elenko"
 SERVICE_NAME="elenko"
+DEPLOY_USER=""
 INSTALL_SYSTEMD=1
 START_SERVICE=1
 NODE_MIN_MAJOR=18
+
+# shellcheck source=almalinux-lib.sh
+source "${SCRIPT_DIR}/almalinux-lib.sh"
 
 usage() {
   sed -n '2,20p' "$0" | tail -n +2
@@ -36,6 +40,7 @@ Options:
   --config-db NAME       ELENKO_CONFIG_DB (default: elenko_config)
   --service-user NAME    systemd User= (default: elenko)
   --service-name NAME    systemd unit name (default: elenko)
+  --deploy-user NAME     Login user allowed to git pull in install dir (group elenko, mode 770)
   --no-systemd           Skip user + unit file (npm install and .env only)
   --no-start             Do not enable/start systemd unit after install
   -h, --help             Show this help
@@ -55,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --config-db) CONFIG_DB="$2"; shift 2 ;;
     --service-user) SERVICE_USER="$2"; shift 2 ;;
     --service-name) SERVICE_NAME="$2"; shift 2 ;;
+    --deploy-user) DEPLOY_USER="$2"; shift 2 ;;
     --no-systemd) INSTALL_SYSTEMD=0; shift ;;
     --no-start) START_SERVICE=0; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -97,6 +103,8 @@ echo ""
 echo "Elenko AlmaLinux install"
 echo "Install directory: ${INSTALL_DIR}"
 echo ""
+
+elenko_chmod_install_scripts "$SCRIPT_DIR"
 
 log_step "Checking Node.js"
 log_ok "Node.js ${NODE_VERSION} at ${NODE_BIN}"
@@ -154,8 +162,7 @@ if [[ "$INSTALL_SYSTEMD" -eq 1 ]]; then
   else
     log_ok "User ${SERVICE_USER} already exists"
   fi
-  chown -R "${SERVICE_USER}:${SERVICE_USER}" "$INSTALL_DIR"
-  chmod 600 "$ENV_FILE" 2>/dev/null || true
+  elenko_apply_service_tree_permissions "$INSTALL_DIR" "$SERVICE_USER" "$DEPLOY_USER"
   log_ok "Ownership set to ${SERVICE_USER}:${SERVICE_USER}"
 
   log_step "systemd unit ${SERVICE_NAME}.service"
