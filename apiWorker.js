@@ -33,6 +33,12 @@ function resolveRepeatScalarModifier(rows, modifier) {
   const mod = modRaw.toUpperCase();
   if (mod === "FIRST") return list.length > 0 ? String(list[0]) : "";
   if (mod === "LAST") return list.length > 0 ? String(list[list.length - 1]) : "";
+  if (mod === "LASTFILLED" || mod === "LASTNONEMPTY") {
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (String(list[i] || "").trim() !== "") return String(list[i]);
+    }
+    return list.length > 0 ? String(list[list.length - 1]) : "";
+  }
   if (mod === "ALL") {
     return list
       .map((r) => (r != null ? String(r) : ""))
@@ -51,10 +57,11 @@ function resolveRepeatScalarModifier(rows, modifier) {
 function parseFieldTemplateToken(token) {
   const raw = String(token || "").trim();
   if (!raw) return { fieldName: "", modifier: null };
-  const m = raw.match(/^([^(]+)\((FIRST|LAST|ALL|\d+)\)$/i);
+  const m = raw.match(/^([^(]+)\((FIRST|LAST|LASTFILLED|LASTNONEMPTY|ALL|\d+)\)$/i);
   if (m) {
     const modPart = m[2];
-    const modifier = /^\d+$/.test(modPart) ? modPart : modPart.toUpperCase();
+    let modifier = /^\d+$/.test(modPart) ? modPart : modPart.toUpperCase();
+    if (modifier === "LASTNONEMPTY") modifier = "LASTFILLED";
     return { fieldName: m[1].trim(), modifier };
   }
   return { fieldName: raw, modifier: null };
@@ -172,7 +179,7 @@ function resolveTemplateFieldValue(fieldName, modifier, dataset) {
   return v != null ? String(v) : "";
 }
 
-const FIELD_PLACEHOLDER_RE = /#([A-Za-z_][A-Za-z0-9_]*(?:\((?:FIRST|LAST|ALL|\d+)\))?)\#/g;
+const FIELD_PLACEHOLDER_RE = /#([A-Za-z_][A-Za-z0-9_]*(?:\((?:FIRST|LAST|LASTFILLED|LASTNONEMPTY|ALL|\d+)\))?)\#/g;
 
 /** Replace #REPEAT(N)# blocks, then #fieldName# / #fieldName(FIRST|LAST|ALL|n)# placeholders. */
 function applyTemplate(template, dataset, options) {
@@ -189,7 +196,7 @@ function applyTemplate(template, dataset, options) {
 }
 
 function urlHasFieldPlaceholders(url) {
-  return typeof url === "string" && /#[A-Za-z_][A-Za-z0-9_]*(?:\((?:FIRST|LAST|ALL|\d+)\))?\#/.test(url);
+  return typeof url === "string" && /#[A-Za-z_][A-Za-z0-9_]*(?:\((?:FIRST|LAST|LASTFILLED|LASTNONEMPTY|ALL|\d+)\))?\#/.test(url);
 }
 
 function buildUrlWithQuery(baseUrl, dataset) {

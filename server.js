@@ -67,6 +67,11 @@ const MAX_ENTRIES_PER_PROFILE = 500000;
 const PURGE_OLD_MAX_DELETE = 500;
 const FLOW_REFRESH_DEFAULT_TIMEOUT_MS = 15000;
 const FLOW_REFRESH_POLL_INTERVAL_MS = 5000;
+/** Delay between entry flow runs when a timer bulk-runs all profile entries (ms). */
+const TIMER_BULK_RUN_DELAY_MS = Math.max(
+  0,
+  parseInt(process.env.TIMER_BULK_RUN_DELAY_MS || "5000", 10) || 5000
+);
 const PURGE_OLD_MS_PER_DAY = 24 * 60 * 60 * 1000;
 const ENTRIES_PAGE_SIZE = 25;
 const ENTRIES_PAGE_SIZE_MIN = 5;
@@ -588,7 +593,9 @@ function applyPlainValueToProfileField(profileDoc, record, fieldName, incomingVa
   if (!profileDoc || !record || !shouldApplyRepeatScalarCellWrite(profileDoc, record, fieldName, incomingValue)) {
     return incomingValue != null ? String(incomingValue) : "";
   }
-  const rowIndex = resolveCorrespondingRepeatRowIndex(record, profileDoc, fieldName);
+  const draftIdx = getDraftRepeatRowIndex(record);
+  const rowIndex =
+    draftIdx >= 0 ? draftIdx : resolveCorrespondingRepeatRowIndex(record, profileDoc, fieldName);
   const cellValue = incomingValue != null ? String(incomingValue) : "";
   let maxRows = maxRepeatScalarRowCount(record, profileDoc);
   maxRows = Math.max(maxRows, rowIndex + 1);
@@ -836,8 +843,87 @@ function getRepeatGroupLayoutFromForm(formDoc) {
   return null;
 }
 
+function isProfileRepeatScalarFieldKey(profileDoc, record, fieldName) {
+  const fn = fieldName != null ? String(fieldName).trim() : "";
+  if (!fn) return false;
+  if (profileDoc && isProfileRepeatField(profileDoc, fn)) return true;
+  if (profileDoc && record && profileDialogRepeatFieldNames(profileDoc, record).includes(fn)) {
+    return true;
+  }
+  return isProfileRepeatScalarJson(record && record[fn]);
+}
+
+/** Script sandbox input: keep stored fields; add parsed repeat rows on non-enumerable $repeatRows. */
+function enrichScriptInput(profileDoc, dataset) {
+  const input = dataset && typeof dataset === "object" ? { ...dataset } : {};
+  if (!profileDoc) return input;
+  const repeatRows = {};
+  for (const fn of profileDialogRepeatFieldNames(profileDoc, input)) {
+    const parsed = parseProfileRepeatScalarValue(input[fn]);
+    if (parsed.ok) repeatRows[fn] = parsed.rows.slice();
+  }
+  if (Object.keys(repeatRows).length > 0) {
+    Object.defineProperty(input, "$repeatRows", {
+      enumerable: false,
+      configurable: true,
+      writable: false,
+      value: repeatRows,
+    });
+  }
+  return input;
+}
+
+/**
+ * Coerce script output for one field before merging into context.dataset.
+ * Repeat profile fields accept JSON string, { rows: [...] }, or string[]; plain strings merge into the draft/current row.
+ */
+function normalizeScriptOutputFieldValue(profileDoc, dataset, fieldName, value) {
+  const fn = fieldName != null ? String(fieldName).trim() : "";
+  if (!fn || !profileDoc || !isProfileRepeatScalarFieldKey(profileDoc, dataset, fn)) {
+    return value;
+  }
+  if (value == null) return value;
+  const mergeRecord = dataset && typeof dataset === "object" ? dataset : {};
+  if (Array.isArray(value)) {
+    return serializeProfileRepeatScalarValue(value.map((r) => (r != null ? String(r) : "")));
+  }
+  if (typeof value === "object") {
+    const rows = Array.isArray(value.rows) ? value.rows : null;
+    if (rows) {
+      return serializeProfileRepeatScalarValue(rows.map((r) => (r != null ? String(r) : "")));
+    }
+    return value;
+  }
+  const s = String(value);
+  if (isProfileRepeatScalarJson(s)) return s;
+  return applyPlainValueToProfileField(profileDoc, mergeRecord, fn, s);
+}
+
+function normalizeScriptOutputForDataset(profileDoc, dataset, scriptOutput) {
+  if (!scriptOutput || typeof scriptOutput !== "object") return scriptOutput;
+  const out = { ...scriptOutput };
+  if (out.$repeatRows && typeof out.$repeatRows === "object" && !Array.isArray(out.$repeatRows)) {
+    for (const fn of Object.keys(out.$repeatRows)) {
+      const arr = out.$repeatRows[fn];
+      if (Array.isArray(arr)) {
+        out[fn] = serializeProfileRepeatScalarValue(arr.map((r) => (r != null ? String(r) : "")));
+      }
+    }
+    delete out.$repeatRows;
+  }
+  if (!profileDoc) return out;
+  const base = dataset && typeof dataset === "object" ? dataset : {};
+  for (const key of Object.keys(out)) {
+    if (key.startsWith("_")) continue;
+    out[key] = normalizeScriptOutputFieldValue(profileDoc, base, key, out[key]);
+  }
+  return out;
+}
+
+/** Values for a newly appended repeat row (always empty unless _repeatRow is set on the dataset). */
 function buildRepeatRowFromDataset(columns, dataset, profileDoc) {
   const row = {};
+  const record = dataset && typeof dataset === "object" ? dataset : {};
   const explicit = dataset && dataset._repeatRow;
   if (explicit && typeof explicit === "object" && !Array.isArray(explicit)) {
     for (const c of columns) {
@@ -847,8 +933,8 @@ function buildRepeatRowFromDataset(columns, dataset, profileDoc) {
   }
   for (const c of columns) {
     const raw = dataset && dataset[c.key] != null ? String(dataset[c.key]) : "";
-    if (profileDoc && isProfileRepeatField(profileDoc, c.key)) {
-      row[c.key] = shouldMergePlainTextIntoRepeatField(raw) ? raw : "";
+    if (profileDoc && isProfileRepeatScalarFieldKey(profileDoc, record, c.key)) {
+      row[c.key] = "";
     } else if (isProfileRepeatScalarJson(raw)) {
       row[c.key] = "";
     } else {
@@ -1250,7 +1336,7 @@ function formatRepeatGroupHtml(record, o) {
           (row, idx) => {
             const isDraft = idx === draftRowIndex;
             return (
-              `<div class="entry-repeat-stack-block${isDraft ? " entry-repeat-draft-row" : ""}"${isDraft ? ' data-draft-row="1"' : ""}>` +
+              `<div class="entry-repeat-stack-block${isDraft ? " entry-repeat-draft-row" : ""}" data-row-index="${idx}"${isDraft ? ' data-draft-row="1"' : ""}>` +
               `<div class="entry-repeat-stack-head">#${idx + 1}${isDraft ? ' <span class="entry-repeat-draft-badge">Draft</span>' : ""}</div>` +
               columns
                 .map((c) => {
@@ -1275,7 +1361,7 @@ function formatRepeatGroupHtml(record, o) {
       (row, idx) => {
         const isDraft = idx === draftRowIndex;
         return (
-          `<tr${isDraft ? ' class="entry-repeat-draft-row" data-draft-row="1"' : ""}>` +
+          `<tr class="entry-repeat-row${isDraft ? " entry-repeat-draft-row" : ""}" data-row-index="${idx}"${isDraft ? ' data-draft-row="1"' : ""}>` +
           columns
             .map((c) => {
               if (isDraft) {
@@ -1297,12 +1383,12 @@ function buildRepeatCellEditInputHtml(column, cellVal) {
   const escapedVal = escapeHtml(cellVal != null ? String(cellVal) : "");
   const ft = normalizeRepeatSubFieldType(column.fieldType);
   if (ft === "url") {
-    return `<input type="url" class="entry-repeat-cell" data-col-key="${key}" data-col-type="url" value="${escapedVal}">`;
+    return `<input type="url" class="entry-repeat-cell" data-col-key="${key}" data-col-type="url" autocomplete="off" value="${escapedVal}">`;
   }
   if (ft === "markdown") {
-    return `<textarea class="entry-repeat-cell entry-repeat-cell-textarea entry-repeat-cell-markdown" data-col-key="${key}" data-col-type="markdown" rows="6" spellcheck="false">${escapedVal}</textarea>`;
+    return `<textarea class="entry-repeat-cell entry-repeat-cell-textarea entry-repeat-cell-markdown" data-col-key="${key}" data-col-type="markdown" rows="6" spellcheck="false" autocomplete="off">${escapedVal}</textarea>`;
   }
-  return `<textarea class="entry-repeat-cell entry-repeat-cell-textarea" data-col-key="${key}" data-col-type="text" rows="2">${escapedVal}</textarea>`;
+  return `<textarea class="entry-repeat-cell entry-repeat-cell-textarea" data-col-key="${key}" data-col-type="text" rows="2" autocomplete="off">${escapedVal}</textarea>`;
 }
 
 function renderRepeatColumnEditorRowsHtml(columns, fieldName) {
@@ -3001,6 +3087,128 @@ async function resolveFlowDocByRef(flowRef) {
   return flowDoc && flowDoc.type === "elenko_flow" ? flowDoc : null;
 }
 
+/** Entry ids for bulk flow runs (optional list search `q`; empty = all records in profile). */
+async function collectProfileEntryIds(profileId, profileDoc, searchQuery = "") {
+  const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const q = typeof searchQuery === "string" ? searchQuery.trim() : "";
+  const useAccentFolding = isProfileSearchAccentFoldingEnabled(profileDoc);
+  const selector = buildProfileEntrySearchSelector(profileId, fieldNames, q, useAccentFolding);
+  const normalizedSearch = q && useAccentFolding ? normalizeForSearch(q) : "";
+  const findFields =
+    q && useAccentFolding && fieldNames.length
+      ? ["_id", "profileId", "type", ...fieldNames]
+      : ["_id", "profileId", "type"];
+  const entryIds = [];
+  const BATCH = 500;
+  let bookmark;
+  for (;;) {
+    const findOpts = {
+      selector,
+      fields: findFields,
+      limit: BATCH,
+    };
+    if (bookmark) findOpts.bookmark = bookmark;
+    const batch = await db.find(findOpts);
+    let docs = batch.docs || [];
+    if (q && useAccentFolding && normalizedSearch) {
+      docs = docs.filter((d) => entryMatchesSearchQuery(d, fieldNames, normalizedSearch));
+    }
+    for (const d of docs) {
+      if (d && d._id && d.type === "elenko_record" && d.profileId === profileId) {
+        entryIds.push(String(d._id));
+      }
+    }
+    if (!batch.docs || batch.docs.length < BATCH) break;
+    bookmark = batch.bookmark;
+    if (!bookmark) break;
+  }
+  return entryIds;
+}
+
+/**
+ * Run a flow on each entry id sequentially. Per-entry failures are counted separately;
+ * the returned summary is always ok unless the caller treats failed > 0 as partial.
+ */
+async function runFlowOnProfileEntryIds({
+  profileId,
+  profileDoc,
+  flowDoc,
+  entryIds,
+  encAccess,
+  param = "",
+  req = null,
+  delayBetweenMs = 0,
+  skipRefreshSteps = false,
+  maxErrorsReturned = 5,
+}) {
+  const formDoc = await loadDefaultEntryFormForProfile(db, profileDoc);
+  let ran = 0;
+  let failed = 0;
+  const errors = [];
+  for (let i = 0; i < entryIds.length; i++) {
+    const entryId = entryIds[i];
+    if (i > 0 && delayBetweenMs > 0) await delay(delayBetweenMs);
+    try {
+      const record = await db.get(entryId);
+      if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
+        failed++;
+        const errMsg = "Entry not found or wrong profile";
+        if (errors.length < maxErrorsReturned) errors.push({ entryId, error: errMsg });
+        console.error(`Bulk flow failed for entry ${entryId}: ${errMsg}`);
+        continue;
+      }
+      if (encAccess && encAccess.profileKey) {
+        decryptRecordFieldsInPlace(record, profileDoc, encAccess.profileKey, formDoc);
+      }
+      const context = {
+        profileId,
+        entryId,
+        profileName: profileDoc.name || profileId,
+        dataset: { ...record },
+        param: param != null ? String(param) : "",
+        req,
+        skipRefreshSteps,
+      };
+      await runPipeline(context, flowDoc);
+      ran++;
+    } catch (err) {
+      failed++;
+      const errMsg = err && err.message ? String(err.message) : String(err);
+      if (errors.length < maxErrorsReturned) errors.push({ entryId, error: errMsg });
+      console.error(`Bulk flow failed for entry ${entryId}:`, errMsg);
+    }
+  }
+  if (ran > 0) clearProfileListCache(profileId);
+  return { ran, failed, requested: entryIds.length, errors };
+}
+
+function formatTimerBulkRunResult(summary) {
+  if (!summary || typeof summary !== "object") return "";
+  if (summary.skipped) return String(summary.message || "Skipped: bulk run already in progress");
+  if (summary.error) return String(summary.error);
+  const ran = typeof summary.ran === "number" ? summary.ran : 0;
+  const failed = typeof summary.failed === "number" ? summary.failed : 0;
+  if (summary.requested === 0) return "No entries in database";
+  if (failed === 0) return `${ran} succeeded`;
+  return `${ran} succeeded, ${failed} failed`;
+}
+
+async function persistTimerLastRun(timerId, lastRunIso, lastRunResult) {
+  if (!configDb || !timerId) return;
+  try {
+    const timerDoc = await configDb.get(timerId);
+    if (!timerDoc || timerDoc.type !== "elenko_timer") return;
+    timerDoc.lastRun = lastRunIso;
+    timerDoc.lastRunResult =
+      typeof lastRunResult === "string" ? lastRunResult : formatTimerBulkRunResult(lastRunResult);
+    await configDb.insert(timerDoc);
+  } catch (e) {
+    if (e.statusCode !== 404) console.error("persistTimerLastRun:", e);
+  }
+}
+
+const timerBulkRunLocks = new Set();
+
 function getProfileEntryFormIds(profileDoc) {
   if (!profileDoc || typeof profileDoc !== "object") return [];
   const fromArray = Array.isArray(profileDoc.entryFormIds) ? profileDoc.entryFormIds : [];
@@ -3209,9 +3417,10 @@ async function updateCurrentEntryFromDataset(dbInstance, context) {
   delete patch.createdBy;
   delete patch.updatedBy;
   if (profileDoc) {
+    const mergeRecord = { ...existing, ...dataset };
     for (const key of Object.keys(patch)) {
       if (key.startsWith("_") || key === "type" || key === "profileId" || key === "sortKey" || key === "draftRepeatRowIndex") continue;
-      patch[key] = applyPlainValueToProfileField(profileDoc, existing, key, patch[key]);
+      patch[key] = applyPlainValueToProfileField(profileDoc, mergeRecord, key, patch[key]);
     }
   }
   const updated = { ...existing, ...patch };
@@ -3592,6 +3801,7 @@ async function runPipeline(context, flowDoc) {
       continue;
     }
     if (target === "refresh") {
+      if (context && context.skipRefreshSteps) continue;
       const param = (step && typeof step.param === "string") ? step.param.trim() : "";
       await runFlowRefreshStep(db, context, i, param);
       continue;
@@ -3625,7 +3835,17 @@ async function runPipeline(context, flowDoc) {
         continue;
       }
       const timeoutMs = Math.min(Math.max(Number(jsDoc.timeout) || 5000, 100), 60000);
-      const input = context.dataset && typeof context.dataset === "object" ? { ...context.dataset } : {};
+      let profileDoc = context.profileDoc;
+      if (!profileDoc && context.profileId && db) {
+        try {
+          const pd = await db.get(context.profileId);
+          if (pd && pd.type === "elenko_profile") {
+            profileDoc = pd;
+            context.profileDoc = pd;
+          }
+        } catch (_) {}
+      }
+      const input = enrichScriptInput(profileDoc, context.dataset);
       const result = await runScriptInFlowWorker(script, input, timeoutMs);
       if (result.error) {
         sendFlowMessage("flow.scriptError", {
@@ -3657,7 +3877,11 @@ async function runPipeline(context, flowDoc) {
         }
       }
       if (result.output && typeof result.output === "object") {
-        const scriptOutput = { ...result.output };
+        const scriptOutput = normalizeScriptOutputForDataset(
+          profileDoc,
+          context.dataset,
+          { ...result.output }
+        );
         const createManyRaw = Array.isArray(scriptOutput._createMany) ? scriptOutput._createMany : null;
         delete scriptOutput._createMany;
         context.dataset = { ...(context.dataset || {}), ...scriptOutput };
@@ -4366,11 +4590,25 @@ const START_PAGE_ICON_SCRIPT = `
       document.addEventListener('keydown', function(e) {
         if (e.key === 'Escape') closeGroupPanel();
       });
+      function clearStoredOpenGroup() {
+        try { sessionStorage.removeItem(storageKey); } catch (_) {}
+      }
+      function consumeFreshLoginLanding() {
+        try {
+          var params = new URLSearchParams(window.location.search);
+          if (params.get('fresh') !== '1') return;
+          clearStoredOpenGroup();
+          params.delete('fresh');
+          var qs = params.toString();
+          history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : '') + window.location.hash);
+        } catch (_) {}
+      }
       function restoreOpenGroupFromStorage() {
         var storedGroup = null;
         try { storedGroup = sessionStorage.getItem(storageKey); } catch (_) {}
         if (storedGroup) openGroupPanel(storedGroup);
       }
+      consumeFreshLoginLanding();
       restoreOpenGroupFromStorage();
       window.addEventListener('pageshow', function(ev) {
         if (ev.persisted) restoreOpenGroupFromStorage();
@@ -4800,14 +5038,40 @@ async function getDocRevForAttachmentWrite(store, docId) {
   return doc && doc._rev ? doc._rev : null;
 }
 
+/** Single elenko_app_config on the server (sorted _id, same rule as config import upsert). */
+async function findCanonicalAppConfigDoc() {
+  if (!configDb) return null;
+  const listRes = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 100 });
+  const list = Array.isArray(listRes.docs) ? listRes.docs.slice() : [];
+  if (list.length === 0) return null;
+  list.sort((a, b) => String(a._id || "").localeCompare(String(b._id || "")));
+  return list[0] || null;
+}
+
+/**
+ * Folder icons attach to elenko_app_config. Import merges app config onto the target canonical
+ * _id, which often differs from the export docId — always store group icons on canonical doc.
+ */
+async function resolveConfigImportAttachmentDocId(exportedDocId, attachmentName) {
+  const exportedId = exportedDocId != null ? String(exportedDocId) : "";
+  const name = attachmentName != null ? String(attachmentName).trim() : "";
+  if (!configDb || !name) return exportedId;
+  if (!/^start-group-[a-zA-Z0-9_.-]+\.(webp|jpe?g|png|gif)$/i.test(name)) return exportedId;
+  const canonical = await findCanonicalAppConfigDoc();
+  return canonical && canonical._id ? String(canonical._id) : exportedId;
+}
+
 async function applyExportAttachments(attachments, errors) {
   if (!Array.isArray(attachments) || attachments.length === 0) return 0;
   let applied = 0;
   for (const att of attachments) {
     if (!att || typeof att !== "object") continue;
     const store = att.store === "configDb" ? configDb : db;
-    const docId = att.docId != null ? String(att.docId) : "";
     const name = att.name != null ? String(att.name) : "";
+    let docId = att.docId != null ? String(att.docId) : "";
+    if (store === configDb) {
+      docId = await resolveConfigImportAttachmentDocId(docId, name);
+    }
     const dataBase64 = att.dataBase64 != null ? String(att.dataBase64) : "";
     if (!store || !docId || !name || !dataBase64) continue;
     try {
@@ -5553,6 +5817,74 @@ function syncTimersFromDbSoon(reason) {
   syncTimersFromDb().catch((e) => console.error("syncTimersFromDb (" + reason + "):", e));
 }
 
+async function runTimerBulkFlowJob(timerId, timerDoc, flowDoc, profileDoc, param, firedAt) {
+  const profileId = profileDoc._id;
+  const lastRunIso = firedAt || new Date().toISOString();
+  try {
+    if (isProfilePersonalEncryptionEnabled(profileDoc)) {
+      const errText =
+        "Timer bulk run is not supported on personally encrypted databases (no key session).";
+      sendFlowMessage("timer.error", { timerId, error: errText, profileId });
+      await persistTimerLastRun(timerId, lastRunIso, errText);
+      return;
+    }
+
+    const entryIds = await collectProfileEntryIds(profileId, profileDoc, "");
+    if (entryIds.length === 0) {
+      await persistTimerLastRun(timerId, lastRunIso, "No entries in database");
+      sendFlowMessage("timer.bulkComplete", {
+        timerId,
+        timerName: timerDoc.name || timerId,
+        ran: 0,
+        failed: 0,
+        requested: 0,
+        errors: [],
+      });
+      return;
+    }
+
+    const encAccess = { ok: true, profileKey: null };
+    const summary = await runFlowOnProfileEntryIds({
+      profileId,
+      profileDoc,
+      flowDoc,
+      entryIds,
+      encAccess,
+      param,
+      req: null,
+      delayBetweenMs: TIMER_BULK_RUN_DELAY_MS,
+      skipRefreshSteps: true,
+      maxErrorsReturned: 100,
+    });
+
+    await persistTimerLastRun(timerId, lastRunIso, summary);
+    sendFlowMessage("timer.bulkComplete", {
+      timerId,
+      timerName: timerDoc.name || timerId,
+      flowId: flowDoc._id,
+      flowName: flowDoc.name || flowDoc._id,
+      profileId,
+      ...summary,
+    });
+    if (summary.failed > 0) {
+      for (const item of summary.errors || []) {
+        sendFlowMessage("timer.bulkEntryError", {
+          timerId,
+          entryId: item.entryId,
+          error: item.error,
+        });
+      }
+    }
+  } catch (e) {
+    console.error("Timer bulk flow job:", e);
+    const errText = e && e.message ? String(e.message) : "Bulk run failed";
+    sendFlowMessage("timer.pipelineError", { timerId, error: errText });
+    await persistTimerLastRun(timerId, lastRunIso, errText);
+  } finally {
+    timerBulkRunLocks.delete(timerId);
+  }
+}
+
 async function handleTimerFireMessage(msg) {
   if (!msg || msg.type !== "timerFire") return;
   const timerId = msg.timerId != null ? String(msg.timerId) : "";
@@ -5600,6 +5932,35 @@ async function handleTimerFireMessage(msg) {
 
   const entryIdRaw = timerDoc.entryId != null ? String(timerDoc.entryId).trim() : "";
   const param = timerDoc.param != null ? String(timerDoc.param).trim() : "";
+  const firedAt = new Date().toISOString();
+
+  if (!entryIdRaw) {
+    sendFlowMessage("timer.fire", {
+      timerId,
+      timerName: timerDoc.name || timerId,
+      flowId: flowDoc._id,
+      flowName: flowDoc.name || flowDoc._id,
+      profileId,
+      entryId: "",
+      param,
+      firedAt,
+      bulkAllEntries: true,
+    });
+    if (timerBulkRunLocks.has(timerId)) {
+      console.warn(`Timer ${timerId}: skipped fire — previous bulk run still in progress`);
+      sendFlowMessage("timer.skipped", {
+        timerId,
+        reason: "Previous bulk run still in progress",
+      });
+      return;
+    }
+    timerBulkRunLocks.add(timerId);
+    runTimerBulkFlowJob(timerId, timerDoc, flowDoc, profileDoc, param, firedAt).catch((e) => {
+      console.error("runTimerBulkFlowJob:", e);
+      timerBulkRunLocks.delete(timerId);
+    });
+    return;
+  }
 
   let record = null;
   if (entryIdRaw) {
@@ -5614,7 +5975,6 @@ async function handleTimerFireMessage(msg) {
     }
   }
 
-  const firedAt = new Date().toISOString();
   sendFlowMessage("timer.fire", {
     timerId,
     timerName: timerDoc.name || timerId,
@@ -5633,17 +5993,20 @@ async function handleTimerFireMessage(msg) {
     dataset: record ? { ...record } : { _timerFiredAt: firedAt },
     param,
     suppressPipelineCreate: false,
-    suppressPipelineEntryWrites: !entryIdRaw,
+    suppressPipelineEntryWrites: false,
   };
 
   try {
     await runPipeline(context, flowDoc);
+    await persistTimerLastRun(timerId, firedAt, "OK (single entry)");
   } catch (pipeErr) {
     console.error("Timer pipeline error:", pipeErr);
+    const errText = pipeErr && pipeErr.message ? String(pipeErr.message) : "Pipeline failed";
     sendFlowMessage("timer.pipelineError", {
       timerId,
-      error: pipeErr && pipeErr.message ? String(pipeErr.message) : "Pipeline failed",
+      error: errText,
     });
+    await persistTimerLastRun(timerId, firedAt, errText);
   }
 }
 
@@ -6890,7 +7253,7 @@ app.post("/login", loginKeyFileParser, async (req, res) => {
       role: req.session.role,
       keyFileUnlocked: !!req.session.keyFileUnlocked,
     });
-    return res.redirect("/");
+    return res.redirect("/?fresh=1");
   } catch (err) {
     console.error("Login error:", err);
     return res
@@ -9420,6 +9783,8 @@ app.get("/api/timers", requireAdmin, async (req, res) => {
         "startTime",
         "intervalKey",
         "active",
+        "lastRun",
+        "lastRunResult",
       ],
       sort: [{ name: "asc" }],
       limit: 500,
@@ -9448,6 +9813,8 @@ app.get("/timers", requireAdmin, async (req, res) => {
         "startTime",
         "intervalKey",
         "active",
+        "lastRun",
+        "lastRunResult",
       ],
       sort: [{ name: "asc" }],
       limit: 500,
@@ -10817,6 +11184,8 @@ app.put("/api/profiles/:id/entries/:entryId", requireEditor, async (req, res) =>
     for (const fn of fieldNames) {
       record[fn] = values[fn] != null ? String(values[fn]).trim() : "";
     }
+    /** Manual edit save replaces repeat rows; do not keep append-flow draft pointer. */
+    delete record.draftRepeatRowIndex;
     if (Object.prototype.hasOwnProperty.call(values, "entryFormId")) {
       const newEntryFormId =
         typeof values.entryFormId === "string" ? values.entryFormId.trim() : "";
@@ -11319,43 +11688,12 @@ app.post("/api/profiles/:id/entries/bulk-run-flow", requireAuth, async (req, res
     if (!flowDoc) {
       return res.status(404).json({ error: "Flow not found: " + flowRef });
     }
-    const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
     const searchQuery = typeof req.body?.q === "string" ? req.body.q.trim() : "";
-    const useAccentFolding = isProfileSearchAccentFoldingEnabled(doc);
     const runAll = req.body?.all === true;
     let entryIds = [];
 
     if (runAll) {
-      const selector = buildProfileEntrySearchSelector(profileId, fieldNames, searchQuery, useAccentFolding);
-      const normalizedSearch =
-        searchQuery && useAccentFolding ? normalizeForSearch(searchQuery) : "";
-      const findFields =
-        searchQuery && useAccentFolding && fieldNames.length
-          ? ["_id", "profileId", "type", ...fieldNames]
-          : ["_id", "profileId", "type"];
-      const BATCH = 500;
-      let bookmark;
-      for (;;) {
-        const findOpts = {
-          selector,
-          fields: findFields,
-          limit: BATCH,
-        };
-        if (bookmark) findOpts.bookmark = bookmark;
-        const batch = await db.find(findOpts);
-        let docs = batch.docs || [];
-        if (searchQuery && useAccentFolding && normalizedSearch) {
-          docs = docs.filter((d) => entryMatchesSearchQuery(d, fieldNames, normalizedSearch));
-        }
-        for (const d of docs) {
-          if (d && d._id && d.type === "elenko_record" && d.profileId === profileId) {
-            entryIds.push(String(d._id));
-          }
-        }
-        if (!batch.docs || batch.docs.length < BATCH) break;
-        bookmark = batch.bookmark;
-        if (!bookmark) break;
-      }
+      entryIds = await collectProfileEntryIds(profileId, doc, searchQuery);
     } else {
       const items = req.body?.items;
       if (!Array.isArray(items) || items.length === 0) {
@@ -11380,39 +11718,19 @@ app.post("/api/profiles/:id/entries/bulk-run-flow", requireAuth, async (req, res
       return res.status(400).json({ error: "No entries selected" });
     }
 
-    const formDoc = await loadDefaultEntryFormForProfile(db, doc);
-    let ran = 0;
-    let failed = 0;
-    const errors = [];
-    for (const entryId of entryIds) {
-      try {
-        const record = await db.get(entryId);
-        if (!record || record.type !== "elenko_record" || record.profileId !== profileId) {
-          failed++;
-          continue;
-        }
-        if (encAccess.profileKey) {
-          decryptRecordFieldsInPlace(record, doc, encAccess.profileKey, formDoc);
-        }
-        const context = {
-          profileId,
-          entryId,
-          profileName: doc.name || profileId,
-          dataset: { ...record },
-          param: "",
-          req,
-        };
-        await runPipeline(context, flowDoc);
-        ran++;
-      } catch (err) {
-        failed++;
-        if (errors.length < 5) {
-          errors.push({ entryId, error: err && err.message ? String(err.message) : String(err) });
-        }
-      }
-    }
-    if (ran > 0) clearProfileListCache(profileId);
-    res.json({ ok: true, ran, failed, requested: entryIds.length, errors });
+    const { ran, failed, requested, errors } = await runFlowOnProfileEntryIds({
+      profileId,
+      profileDoc: doc,
+      flowDoc,
+      entryIds,
+      encAccess,
+      param: "",
+      req,
+      delayBetweenMs: 0,
+      skipRefreshSteps: true,
+      maxErrorsReturned: 5,
+    });
+    res.json({ ok: true, ran, failed, requested, errors });
   } catch (err) {
     console.error("Error bulk-running flow on entries:", err);
     res.status(500).json({ error: err.message || "Bulk flow run failed" });
@@ -12589,7 +12907,19 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
     body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 1.25rem; background: var(--entry-bg, #0f1419); color: var(--entry-text, #e6edf3); max-width: 48rem; }
     h1 { font-weight: 600; margin: 0; font-size: 1.25rem; line-height: 1.2; }
     .sub { color: var(--entry-label, #8b949e); margin: 0; }
-    .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 0.75rem; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 200;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
+      margin: -1rem -1.25rem 0.75rem;
+      padding: calc(1rem + env(safe-area-inset-top, 0px)) 1.25rem 0.65rem;
+      background: var(--entry-bg, #0f1419);
+      box-shadow: 0 1px 0 var(--entry-field-border, #21262d), 0 6px 16px rgba(0, 0, 0, 0.22);
+    }
     .topbar-main { min-width: 0; flex: 1 1 auto; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
     .topbar-links { margin: 0; display: inline-flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; }
     .topbar-links a { color: var(--entry-link, #58a6ff); text-decoration: none; }
@@ -12621,35 +12951,85 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
       opacity: 0.65;
     }
     /* Same button look as .entry-nav-pag / pagination; ◀ is widely supported (unlike U+2B9C). */
-    .topbar-links a.topbar-icon-btn {
-      display: inline-block;
+    .topbar-links a.topbar-icon-btn,
+    .topbar-actions a.topbar-icon-btn,
+    .topbar-actions button.topbar-icon-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       padding: 0.5rem 0.75rem;
       border-radius: 6px;
-      font-size: 0.875rem;
+      font-family: inherit;
+      font-size: 1.28rem;
       line-height: 1;
       border: 1px solid var(--entry-field-border, #21262d);
       background: var(--entry-field-bg, #161b22);
       color: var(--entry-link, #58a6ff);
       text-decoration: none;
       box-sizing: border-box;
+      cursor: pointer;
     }
-    .topbar-links a.topbar-icon-btn:hover {
+    .topbar-actions button.topbar-icon-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .topbar-links a.topbar-icon-btn:hover,
+    .topbar-actions a.topbar-icon-btn:hover,
+    .topbar-actions button.topbar-icon-btn:hover:not(:disabled) {
       text-decoration: none;
       background: color-mix(in srgb, var(--entry-field-bg, #161b22) 78%, var(--entry-link, #58a6ff) 22%);
       color: var(--entry-link, #58a6ff);
     }
     @media (max-width: 768px) {
-      .topbar-links a.topbar-icon-btn {
-        display: inline-flex;
+      .topbar {
+        flex-wrap: nowrap;
         align-items: center;
-        justify-content: center;
-        min-width: 2.75rem;
-        min-height: 2.75rem;
-        padding: 0.45rem 0.65rem;
-        margin: -0.45rem 0.25rem -0.45rem -0.5rem;
+        gap: 0.5rem;
+      }
+      .topbar-main {
+        flex: 0 1 auto;
+        width: auto;
+        flex-wrap: nowrap;
+        align-items: center;
+        min-width: 0;
+      }
+      .topbar-links {
+        flex-shrink: 0;
+      }
+      .topbar-actions {
+        flex: 1 1 auto;
+        width: auto;
+        min-width: 0;
+        justify-content: flex-end;
+        flex-wrap: nowrap;
+        gap: 0.35rem;
+      }
+      .entry-flow-actions .btn-flow {
+        padding: 0.45rem 0.7rem;
+        font-size: 0.8125rem;
+        flex: 0 1 auto;
+        min-width: 0;
+        max-width: 10rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .topbar-links a.topbar-icon-btn,
+      .topbar-actions a.topbar-icon-btn,
+      .topbar-actions button.topbar-icon-btn {
+        font-size: 1.08rem;
+        min-width: 2.5rem;
+        min-height: 2.5rem;
+        padding: 0.35rem 0.5rem;
+      }
+      .topbar-links a.topbar-icon-btn {
+        margin: 0;
       }
     }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
+    @media (max-width: 768px) {
+      .topbar-titleline { display: none; }
+    }
     .topbar-actions { flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 0.5rem; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 0.75rem 1rem; text-align: left; }
@@ -12790,20 +13170,19 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
 <body>
   <div class="topbar">
     <div class="topbar-main">
-      <div class="topbar-links">${isSplitEmbed ? "" : `<a href="${escapeHtml(backUrl)}" class="topbar-icon-btn" title="Back to database" aria-label="Back to database">◀</a>`}${canEdit ? `<a href="${editUrl}">Edit</a>` : ""}${entryNavHtml}</div>
+      <div class="topbar-links">${isSplitEmbed ? "" : `<a href="${escapeHtml(backUrl)}" class="topbar-icon-btn" title="Back to database" aria-label="Back to database">◀</a>`}${entryNavHtml}</div>
       <div class="topbar-titleline">
         <h1>${title}</h1>
         ${formLabel ? `<span class="sub">Form: ${escapeHtml(formLabel)}</span>` : ""}
       </div>
     </div>
     <div class="topbar-actions entry-flow-actions">
-      ${flowButtonsHtml}
-      <button type="button" id="refresh-entry-btn" class="btn-flow btn-flow-secondary">Refresh</button>
+      ${flowButtonsHtml}${canEdit ? `<a href="${editUrl}" class="topbar-icon-btn" title="Edit entry" aria-label="Edit entry">✎</a>` : ""}<button type="button" id="refresh-entry-btn" class="topbar-icon-btn" title="Refresh entry" aria-label="Refresh entry">↻</button>
     </div>
   </div>
   ${hasFlowButtons ? '<div id="flow-msg" class="flow-msg" style="margin-bottom:0.5rem;"></div>' : ""}
   ${contentHtml}
-  ${hasFlowButtons ? "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; background: #238636; color: #fff; }.btn-flow:hover { background: #2ea043; }.btn-flow:disabled { opacity: 0.6; cursor: not-allowed; }.btn-flow-secondary { background: #21262d; }.btn-flow-secondary:hover { background: #30363d; }.flow-msg { margin-top: 0.5rem; font-size: 0.875rem; }.flow-msg.ok { color: #3fb950; }.flow-msg.err { color: #f85149; }</style>\n  <script>\n    (function() {\n      var msgEl = document.getElementById(\"flow-msg\");\n      document.querySelectorAll(\".entry-flow-actions .btn-flow[data-entry-id]\").forEach(function(btn) {\n        if (btn.id === \"refresh-entry-btn\") return;\n        btn.onclick = function() {\n          var pid = btn.getAttribute(\"data-profile-id\");\n          var eid = btn.getAttribute(\"data-entry-id\");\n          if (!pid || !eid) return;\n          btn.disabled = true;\n          if (msgEl) { msgEl.textContent = \"\"; msgEl.className = \"flow-msg\"; }\n          var body = {};\n          var idx = btn.getAttribute(\"data-flow-index\");\n          if (idx !== null && idx !== \"\") body.flowIndex = parseInt(idx, 10);\n          var draftRow = document.querySelector(\".entry-repeat-draft-row\");\n          if (draftRow) {\n            var edits = {};\n            draftRow.querySelectorAll(\".entry-repeat-cell\").forEach(function(el) {\n              var k = el.getAttribute(\"data-col-key\");\n              if (k) edits[k] = el.value != null ? el.value : \"\";\n            });\n            if (Object.keys(edits).length) body.draftRepeatEdits = edits;\n          }\n          var url = \"/api/profile/\" + encodeURIComponent(pid) + \"/entry/\" + encodeURIComponent(eid) + \"/send-to-flow\";\n          fetch(url, { method: \"POST\", headers: { \"Content-Type\": \"application/json\" }, body: JSON.stringify(body) })\n            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })\n            .then(function(o) {\n              if (o.ok && o.data && o.data.reloadEntry) {\n                if (msgEl) { msgEl.textContent = \"Updated — refreshing…\"; msgEl.className = \"flow-msg ok\"; }\n                window.location.reload();\n                return;\n              }\n              if (o.ok && msgEl) {\n                msgEl.textContent = (o.data && o.data.refreshTimedOut)\n                  ? \"Flow finished; entry did not update in time (see flow log).\"\n                  : \"Sent to Flow.\";\n                msgEl.className = (o.data && o.data.refreshTimedOut) ? \"flow-msg err\" : \"flow-msg ok\";\n              } else if (msgEl) { msgEl.textContent = o.data.error || \"Failed\"; msgEl.className = \"flow-msg err\"; }\n              btn.disabled = false;\n            })\n            .catch(function(e) { if (msgEl) { msgEl.textContent = e.message || \"Request failed\"; msgEl.className = \"flow-msg err\"; } btn.disabled = false; });\n        };\n      });\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>" : "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; }.btn-flow-secondary { background: #21262d; color: #e6edf3; }.btn-flow-secondary:hover { background: #30363d; }</style>\n  <script>\n    (function() {\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>"}
+  ${hasFlowButtons ? "\n  <style>.btn-flow { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; background: #238636; color: #fff; }.btn-flow:hover { background: #2ea043; }.btn-flow:disabled { opacity: 0.6; cursor: not-allowed; }.btn-flow-secondary { background: #21262d; }.btn-flow-secondary:hover { background: #30363d; }.flow-msg { margin-top: 0.5rem; font-size: 0.875rem; }.flow-msg.ok { color: #3fb950; }.flow-msg.err { color: #f85149; }</style>\n  <script>\n    (function() {\n      var msgEl = document.getElementById(\"flow-msg\");\n      var entryDraftRepeatRowIndex = " + JSON.stringify(getDraftRepeatRowIndex(record)) + ";\n      document.querySelectorAll(\".entry-flow-actions .btn-flow[data-entry-id]\").forEach(function(btn) {\n        if (btn.id === \"refresh-entry-btn\") return;\n        btn.onclick = function() {\n          var pid = btn.getAttribute(\"data-profile-id\");\n          var eid = btn.getAttribute(\"data-entry-id\");\n          if (!pid || !eid) return;\n          btn.disabled = true;\n          if (msgEl) { msgEl.textContent = \"\"; msgEl.className = \"flow-msg\"; }\n          var body = {};\n          var idx = btn.getAttribute(\"data-flow-index\");\n          if (idx !== null && idx !== \"\") body.flowIndex = parseInt(idx, 10);\n          var draftRow = null;\n          if (typeof entryDraftRepeatRowIndex === \"number\" && entryDraftRepeatRowIndex >= 0) {\n            draftRow = document.querySelector('.entry-repeat-stack-block[data-row-index=\"' + entryDraftRepeatRowIndex + '\"]')\n              || document.querySelector('tr.entry-repeat-row[data-row-index=\"' + entryDraftRepeatRowIndex + '\"]');\n          }\n          if (!draftRow) draftRow = document.querySelector(\".entry-repeat-draft-row\");\n          if (draftRow) {\n            var edits = {};\n            draftRow.querySelectorAll(\".entry-repeat-cell\").forEach(function(el) {\n              var k = el.getAttribute(\"data-col-key\");\n              if (k) edits[k] = el.value != null ? el.value : \"\";\n            });\n            if (Object.keys(edits).length) body.draftRepeatEdits = edits;\n          }\n          var url = \"/api/profile/\" + encodeURIComponent(pid) + \"/entry/\" + encodeURIComponent(eid) + \"/send-to-flow\";\n          fetch(url, { method: \"POST\", headers: { \"Content-Type\": \"application/json\" }, body: JSON.stringify(body) })\n            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })\n            .then(function(o) {\n              if (o.ok && o.data && o.data.reloadEntry) {\n                if (msgEl) { msgEl.textContent = \"Updated — refreshing…\"; msgEl.className = \"flow-msg ok\"; }\n                window.location.reload();\n                return;\n              }\n              if (o.ok && msgEl) {\n                msgEl.textContent = (o.data && o.data.refreshTimedOut)\n                  ? \"Flow finished; entry did not update in time (see flow log).\"\n                  : \"Sent to Flow.\";\n                msgEl.className = (o.data && o.data.refreshTimedOut) ? \"flow-msg err\" : \"flow-msg ok\";\n              } else if (msgEl) { msgEl.textContent = o.data.error || \"Failed\"; msgEl.className = \"flow-msg err\"; }\n              btn.disabled = false;\n            })\n            .catch(function(e) { if (msgEl) { msgEl.textContent = e.message || \"Request failed\"; msgEl.className = \"flow-msg err\"; } btn.disabled = false; });\n        };\n      });\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>" : "\n  <script>\n    (function() {\n      var refreshBtn = document.getElementById(\"refresh-entry-btn\");\n      if (refreshBtn) refreshBtn.onclick = function() { window.location.reload(); };\n    })();\n  </script>"}
   <script>
     (function() {
       document.querySelectorAll('.linked-query-load-btn').forEach(function(btn) {
@@ -12838,6 +13217,14 @@ async function renderViewEntryPage(doc, record, role, formDoc, returnQuery) {
             });
         });
       });
+      function scrollToRepeatDraftIfAny() {
+        var draft = document.querySelector('.entry-repeat-draft-row');
+        if (!draft) return;
+        requestAnimationFrame(function() {
+          draft.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        });
+      }
+      scrollToRepeatDraftIfAny();
     })();
   </script>${
     viewHasChartField
@@ -13139,7 +13526,19 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
     body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 1.25rem; background: var(--entry-bg, #0f1419); color: var(--entry-text, #e6edf3); max-width: 48rem; }
     h1 { font-weight: 600; margin: 0; font-size: 1.2rem; line-height: 1.2; }
     .sub { color: var(--entry-label, #8b949e); margin: 0; }
-    .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 0.75rem; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 200;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
+      margin: -1rem -1.25rem 0.75rem;
+      padding: calc(1rem + env(safe-area-inset-top, 0px)) 1.25rem 0.65rem;
+      background: var(--entry-bg, #0f1419);
+      box-shadow: 0 1px 0 var(--entry-field-border, #21262d), 0 6px 16px rgba(0, 0, 0, 0.22);
+    }
     .topbar-main { min-width: 0; flex: 1 1 auto; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
     .topbar-links { display: inline-flex; align-items: baseline; gap: 0.75rem; }
     .topbar-links a { color: var(--entry-link, #58a6ff); text-decoration: none; }
@@ -13171,8 +13570,17 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
         padding: 0.45rem 0.65rem;
         margin: -0.45rem 0.25rem -0.45rem -0.5rem;
       }
+      .topbar-main {
+        flex-wrap: nowrap;
+        align-items: center;
+        min-width: 0;
+        flex: 1 1 auto;
+      }
     }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
+    @media (max-width: 768px) {
+      .topbar-titleline { display: none; }
+    }
     .topbar-actions { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 0.4rem 0.6rem; text-align: left; }
@@ -13370,7 +13778,7 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       <a href="${escapeHtml(cancelHref)}" class="btn btn-secondary" id="edit-cancel-btn"${discardOnCancel ? " data-abandon-draft=\"1\"" : ""}>Cancel</a>
     </div>
   </div>
-  <form id="entry-form">
+  <form id="entry-form" autocomplete="off">
     <input type="hidden" id="rev" value="${rev}">
     ${contentHtml}
   <div id="msg"></div>
@@ -13561,16 +13969,35 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       }
     }
 
-    function repeatCellInputHtml(c, val) {
+    function createRepeatCellElement(c, val) {
       const key = c && c.key ? String(c.key) : '';
-      const safeVal = String(val != null ? val : '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+      const cellVal = val != null ? String(val) : '';
+      let el;
       if (c && c.fieldType === 'url') {
-        return '<input type="url" class="entry-repeat-cell" data-col-key="' + key + '" data-col-type="url" value="' + safeVal + '">';
+        el = document.createElement('input');
+        el.type = 'url';
+      } else {
+        el = document.createElement('textarea');
+        el.rows = c && c.fieldType === 'markdown' ? 6 : 2;
+        if (c && c.fieldType === 'markdown') {
+          el.className = 'entry-repeat-cell entry-repeat-cell-textarea entry-repeat-cell-markdown';
+          el.spellcheck = false;
+        } else {
+          el.className = 'entry-repeat-cell entry-repeat-cell-textarea';
+        }
       }
-      if (c && c.fieldType === 'markdown') {
-        return '<textarea class="entry-repeat-cell entry-repeat-cell-textarea entry-repeat-cell-markdown" data-col-key="' + key + '" data-col-type="markdown" rows="6" spellcheck="false">' + safeVal + '</textarea>';
+      if (el.tagName === 'INPUT') {
+        el.className = 'entry-repeat-cell';
+        el.setAttribute('data-col-type', 'url');
+      } else if (c && c.fieldType === 'markdown') {
+        el.setAttribute('data-col-type', 'markdown');
+      } else {
+        el.setAttribute('data-col-type', 'text');
       }
-      return '<textarea class="entry-repeat-cell entry-repeat-cell-textarea" data-col-key="' + key + '" data-col-type="text" rows="2">' + safeVal + '</textarea>';
+      el.setAttribute('data-col-key', key);
+      el.setAttribute('autocomplete', 'off');
+      el.value = cellVal;
+      return el;
     }
 
     function autoResizeRepeatCell(el) {
@@ -13585,27 +14012,41 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
       const row = rowData && typeof rowData === 'object' ? rowData : {};
       const idx = wrap.querySelectorAll('.entry-repeat-row').length;
       if (mode === 'stack') {
-        const fields = columns.map(function(c) {
-          const key = c && c.key ? String(c.key) : '';
-          const label = c && c.label ? String(c.label) : key;
-          const val = row[key] != null ? String(row[key]) : '';
-          return '<label class="entry-repeat-stack-edit-field"><span class="entry-repeat-col-label">' + label + '</span>' + repeatCellInputHtml(c, val) + '</label>';
-        }).join('');
         const div = document.createElement('div');
         div.className = 'entry-repeat-row entry-repeat-stack-row';
         div.setAttribute('data-row-index', String(idx));
-        div.innerHTML = '<div class="entry-repeat-stack-row-head"><span>#' + (idx + 1) + '</span><button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button></div>' + fields;
+        const head = document.createElement('div');
+        head.className = 'entry-repeat-stack-row-head';
+        head.innerHTML = '<span>#' + (idx + 1) + '</span><button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button>';
+        div.appendChild(head);
+        columns.forEach(function(c) {
+          const key = c && c.key ? String(c.key) : '';
+          const label = c && c.label ? String(c.label) : key;
+          const val = row[key] != null ? String(row[key]) : '';
+          const lab = document.createElement('label');
+          lab.className = 'entry-repeat-stack-edit-field';
+          const span = document.createElement('span');
+          span.className = 'entry-repeat-col-label';
+          span.textContent = label;
+          lab.appendChild(span);
+          lab.appendChild(createRepeatCellElement(c, val));
+          div.appendChild(lab);
+        });
         return div;
       }
-      const tds = columns.map(function(c) {
-        const key = c && c.key ? String(c.key) : '';
-        const val = row[key] != null ? String(row[key]) : '';
-        return '<td>' + repeatCellInputHtml(c, val) + '</td>';
-      }).join('');
       const tr = document.createElement('tr');
       tr.className = 'entry-repeat-row';
       tr.setAttribute('data-row-index', String(idx));
-      tr.innerHTML = tds + '<td><button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button></td>';
+      columns.forEach(function(c) {
+        const key = c && c.key ? String(c.key) : '';
+        const val = row[key] != null ? String(row[key]) : '';
+        const td = document.createElement('td');
+        td.appendChild(createRepeatCellElement(c, val));
+        tr.appendChild(td);
+      });
+      const actionTd = document.createElement('td');
+      actionTd.innerHTML = '<button type="button" class="btn btn-secondary entry-repeat-remove">Remove</button>';
+      tr.appendChild(actionTd);
       return tr;
     }
 
@@ -13626,6 +14067,10 @@ function renderEditEntryPage(doc, record, formDoc, returnQuery, formChoices = []
             }
             bindRepeatRow(wrap, rowEl);
             syncRepeatWrap(wrap);
+            requestAnimationFrame(function() {
+              var scrollTarget = wrap.querySelector('.entry-repeat-actions') || rowEl;
+              scrollTarget.scrollIntoView({ behavior: 'smooth', block: 'end' });
+            });
           });
         }
         syncRepeatWrap(wrap);
@@ -14420,6 +14865,9 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
           if (!confirmLargeSelection(count, actionLabel)) return;
           flowBtns.forEach(function(b) { b.disabled = true; });
           if (deleteBtn) deleteBtn.disabled = true;
+          if (toggleBtn) toggleBtn.disabled = true;
+          if (selectAll) selectAll.disabled = true;
+          rowChecks().forEach(function(cb) { cb.disabled = true; });
           setMsg('Running ' + actionLabel + ' on ' + count + ' entr' + (count === 1 ? 'y' : 'ies') + '…');
           var body = deleteAllInScope
             ? { all: true, q: searchQuery, flowId: flowId }
@@ -14433,6 +14881,9 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             var data = await r.json();
             if (!r.ok) {
               setMsg(data.error || 'Flow run failed', 'err');
+              if (toggleBtn) toggleBtn.disabled = false;
+              if (selectAll) selectAll.disabled = false;
+              rowChecks().forEach(function(cb) { cb.disabled = false; });
               updateActionButtons();
               return;
             }
@@ -14445,6 +14896,9 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
             setTimeout(function() { window.location.reload(); }, failed > 0 ? 1500 : 700);
           } catch (err) {
             setMsg((err && err.message) ? err.message : 'Request failed', 'err');
+            if (toggleBtn) toggleBtn.disabled = false;
+            if (selectAll) selectAll.disabled = false;
+            rowChecks().forEach(function(cb) { cb.disabled = false; });
             updateActionButtons();
           }
         });
@@ -15195,6 +15649,14 @@ function renderTimersListPage(timers, appUi) {
   const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
   const intervalLabel = (key) => TIMER_INTERVAL_LABEL[key] || key || "—";
   const activeLabel = (a) => (a === true || a === "true" ? "Active" : "Inactive");
+  const lastRunLabel = (t) => {
+    const raw = t && t.lastRun != null ? String(t.lastRun).trim() : "";
+    return raw || "—";
+  };
+  const lastResultLabel = (t) => {
+    const raw = t && t.lastRunResult != null ? String(t.lastRunResult).trim() : "";
+    return truncate(raw, 48) || "—";
+  };
   const rows =
     timers.length > 0
       ? timers
@@ -15207,13 +15669,15 @@ function renderTimersListPage(timers, appUi) {
           <td>${escapeHtml([t.startDate, t.startTime].filter(Boolean).join(" ") || "—")}</td>
           <td>${escapeHtml(intervalLabel(t.intervalKey))}</td>
           <td>${escapeHtml(activeLabel(t.active))}</td>
+          <td class="last-run-cell">${escapeHtml(lastRunLabel(t))}</td>
+          <td title="${escapeHtml(t.lastRunResult != null ? String(t.lastRunResult) : "")}">${escapeHtml(lastResultLabel(t))}</td>
           <td class="row-actions"><a href="/timers/${encodeURIComponent(t._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action timer-copy-btn" data-id="${escapeHtml(t._id)}" aria-label="Copy" title="Copy">⧉</button><button type="button" class="delete-btn icon-action delete-timer-btn" data-id="${escapeHtml(t._id)}" data-rev="${escapeHtml(t._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
         </tr>`
           )
           .join("")
       : `
         <tr>
-          <td colspan="7" class="empty">No timers yet. Schedule a flow to run on a repeating interval.</td>
+          <td colspan="9" class="empty">No timers yet. Schedule a flow to run on a repeating interval.</td>
         </tr>`;
 
   return `<!DOCTYPE html>
@@ -15279,14 +15743,15 @@ function renderTimersListPage(timers, appUi) {
     .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .empty { color: var(--app-label, #8b949e); font-style: italic; }
     .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
+    .last-run-cell { font-size: 0.85em; white-space: nowrap; }
   </style>
 </head>
 <body>
   <div class="actions"><a href="/">← Start</a><a href="/timers/create" class="btn">Create timer</a></div>
   <h1>Timers</h1>
-  <p class="sub">Run a flow on a schedule. Start date and time use the server&apos;s local timezone. Toggle off to pause without deleting.</p>
+  <p class="sub">Run a flow on a schedule. Start date and time use the server&apos;s local timezone. Toggle off to pause without deleting. Without an entry ID, the flow bulk-runs on every document in the database (refresh steps are skipped).</p>
   <table>
-    <thead><tr><th>Name</th><th>Flow</th><th>Profile</th><th>Starts</th><th>Repeat</th><th>Status</th><th>Actions</th></tr></thead>
+    <thead><tr><th>Name</th><th>Flow</th><th>Profile</th><th>Starts</th><th>Repeat</th><th>Status</th><th>Last run</th><th>Result</th><th>Actions</th></tr></thead>
     <tbody>${rows}
     </tbody>
   </table>
@@ -15428,6 +15893,14 @@ function renderEditTimerPage(doc, err, appUi, flows, profiles) {
         <span class="slider"></span>
       </label>
     </div>`;
+  const lastRunDisplay =
+    isEdit && doc && doc.lastRun
+      ? `<p class="meta-line"><strong>Last run:</strong> ${escapeHtml(String(doc.lastRun))}${
+          doc.lastRunResult
+            ? ` — <strong>Result:</strong> ${escapeHtml(String(doc.lastRunResult))}`
+            : ""
+        }</p>`
+      : "";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -15469,6 +15942,7 @@ function renderEditTimerPage(doc, err, appUi, flows, profiles) {
     .switch input:checked + .slider { background: #238636; }
     .switch input:checked + .slider:before { transform: translateX(1.2rem); }
     .switch input:focus + .slider { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    .meta-line { font-size: 0.9rem; color: var(--app-label, #8b949e); margin: 0 0 1rem; }
   </style>
 </head>
 <body>
@@ -15478,7 +15952,10 @@ function renderEditTimerPage(doc, err, appUi, flows, profiles) {
     <a href="/timers" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
   </div>
   <h1>${title}</h1>
-  <p class="sub">Optional entry: when set, the flow runs with that document; otherwise a minimal dataset (<code>_timerFiredAt</code>) is used and single-step persistence is suppressed unless the flow saves explicitly.</p>
+  <p class="sub">Optional entry: when set, the flow runs once on that document. When empty, the flow bulk-runs on every entry in the database (refresh steps skipped; ${Math.round(
+    TIMER_BULK_RUN_DELAY_MS / 1000
+  )}s pause between entries). Personally encrypted databases cannot be bulk-run from a timer yet.</p>
+  ${lastRunDisplay}
   ${errHtml}
   <form id="timer-form">
     ${revInput}
@@ -16055,6 +16532,20 @@ var apiJson = input.guardianJson || "";</pre>
 output.normalizedQuery = (input.query || "").trim().toLowerCase();
 output.importCount = 0;</pre>
 
+  <h2>Profile repeat fields (dialog Q&amp;A)</h2>
+  <p>Repeat columns (e.g. PROMPT / RESPONSE) are stored as JSON on the entry. Prefer the parsed helper on <code>input</code> and row arrays on <code>output</code> instead of hand-editing JSON strings.</p>
+  <pre>// Read rows (input.PROMPT is still the raw stored JSON string)
+var prompts = (input.$repeatRows &amp;&amp; input.$repeatRows.PROMPT) || [];
+
+// Write full column (array of strings, one per row)
+output.$repeatRows = { PROMPT: prompts.concat(["next question"]) };
+
+// Or assign one field directly as string array / { rows: [...] }
+output.RESPONSE = { rows: ["answer 1", "answer 2"] };
+
+// Plain string merges into the current draft repeat row (same as a single text field)
+output.lastRun = new Date().toISOString();</pre>
+
   <h2>output._writeLog(object)</h2>
   <p>Write structured log entries to the flow log as <code>flow.scriptLog</code> messages.</p>
   <pre>// Example
@@ -16106,12 +16597,12 @@ function renderApisListPage(apis, appUi) {
           .map(
             (a) => `
         <tr>
-          <td><a href="/apis/${encodeURIComponent(a._id)}/edit">${escapeHtml(a.name || a._id)}</a></td>
-          <td><code class="id-cell">${escapeHtml(a._id || "")}</code></td>
-          <td>${escapeHtml(truncate(a.description || "", 40))}</td>
-          <td>${escapeHtml(a.method || "GET")}</td>
-          <td>${escapeHtml(truncate(a.url || "", 50))}</td>
-          <td class="row-actions"><a href="/apis/${encodeURIComponent(a._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action api-copy-btn" data-id="${escapeHtml(a._id)}" aria-label="Copy" title="Copy">⧉</button><button type="button" class="delete-btn icon-action delete-api-btn" data-id="${escapeHtml(a._id)}" data-rev="${escapeHtml(a._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
+          <td class="col-name"><a href="/apis/${encodeURIComponent(a._id)}/edit">${escapeHtml(a.name || a._id)}</a></td>
+          <td class="col-id"><code class="id-cell">${escapeHtml(a._id || "")}</code></td>
+          <td class="col-desc">${escapeHtml(truncate(a.description || "", 40))}</td>
+          <td class="col-method">${escapeHtml(a.method || "GET")}</td>
+          <td class="col-url"><span class="url-cell" title="${escapeHtml(a.url || "")}">${escapeHtml(truncate(a.url || "", 48))}</span></td>
+          <td class="row-actions col-actions"><a href="/apis/${encodeURIComponent(a._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a><button type="button" class="copy-btn icon-action api-copy-btn" data-id="${escapeHtml(a._id)}" aria-label="Copy" title="Copy">⧉</button><button type="button" class="delete-btn icon-action delete-api-btn" data-id="${escapeHtml(a._id)}" data-rev="${escapeHtml(a._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>
         </tr>`
           )
           .join("")
@@ -16158,48 +16649,58 @@ function renderApisListPage(apis, appUi) {
     .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
     .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
     table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
-    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    table.apis-list-table { table-layout: fixed; width: 100%; }
+    table.apis-list-table .col-name { width: 14%; }
+    table.apis-list-table .col-id { width: 6.75rem; }
+    table.apis-list-table .col-desc { width: 16%; }
+    table.apis-list-table .col-method { width: 4.25rem; }
+    table.apis-list-table .col-actions { width: 7.5rem; }
+    table.apis-list-table .col-url { width: auto; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); vertical-align: top; }
+    table.apis-list-table td.col-url { overflow: hidden; max-width: 0; }
+    table.apis-list-table td.col-actions { overflow: hidden; padding-left: 0.5rem; padding-right: 0.5rem; }
     th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
-    .row-actions { white-space: nowrap; }
-    .row-actions .icon-action {
+    table.apis-list-table .row-actions { white-space: nowrap; width: 7.5rem; max-width: 7.5rem; box-sizing: border-box; }
+    table.apis-list-table .row-actions .icon-action {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-width: 2rem;
+      min-width: 1.85rem;
       min-height: 2rem;
-      margin: 0 0.15rem;
-      padding: 0.2rem 0.35rem;
+      margin: 0 0.05rem;
+      padding: 0.2rem 0.25rem;
       font-size: 1.15rem;
       line-height: 1;
       vertical-align: middle;
       text-decoration: none;
       border-radius: 4px;
     }
-    .row-actions .icon-action:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
-    .edit-link { color: var(--app-link, #58a6ff); }
-    .edit-link:hover { background: rgba(88, 166, 255, 0.12); }
-    .copy-btn {
+    table.apis-list-table .row-actions .icon-action:focus { outline: 2px solid var(--app-link, #58a6ff); outline-offset: 2px; }
+    table.apis-list-table .edit-link { color: var(--app-link, #58a6ff); }
+    table.apis-list-table .edit-link:hover { background: rgba(88, 166, 255, 0.12); }
+    table.apis-list-table .copy-btn {
       border: none;
       background: none;
       color: var(--app-label, #8b949e);
       font: inherit;
       cursor: pointer;
     }
-    .copy-btn:hover { color: var(--app-link, #58a6ff); background: rgba(88, 166, 255, 0.08); }
-    .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .delete-btn {
+    table.apis-list-table .copy-btn:hover { color: var(--app-link, #58a6ff); background: rgba(88, 166, 255, 0.08); }
+    table.apis-list-table .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    table.apis-list-table .delete-btn {
       border: none;
       background: none;
       color: #f85149;
       font: inherit;
       cursor: pointer;
-      padding: 0.2rem 0.35rem;
+      padding: 0.2rem 0.25rem;
     }
-    .delete-btn:hover { color: #ff7b72; background: rgba(248, 81, 73, 0.12); }
-    .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    table.apis-list-table .delete-btn:hover { color: #ff7b72; background: rgba(248, 81, 73, 0.12); }
+    table.apis-list-table .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .empty { color: var(--app-label, #8b949e); font-style: italic; }
-    .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); word-break: break-all; }
+    .id-cell { font-size: 0.78em; color: var(--app-label, #8b949e); word-break: break-all; white-space: normal; display: block; line-height: 1.35; max-width: 6.75rem; }
+    .url-cell { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
     #api-list-msg { margin-top: 0.75rem; font-size: 0.875rem; }
   </style>
 </head>
@@ -16207,8 +16708,9 @@ function renderApisListPage(apis, appUi) {
   <div class="actions"><a href="/">← Start</a><a href="/apis/create" class="btn">Create REST API</a></div>
   <h1>REST APIs</h1>
   <p class="sub">Configure REST API targets for the &quot;Call API&quot; flow. Use the API document ID or name in the entry form flow parameter.</p>
-  <table>
-    <thead><tr><th>Name</th><th>ID</th><th>Description</th><th>Method</th><th>URL</th><th>Actions</th></tr></thead>
+  <table class="apis-list-table">
+    <colgroup><col class="col-name"><col class="col-id"><col class="col-desc"><col class="col-method"><col class="col-url"><col class="col-actions"></colgroup>
+    <thead><tr><th class="col-name">Name</th><th class="col-id">ID</th><th class="col-desc">Description</th><th class="col-method">Method</th><th class="col-url">URL</th><th class="col-actions">Actions</th></tr></thead>
     <tbody>${rows}
     </tbody>
   </table>
@@ -19985,6 +20487,11 @@ function renderLoginPage(errorMessage, appUi) {
     </form>
     ${loginTextBelowHtml ? `<div class="login-markdown">${loginTextBelowHtml}</div>` : ""}
   </div>
+  <script>
+    (function() {
+      try { sessionStorage.removeItem(${JSON.stringify(START_PAGE_OPEN_GROUP_KEY)}); } catch (_) {}
+    })();
+  </script>
 </body>
 </html>`;
 }
