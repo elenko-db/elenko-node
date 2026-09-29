@@ -94,7 +94,13 @@ const entryImageUpload = multer({
 
 /** Start page profile / folder icons (CouchDB attachments). */
 const MAX_START_ICON_BYTES = Number(process.env.MAX_START_ICON_BYTES) || 512 * 1024;
-const START_ICON_MAX_EDGE = Number(process.env.START_ICON_MAX_EDGE) || 512;
+/** Folder tiles on the start page (large square card, photo band + label). */
+const GROUP_START_ICON_MAX_EDGE =
+  Number(process.env.GROUP_START_ICON_MAX_EDGE) ||
+  Number(process.env.START_ICON_MAX_EDGE) ||
+  512;
+/** Round database icons (~3.5rem on desktop; 256px covers 2× Retina). */
+const PROFILE_START_ICON_MAX_EDGE = Number(process.env.PROFILE_START_ICON_MAX_EDGE) || 256;
 const PROFILE_START_ICON_FILENAME = "elenko-start-icon.webp";
 
 const startIconUpload = multer({
@@ -3928,7 +3934,11 @@ async function bufferFromAttachmentGet(result) {
   return Buffer.from(result || []);
 }
 
-async function processStartIconUploadBuffer(fileBuffer, mimeRaw) {
+async function processStartIconUploadBuffer(fileBuffer, mimeRaw, maxEdgePx) {
+  const maxEdge =
+    maxEdgePx != null && Number.isFinite(Number(maxEdgePx)) && Number(maxEdgePx) > 0
+      ? Math.floor(Number(maxEdgePx))
+      : GROUP_START_ICON_MAX_EDGE;
   const mime =
     mimeRaw && String(mimeRaw).split(";")[0]
       ? String(mimeRaw).split(";")[0].trim().toLowerCase()
@@ -3945,7 +3955,7 @@ async function processStartIconUploadBuffer(fileBuffer, mimeRaw) {
   }
   const outBuffer = await sharp(fileBuffer)
     .rotate()
-    .resize(START_ICON_MAX_EDGE, START_ICON_MAX_EDGE, { fit: "inside", withoutEnlargement: true })
+    .resize(maxEdge, maxEdge, { fit: "inside", withoutEnlargement: true })
     .webp({ quality: 85 })
     .toBuffer();
   return { buffer: outBuffer, contentType: "image/webp", filename: PROFILE_START_ICON_FILENAME };
@@ -7237,7 +7247,11 @@ app.post(
       if (!doc || doc.type !== "elenko_profile") {
         return res.status(404).json({ error: "Profile not found" });
       }
-      const processed = await processStartIconUploadBuffer(req.file.buffer, req.file.mimetype);
+      const processed = await processStartIconUploadBuffer(
+        req.file.buffer,
+        req.file.mimetype,
+        PROFILE_START_ICON_MAX_EDGE
+      );
       const oldFn = typeof doc.startIconFile === "string" ? doc.startIconFile.trim() : "";
       if (oldFn && oldFn !== processed.filename && doc._attachments && doc._attachments[oldFn]) {
         await db.attachment.destroy(id, oldFn, { rev: doc._rev });
@@ -7325,7 +7339,11 @@ app.post(
       if (!req.file || !req.file.buffer) {
         return res.status(400).json({ error: "file is required (multipart field name: file)." });
       }
-      const processed = await processStartIconUploadBuffer(req.file.buffer, req.file.mimetype);
+      const processed = await processStartIconUploadBuffer(
+        req.file.buffer,
+        req.file.mimetype,
+        GROUP_START_ICON_MAX_EDGE
+      );
       const iconFile = groupIconAttachmentNameForId(groupId);
       const appFind = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
       let appDoc = appFind.docs && appFind.docs[0];
@@ -18382,7 +18400,7 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
     table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; margin-bottom: 1rem; }
-    th, td { padding: 0.6rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); vertical-align: middle; }
+    th, td { padding: 0.6rem 0.75rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); vertical-align: top; }
     th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
     .layout-folder td { background: rgba(88, 166, 255, 0.06); }
@@ -18391,13 +18409,15 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
     .layout-actions button:hover { color: var(--app-link, #58a6ff); }
     .layout-actions button:disabled { opacity: 0.35; cursor: not-allowed; }
     .layout-label-input { width: 100%; max-width: 20rem; padding: 0.35rem 0.5rem; background: var(--app-bg, #0f1419); border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; color: var(--app-text, #e6edf3); font: inherit; }
-    .layout-color-cell { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+    .layout-color-td { vertical-align: top; }
+    .layout-color-cell { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; width: 100%; }
     .layout-color-cell--folder { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
-    .layout-color-cell--profile { color: var(--app-label, #8b949e); font-size: 0.9rem; }
-    .layout-color-row { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
-    .layout-color-cell input[type="color"] { width: 2.25rem; height: 2rem; padding: 0; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; cursor: pointer; background: transparent; }
-    .layout-color-hex { width: 5.5rem; padding: 0.3rem 0.4rem; background: var(--app-bg, #0f1419); border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; color: var(--app-text, #e6edf3); font: inherit; font-size: 0.85rem; }
-    .layout-folder-icon-block { display: flex; flex-direction: column; align-items: flex-start; gap: 0.35rem; }
+    .layout-color-cell--profile { color: var(--app-label, #8b949e); font-size: 0.9rem; min-height: 2.15rem; line-height: 2.15rem; }
+    .layout-color-row { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; min-height: 2.15rem; }
+    .layout-color-cell input[type="color"] { width: 2.25rem; height: 2.15rem; padding: 0; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; cursor: pointer; background: transparent; flex-shrink: 0; }
+    .layout-color-hex { width: 5.5rem; padding: 0.35rem 0.5rem; background: var(--app-bg, #0f1419); border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; color: var(--app-text, #e6edf3); font: inherit; font-size: inherit; box-sizing: border-box; }
+    .layout-folder-icon-block { display: flex; flex-direction: column; align-items: flex-start; gap: 0.35rem; max-width: 22rem; }
+    .layout-folder-icon-hint { margin: 0; font-size: 0.8rem; line-height: 1.35; color: var(--app-label, #8b949e); }
     .layout-group-icon-preview { width: 3rem; height: 2.25rem; object-fit: cover; border-radius: 6px; border: 1px solid var(--app-table-border, #30363d); }
     .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 1rem; }
     select { padding: 0.4rem 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font: inherit; max-width: 18rem; }
@@ -18546,8 +18566,10 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
           }
           tr.appendChild(nameTd);
           var colorTd = document.createElement('td');
+          colorTd.className = 'layout-color-td';
+          var colorInner = document.createElement('div');
           if (item.kind === 'group') {
-            colorTd.className = 'layout-color-cell layout-color-cell--folder';
+            colorInner.className = 'layout-color-cell layout-color-cell--folder';
             var colorRow = document.createElement('div');
             colorRow.className = 'layout-color-row';
             var colorPick = document.createElement('input');
@@ -18576,7 +18598,7 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
             });
             colorRow.appendChild(colorPick);
             colorRow.appendChild(colorHex);
-            colorTd.appendChild(colorRow);
+            colorInner.appendChild(colorRow);
             var iconBlock = document.createElement('div');
             iconBlock.className = 'layout-folder-icon-block';
             if (item.iconFile) {
@@ -18613,6 +18635,12 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
               }
             });
             iconBlock.appendChild(iconFileIn);
+            var iconHint = document.createElement('p');
+            iconHint.className = 'layout-folder-icon-hint';
+            iconHint.innerHTML = ${JSON.stringify(
+              `Folder icon: landscape image (~6∶5, e.g. 512×425&nbsp;px). JPEG, PNG, WebP, or GIF; max ${Math.round(MAX_START_ICON_BYTES / 1024)}&nbsp;KiB upload.`
+            )};
+            iconBlock.appendChild(iconHint);
             var rmIconBtn = document.createElement('button');
             rmIconBtn.type = 'button';
             rmIconBtn.className = 'btn btn-secondary';
@@ -18638,11 +18666,12 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
               }
             });
             iconBlock.appendChild(rmIconBtn);
-            colorTd.appendChild(iconBlock);
+            colorInner.appendChild(iconBlock);
           } else {
-            colorTd.className = 'layout-color-cell layout-color-cell--profile';
-            colorTd.textContent = '—';
+            colorInner.className = 'layout-color-cell layout-color-cell--profile';
+            colorInner.textContent = '—';
           }
+          colorTd.appendChild(colorInner);
           tr.appendChild(colorTd);
           var actTd = document.createElement('td');
           actTd.className = 'layout-actions';
@@ -19018,7 +19047,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
     <label for="description">Description</label>
     <textarea id="description" name="description" placeholder="Optional description">${description}</textarea>
     <label style="margin-top:1rem;">Start page icon</label>
-    <p class="sub" style="margin-top:0.25rem;">Round icon on the home page. Colour fills the circle or becomes a 1&nbsp;mm border when an image is set. Defaults from the profile name (hash).</p>
+    <p class="sub" style="margin-top:0.25rem;">Round icon on the home page (about 3.5&nbsp;rem on large screens). Colour fills the circle or becomes a 1&nbsp;mm border when an image is set. Square artwork is fine; stored as WebP with long edge ${PROFILE_START_ICON_MAX_EDGE}&nbsp;px (enough for Retina). JPEG, PNG, WebP, or GIF; max ${Math.round(MAX_START_ICON_BYTES / 1024)}&nbsp;KiB upload. Defaults from the profile name (hash).</p>
     <div class="profile-start-icon-block">
       <div class="profile-start-icon-colours">
         <input type="color" id="start-icon-color" value="${startIconColorVal}" aria-label="Start page icon colour" title="Icon colour">
