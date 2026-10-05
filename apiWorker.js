@@ -361,6 +361,68 @@ function sameUrlIgnoringTrailingSlash(a, b) {
   return x === y;
 }
 
+const DEFAULT_HTTP_USER_AGENT = String(
+  process.env.ELENKO_HTTP_USER_AGENT ||
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+).trim();
+
+function buildOutboundFetchHeaders(method, bodyPayload, extra, finalUrl) {
+  const isGetLike = method === "GET" && (bodyPayload == null || bodyPayload === "");
+  const headers = {};
+  if (!isGetLike) {
+    headers["Content-Type"] = "application/json";
+  } else {
+    headers.Accept = "application/rss+xml, application/atom+xml, application/xml, text/xml, */*";
+    if (finalUrl) {
+      try {
+        const u = new URL(finalUrl);
+        headers.Referer = u.origin + "/";
+      } catch (_) {}
+    }
+  }
+  if (DEFAULT_HTTP_USER_AGENT) headers["User-Agent"] = DEFAULT_HTTP_USER_AGENT;
+  return Object.assign(headers, extra || {});
+}
+
+function isCloudflareBotChallengeBody(text) {
+  if (!text || typeof text !== "string") return false;
+  return (
+    /Just a moment/i.test(text) ||
+    /challenges\.cloudflare\.com/i.test(text) ||
+    /cdn-cgi\/challenge-platform/i.test(text) ||
+    /_cf_chl_opt/i.test(text)
+  );
+}
+
+function isFeedHostBotRejection(statusCode, text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (/^Sorry\.?$/i.test(t)) return true;
+  if (t.length <= 64 && /sorry/i.test(t) && (statusCode === 419 || statusCode === 503 || statusCode === 429)) {
+    return true;
+  }
+  return false;
+}
+
+function summarizeHttpError(statusCode, text, statusText) {
+  const raw = text != null && String(text).trim() !== "" ? String(text) : statusText || "";
+  if (isCloudflareBotChallengeBody(raw)) {
+    return (
+      `HTTP ${statusCode}: blocked by Cloudflare bot protection (not RSS data). ` +
+      "The site requires a browser-style client or a different network; try an alternate feed URL or set ELENKO_HTTP_USER_AGENT " +
+      "to match a feed reader that works from your server."
+    );
+  }
+  if (isFeedHostBotRejection(statusCode, raw)) {
+    return (
+      `HTTP ${statusCode}: feed host rejected this server request (anti-bot; body was "${raw.slice(0, 40)}"). ` +
+      "Common from Docker/VPS IPs (e.g. Hacker News returns 419 Sorry). Use a mirror feed URL or set ELENKO_HTTP_USER_AGENT."
+    );
+  }
+  if (raw.length > 500) return raw.slice(0, 500) + "…[truncated]";
+  return raw || `HTTP ${statusCode}`;
+}
+
 /** When the real URL returns 200 without a Digest challenge, ask paths that typically return 401 + WWW-Authenticate on FRITZ!Box. */
 async function probeFritzDigestChallenge(urlObj, plainHeaders, finalUrlNorm) {
   const origin = urlObj.origin;
@@ -399,7 +461,9 @@ async function fetchWithDigestAuth(finalUrl, method, bodyPayload, apiUsername, a
 
   const finalUrlNorm = urlObj.href.split("#")[0];
   const useSlimGet = method === "GET" && (bodyPayload == null || bodyPayload === "");
-  const plainHeaders = useSlimGet ? { Accept: "application/json, */*" } : Object.assign({}, baseHeaders);
+  const plainHeaders = useSlimGet
+    ? buildOutboundFetchHeaders(method, bodyPayload, null, finalUrl)
+    : Object.assign({}, baseHeaders);
   const mergeDigest = (extra) => Object.assign({}, plainHeaders, extra);
   let res = await fetch(finalUrl, { method, headers: plainHeaders, body: bodyPayload });
 
@@ -525,13 +589,13 @@ async function fetchWithFritzSessionAuth(finalUrl, method, bodyPayload, apiUsern
   const authHdr = "AVM-SID " + sid;
   const useSlimGet = method === "GET" && (bodyPayload == null || bodyPayload === "");
   const headers = useSlimGet
-    ? { Accept: "application/json, */*", Authorization: authHdr }
+    ? buildOutboundFetchHeaders(method, bodyPayload, { Authorization: authHdr }, finalUrl)
     : Object.assign({}, baseHeaders, { Authorization: authHdr });
   return fetch(finalUrl, { method, headers, body: bodyPayload });
 }
 
 async function fetchWithElenkoAuth(finalUrl, method, bodyPayload, authType, apiKey, apiUsername, apiPassword) {
-  const baseHeaders = { "Content-Type": "application/json" };
+  const baseHeaders = buildOutboundFetchHeaders(method, bodyPayload, null, finalUrl);
   const merge = (extra) => Object.assign({}, baseHeaders, extra);
 
   if (authType === "bearer" && apiKey && String(apiKey).trim()) {
@@ -681,7 +745,7 @@ if (parentPort) parentPort.on("message", (msg) => {
         success: res.ok,
         statusCode: res.status,
         body,
-        error: res.ok ? null : (text || res.statusText),
+        error: res.ok ? null : summarizeHttpError(res.status, text, res.statusText),
         responseTarget,
         responseField,
         responseStart,

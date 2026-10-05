@@ -395,6 +395,7 @@ const DEFAULT_PROFILE_THEME = {
   text: "#e6edf3",
   label: "#8b949e",
   link: "#58a6ff",
+  linkVisited: "#99caff",
   tableBg: "#161b22",
   tableHeaderBg: "#21262d",
   tableHeaderText: "#8b949e",
@@ -1909,6 +1910,7 @@ function normalizeProfileTheme(theme) {
     text: get("text"),
     label: get("label"),
     link: get("link"),
+    linkVisited: get("linkVisited"),
     tableBg: get("tableBg"),
     tableHeaderBg: get("tableHeaderBg"),
     tableHeaderText: get("tableHeaderText"),
@@ -2534,6 +2536,10 @@ function normalizeFlowSteps(steps) {
           ? "appendRepeat"
           : t === "refresh"
           ? "refresh"
+          : t === "federationPublish"
+          ? "federationPublish"
+          : t === "federationSync"
+          ? "federationSync"
           : "log";
       const param = typeof (s && s.param) === "string" ? s.param.trim() : "";
       const label = typeof (s && s.label) === "string" ? s.label.trim() : "";
@@ -3056,6 +3062,15 @@ function normalizeListFlowConfigItem(item) {
   return { flowId, label, enabled };
 }
 
+/** Database list flow buttons: "select" = show with Select entries mode; "always" = always in top bar. */
+function normalizeListFlowButtonMode(profileDoc) {
+  const raw =
+    profileDoc && typeof profileDoc.listFlowButtonMode === "string"
+      ? profileDoc.listFlowButtonMode.trim().toLowerCase()
+      : "";
+  return raw === "always" ? "always" : "select";
+}
+
 function getProfileListFlowConfigs(profileDoc) {
   const raw = Array.isArray(profileDoc && profileDoc.listFlowConfigs) ? profileDoc.listFlowConfigs : [];
   return raw.map(normalizeListFlowConfigItem).filter(Boolean).filter((c) => c.enabled);
@@ -3388,6 +3403,1146 @@ async function createResponseEntryFromContext(dbInstance, context, parentEntryId
   });
 }
 
+const FEDERATION_SCHEMA_VERSION = 1;
+const FEDERATION_DEFAULT_INTERNAL_FIELDS = {
+  messageId: "fedMessageId",
+  originPeerId: "fedOriginPeerId",
+  originEntryId: "fedOriginEntryId",
+};
+
+function normalizeFederationInternalFieldNames(exchangeDoc) {
+  const raw =
+    exchangeDoc && exchangeDoc.internalFieldNames && typeof exchangeDoc.internalFieldNames === "object"
+      ? exchangeDoc.internalFieldNames
+      : {};
+  return {
+    messageId:
+      typeof raw.messageId === "string" && raw.messageId.trim()
+        ? raw.messageId.trim()
+        : FEDERATION_DEFAULT_INTERNAL_FIELDS.messageId,
+    originPeerId:
+      typeof raw.originPeerId === "string" && raw.originPeerId.trim()
+        ? raw.originPeerId.trim()
+        : FEDERATION_DEFAULT_INTERNAL_FIELDS.originPeerId,
+    originEntryId:
+      typeof raw.originEntryId === "string" && raw.originEntryId.trim()
+        ? raw.originEntryId.trim()
+        : FEDERATION_DEFAULT_INTERNAL_FIELDS.originEntryId,
+  };
+}
+
+function federationAllowInsecureHttp() {
+  return String(process.env.ELENKO_FEDERATION_ALLOW_HTTP || "").trim() === "1";
+}
+
+/** Suggested elenko_api_key _id for a federation peer (must match client slugify on peer form). */
+function federationApiKeyDocIdFromPeerId(peerId) {
+  const pid = peerId != null ? String(peerId).trim() : "";
+  if (!pid) return "";
+  return slugifyForApiKeyId("federation " + pid);
+}
+
+function federationPeerReturnToPath(isEdit, peerDocId) {
+  if (isEdit && peerDocId) return `/federation/peers/${encodeURIComponent(String(peerDocId))}/edit`;
+  return "/federation/peers/create";
+}
+
+const FEDERATION_PEER_EXPORT_FORMAT = "elenko_federation_peer_export";
+const FEDERATION_PEER_EXPORT_VERSION = 1;
+const FEDERATION_PEER_EXPORT_KDF_ITERATIONS = 100000;
+const FEDERATION_PEER_EXPORT_KEY_LEN = 32;
+
+function inferFederationHubPublicBaseUrl(req) {
+  const env = String(process.env.ELENKO_PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+  if (env) return env;
+  if (!req) return "";
+  const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
+  const host = (req.get("x-forwarded-host") || req.get("host") || "").split(",")[0].trim();
+  return host ? `${proto}://${host}` : "";
+}
+
+function federationPeerExportFilename(peerId) {
+  const raw = peerId != null ? String(peerId).trim() : "peer";
+  const slug = raw.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "peer";
+  return `elenko-federation-peer-${slug.slice(0, 80)}.json`;
+}
+
+function federationSecretsEqual(a, b) {
+  const ba = Buffer.from(String(a), "utf8");
+  const bb = Buffer.from(String(b), "utf8");
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+function deriveFederationPeerExportKey(password, saltBuf) {
+  return crypto.pbkdf2Sync(
+    String(password),
+    saltBuf,
+    FEDERATION_PEER_EXPORT_KDF_ITERATIONS,
+    FEDERATION_PEER_EXPORT_KEY_LEN,
+    "sha256"
+  );
+}
+
+function encryptFederationPeerExportPayload(payloadObj, password) {
+  const salt = crypto.randomBytes(16);
+  const key = deriveFederationPeerExportKey(password, salt);
+  const iv = crypto.randomBytes(12);
+  const plain = Buffer.from(JSON.stringify(payloadObj), "utf8");
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const enc = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    salt: salt.toString("base64"),
+    iv: iv.toString("base64"),
+    ciphertext: enc.toString("base64"),
+    tag: tag.toString("base64"),
+  };
+}
+
+function decryptFederationPeerExportPayload(encryptedPart, password) {
+  const salt = Buffer.from(String(encryptedPart.salt || ""), "base64");
+  const iv = Buffer.from(String(encryptedPart.iv || ""), "base64");
+  const ciphertext = Buffer.from(String(encryptedPart.ciphertext || ""), "base64");
+  const tag = Buffer.from(String(encryptedPart.tag || ""), "base64");
+  if (!salt.length || !iv.length || !ciphertext.length || !tag.length) {
+    throw new Error("Invalid encrypted peer export (missing salt, iv, or ciphertext).");
+  }
+  const key = deriveFederationPeerExportKey(password, salt);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  const parsed = JSON.parse(plain.toString("utf8"));
+  if (!parsed || typeof parsed !== "object") throw new Error("Invalid decrypted peer export payload.");
+  return parsed;
+}
+
+async function buildFederationPeerExportFile(peerDoc, options) {
+  if (!peerDoc || peerDoc.type !== "elenko_federation_peer") {
+    throw new Error("Invalid peer document");
+  }
+  const password = options && options.password != null ? String(options.password) : "";
+  if (!password) throw new Error("Federation secret (encryption password) is required.");
+  const cred = await resolveFederationCredentialFromKeyRef(peerDoc.apiKeyRef);
+  if (!cred.ok) throw new Error(cred.error || "API key not configured for this peer.");
+  if (!federationSecretsEqual(password, cred.secret)) {
+    throw new Error(
+      "The password must match the Secret value stored in this peer's API key document (hub and home use the same secret)."
+    );
+  }
+  let hubBaseUrl =
+    options && typeof options.hubBaseUrl === "string" ? options.hubBaseUrl.trim().replace(/\/+$/, "") : "";
+  if (hubBaseUrl) {
+    try {
+      assertFederationHttpsUrl(hubBaseUrl, "hubBaseUrl");
+    } catch (e) {
+      throw new Error(e.message);
+    }
+  }
+  const peerId = typeof peerDoc.peerId === "string" ? peerDoc.peerId.trim() : "";
+  if (!peerId) throw new Error("peerId is required on the peer document.");
+  let profileName = "";
+  if (peerDoc.profileId && db) {
+    try {
+      const pd = await db.get(String(peerDoc.profileId).trim());
+      if (pd && pd.name) profileName = String(pd.name).trim();
+    } catch (_) {}
+  }
+  const apiKeyDocId =
+    (typeof peerDoc.apiKeyRef === "string" && peerDoc.apiKeyRef.trim()) ||
+    federationApiKeyDocIdFromPeerId(peerId);
+  const inner = {
+    kind: "elenko_federation_peer_home_setup",
+    schemaVersion: FEDERATION_PEER_EXPORT_VERSION,
+    peerId,
+    exchangeId: typeof peerDoc.exchangeId === "string" ? peerDoc.exchangeId.trim() : "",
+    name: typeof peerDoc.name === "string" ? peerDoc.name.trim() : peerId,
+    profileId: typeof peerDoc.profileId === "string" ? peerDoc.profileId.trim() : "",
+    profileName,
+    apiKeyDocId,
+    apiKeySecret: cred.secret,
+    hubBaseUrl,
+    exportedAt: new Date().toISOString(),
+  };
+  if (!inner.exchangeId) throw new Error("exchangeId is required on the peer document.");
+  const encrypted = encryptFederationPeerExportPayload(inner, password);
+  return {
+    format: FEDERATION_PEER_EXPORT_FORMAT,
+    version: FEDERATION_PEER_EXPORT_VERSION,
+    peerId,
+    encryption: "aes-256-gcm-pbkdf2-sha256",
+    kdfIterations: FEDERATION_PEER_EXPORT_KDF_ITERATIONS,
+    ...encrypted,
+  };
+}
+
+async function findFederationPeerDocByPeerId(peerId) {
+  if (!configDb || !peerId) return null;
+  const pid = String(peerId).trim();
+  if (!pid) return null;
+  const find = await configDb.find({
+    selector: { type: "elenko_federation_peer", peerId: pid },
+    limit: 1,
+  });
+  return (find.docs && find.docs[0]) || null;
+}
+
+async function resolveProfileIdForFederationPeerImport(payload, overrideProfileId) {
+  const override = overrideProfileId != null ? String(overrideProfileId).trim() : "";
+  if (override && db) {
+    try {
+      const pd = await db.get(override);
+      if (pd && pd.type === "elenko_profile") return pd._id;
+    } catch (e) {
+      if (e.statusCode !== 404) throw e;
+    }
+    throw new Error("Selected Elenko database not found.");
+  }
+  const fromExport = payload && typeof payload.profileId === "string" ? payload.profileId.trim() : "";
+  if (fromExport && db) {
+    try {
+      const pd = await db.get(fromExport);
+      if (pd && pd.type === "elenko_profile") return pd._id;
+    } catch (e) {
+      if (e.statusCode !== 404) throw e;
+    }
+  }
+  const profileName =
+    payload && typeof payload.profileName === "string" ? payload.profileName.trim() : "";
+  if (profileName && db) {
+    const byName = await db.find({
+      selector: { type: "elenko_profile", name: profileName },
+      limit: 2,
+    });
+    const hits = byName.docs || [];
+    if (hits.length === 1) return hits[0]._id;
+    if (hits.length > 1) {
+      throw new Error(
+        `Multiple databases named "${profileName}". Import the exchange profile first, or choose the database on import.`
+      );
+    }
+  }
+  throw new Error(
+    "Could not match a local Elenko database. Import configuration from the hub first, or select the mailbox database when importing the peer file."
+  );
+}
+
+async function applyFederationPeerConfigImport(fileBody, password, overrideProfileId) {
+  if (!configDb || !db) throw new Error("Database not available");
+  const body = fileBody && typeof fileBody === "object" ? fileBody : null;
+  if (!body || body.format !== FEDERATION_PEER_EXPORT_FORMAT) {
+    throw new Error("Invalid file format. Use a peer config exported from the hub (Export peer config).");
+  }
+  if (Number(body.version) !== FEDERATION_PEER_EXPORT_VERSION) {
+    throw new Error(`Unsupported peer export version (expected ${FEDERATION_PEER_EXPORT_VERSION}).`);
+  }
+  const pwd = password != null ? String(password) : "";
+  if (!pwd) throw new Error("Federation secret (file password) is required.");
+  const payload = decryptFederationPeerExportPayload(body, pwd);
+  if (payload.kind !== "elenko_federation_peer_home_setup") {
+    throw new Error("Invalid decrypted peer export payload.");
+  }
+  const peerId = typeof payload.peerId === "string" ? payload.peerId.trim() : "";
+  const exchangeId = typeof payload.exchangeId === "string" ? payload.exchangeId.trim() : "";
+  const hubBaseUrl = typeof payload.hubBaseUrl === "string" ? payload.hubBaseUrl.trim().replace(/\/+$/, "") : "";
+  if (!peerId || !exchangeId) throw new Error("Export file is missing peerId or exchangeId.");
+  if (!hubBaseUrl) {
+    throw new Error("Export file has no hub base URL. Re-export on the hub with Hub public URL filled in.");
+  }
+  try {
+    assertFederationHttpsUrl(hubBaseUrl, "hubBaseUrl");
+  } catch (e) {
+    throw new Error(e.message);
+  }
+  const apiKeySecret =
+    typeof payload.apiKeySecret === "string" && payload.apiKeySecret
+      ? payload.apiKeySecret
+      : pwd;
+  if (!federationSecretsEqual(pwd, apiKeySecret)) {
+    throw new Error("File password does not match the federation secret inside the export.");
+  }
+  const apiKeyDocId =
+    (typeof payload.apiKeyDocId === "string" && payload.apiKeyDocId.trim()) ||
+    federationApiKeyDocIdFromPeerId(peerId);
+  const keyName = `Federation peer ${peerId}`;
+  let keyDoc;
+  try {
+    keyDoc = await configDb.get(apiKeyDocId);
+  } catch (e) {
+    if (e.statusCode !== 404) throw e;
+    keyDoc = null;
+  }
+  if (keyDoc && keyDoc.type !== "elenko_api_key") {
+    throw new Error(`Document "${apiKeyDocId}" exists but is not an API key.`);
+  }
+  if (!keyDoc) {
+    keyDoc = { _id: apiKeyDocId, type: "elenko_api_key", name: keyName, key: apiKeySecret };
+  } else {
+    keyDoc.name = keyName;
+    keyDoc.key = apiKeySecret;
+  }
+  const keySaved = await configDb.insert(keyDoc);
+  const profileId = await resolveProfileIdForFederationPeerImport(payload, overrideProfileId);
+  let peerDoc = await findFederationPeerDocByPeerId(peerId);
+  const peerName =
+    (typeof payload.name === "string" && payload.name.trim()) || peerId;
+  if (!peerDoc) {
+    peerDoc = {
+      type: "elenko_federation_peer",
+      name: peerName,
+      exchangeId,
+      peerId,
+      role: "home",
+      profileId,
+      apiKeyRef: keySaved.id,
+      remoteBaseUrl: hubBaseUrl,
+      enabled: true,
+      outboxCursor: { sentAt: "", seq: 0 },
+    };
+  } else {
+    peerDoc.name = peerName;
+    peerDoc.exchangeId = exchangeId;
+    peerDoc.role = "home";
+    peerDoc.profileId = profileId;
+    peerDoc.apiKeyRef = keySaved.id;
+    peerDoc.remoteBaseUrl = hubBaseUrl;
+    if (peerDoc.enabled === undefined) peerDoc.enabled = true;
+    if (!peerDoc.outboxCursor) peerDoc.outboxCursor = { sentAt: "", seq: 0 };
+  }
+  const peerSaved = await configDb.insert(peerDoc);
+  return {
+    peerId,
+    peerDocId: peerSaved.id,
+    apiKeyDocId: keySaved.id,
+    profileId,
+    hubBaseUrl,
+  };
+}
+
+/** Mandatory profile fields for federation mailboxes (routing + trace). */
+function getFederationProfileFieldNames() {
+  return ["toPeerId", "fromPeerId", "fedMessageId", "fedOriginPeerId", "fedOriginEntryId"];
+}
+
+function normalizeProfileFederation(raw, fieldNames) {
+  const fields = Array.isArray(fieldNames) ? fieldNames : [];
+  const routingDefaults = { toPeerIdField: "toPeerId", fromPeerIdField: "fromPeerId" };
+  if (!raw || typeof raw !== "object") {
+    return {
+      enabled: false,
+      exchangeId: "",
+      peerDocId: "",
+      defaultToPeerId: "",
+      routing: { ...routingDefaults },
+    };
+  }
+  const routingRaw = raw.routing && typeof raw.routing === "object" ? raw.routing : {};
+  let toPeerIdField =
+    typeof routingRaw.toPeerIdField === "string" && routingRaw.toPeerIdField.trim()
+      ? routingRaw.toPeerIdField.trim()
+      : routingDefaults.toPeerIdField;
+  let fromPeerIdField =
+    typeof routingRaw.fromPeerIdField === "string" && routingRaw.fromPeerIdField.trim()
+      ? routingRaw.fromPeerIdField.trim()
+      : routingDefaults.fromPeerIdField;
+  if (!fields.includes(toPeerIdField)) toPeerIdField = routingDefaults.toPeerIdField;
+  if (!fields.includes(fromPeerIdField)) fromPeerIdField = routingDefaults.fromPeerIdField;
+  return {
+    enabled: raw.enabled === true,
+    exchangeId: typeof raw.exchangeId === "string" ? raw.exchangeId.trim() : "",
+    peerDocId: typeof raw.peerDocId === "string" ? raw.peerDocId.trim() : "",
+    defaultToPeerId: typeof raw.defaultToPeerId === "string" ? raw.defaultToPeerId.trim() : "",
+    routing: { toPeerIdField, fromPeerIdField },
+  };
+}
+
+function applyFederationFieldsToProfileDoc(profileDoc) {
+  if (!profileDoc || profileDoc.type !== "elenko_profile") {
+    return { added: [], fieldNames: [] };
+  }
+  const recommended = getFederationProfileFieldNames();
+  const fields = Array.isArray(profileDoc.fieldNames) ? [...profileDoc.fieldNames] : [];
+  const added = [];
+  for (const fn of recommended) {
+    if (!fields.includes(fn)) {
+      fields.push(fn);
+      added.push(fn);
+    }
+  }
+  if (added.length === 0) {
+    return { added, fieldNames: fields };
+  }
+  profileDoc.fieldNames = fields;
+  profileDoc.fieldDefaultSources = normalizeFieldDefaultSources(fields, profileDoc.fieldDefaultSources);
+  profileDoc.fieldDisplay = normalizeFieldDisplay(fields, profileDoc.fieldDisplay);
+  profileDoc.fieldKinds = normalizeFieldKinds(fields, profileDoc.fieldKinds);
+  return { added, fieldNames: fields };
+}
+
+function federationMissingProfileFields(profileDoc) {
+  const fields = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  return getFederationProfileFieldNames().filter((f) => !fields.includes(f));
+}
+
+async function resolveFederationPeerForFlow(profileDoc, param) {
+  if (!configDb) throw new Error("Config store not available");
+  const p = param != null ? String(param).trim() : "";
+  const fed = normalizeProfileFederation(profileDoc && profileDoc.federation, profileDoc && profileDoc.fieldNames);
+  if (!p || p === "@profile") {
+    if (!fed.enabled || !fed.peerDocId) {
+      throw new Error("Profile federation is not configured (enable Federation and choose an outbound peer).");
+    }
+    const peerDoc = await configDb.get(fed.peerDocId);
+    if (!peerDoc || peerDoc.type !== "elenko_federation_peer") {
+      throw new Error("Federation peer document not found for this profile.");
+    }
+    return peerDoc;
+  }
+  try {
+    const peerDoc = await configDb.get(p);
+    if (peerDoc && peerDoc.type === "elenko_federation_peer") return peerDoc;
+  } catch (e) {
+    if (e.statusCode !== 404) throw e;
+  }
+  const byPeerId = await configDb.find({
+    selector: { type: "elenko_federation_peer", peerId: p },
+    limit: 1,
+  });
+  const hit = byPeerId.docs && byPeerId.docs[0];
+  if (hit) return hit;
+  throw new Error("Federation peer not found: " + p);
+}
+
+function resolveFederationRoutingFromContext(context, profileDoc, peerDoc) {
+  const fed = normalizeProfileFederation(profileDoc && profileDoc.federation, profileDoc && profileDoc.fieldNames);
+  const ds = context && context.dataset && typeof context.dataset === "object" ? context.dataset : {};
+  const toField = fed.routing.toPeerIdField || "toPeerId";
+  const fromField = fed.routing.fromPeerIdField || "fromPeerId";
+  let toPeerId = ds[toField] != null ? String(ds[toField]).trim() : "";
+  if (!toPeerId) toPeerId = fed.defaultToPeerId || "";
+  if (!toPeerId && peerDoc && peerDoc.peerId) toPeerId = String(peerDoc.peerId).trim();
+  let fromPeerId = ds[fromField] != null ? String(ds[fromField]).trim() : "";
+  if (!fromPeerId && peerDoc && peerDoc.peerId) fromPeerId = String(peerDoc.peerId).trim();
+  return { toPeerId, fromPeerId, toField, fromField };
+}
+
+async function runFlowFederationPublishStep(dbInstance, context, step, stepIndex) {
+  const profileDoc = context && context.profileDoc;
+  const profileId = context && context.profileId;
+  const entryId = context && context.entryId;
+  if (!profileDoc || !profileId || !entryId) {
+    throw new Error("Federation publish requires a saved entry in flow context.");
+  }
+  const fed = normalizeProfileFederation(profileDoc.federation, profileDoc.fieldNames);
+  if (!fed.enabled) {
+    throw new Error("Federation is not enabled for this profile.");
+  }
+  const param = step && typeof step.param === "string" ? step.param.trim() : "";
+  const peerDoc = await resolveFederationPeerForFlow(profileDoc, param || "@profile");
+  const routing = resolveFederationRoutingFromContext(context, profileDoc, peerDoc);
+  if (!routing.toPeerId) {
+    throw new Error("toPeerId is empty (set on the entry or as profile default).");
+  }
+  const result = await federationPublishEntryFromRecord(peerDoc, entryId, {
+    toPeerId: routing.toPeerId,
+    fromPeerId: routing.fromPeerId,
+  });
+  sendFlowMessage("flow.federationPublish", {
+    stepIndex,
+    profileId,
+    entryId,
+    messageId: result.messageId,
+    toPeerId: routing.toPeerId,
+    fromPeerId: routing.fromPeerId,
+    peerId: peerDoc.peerId,
+  });
+  if (context.dataset && typeof context.dataset === "object") {
+    context.dataset._lastFederationMessageId = result.messageId;
+  }
+  return result;
+}
+
+async function runFlowFederationSyncStep(context, step, stepIndex) {
+  let profileDoc = context && context.profileDoc;
+  const profileId = context && context.profileId;
+  if (!profileDoc && profileId && db) {
+    try {
+      const pd = await db.get(profileId);
+      if (pd && pd.type === "elenko_profile") profileDoc = pd;
+    } catch (_) {}
+  }
+  if (!profileDoc) throw new Error("Missing profile for federation sync.");
+  const param = step && typeof step.param === "string" ? step.param.trim() : "";
+  const peerDoc = await resolveFederationPeerForFlow(profileDoc, param || "@profile");
+  const result = await federationPollAndImportForPeer(peerDoc);
+  sendFlowMessage("flow.federationSync", {
+    stepIndex,
+    profileId: profileDoc._id,
+    peerId: peerDoc.peerId,
+    imported: result.imported,
+    skipped: result.skipped,
+    messages: result.messages,
+  });
+  if (context && context.dataset && typeof context.dataset === "object") {
+    context.dataset._lastFederationImported = result.imported;
+    context.dataset._lastFederationSkipped = result.skipped;
+  }
+  return result;
+}
+
+function assertFederationHttpsUrl(urlStr, label) {
+  const u = urlStr != null ? String(urlStr).trim() : "";
+  if (!u) throw new Error(`${label || "URL"} is required`);
+  let parsed;
+  try {
+    parsed = new URL(u);
+  } catch (_) {
+    throw new Error(`${label || "URL"} is not valid`);
+  }
+  if (parsed.protocol !== "https:" && !(federationAllowInsecureHttp() && parsed.protocol === "http:")) {
+    throw new Error(`${label || "URL"} must use HTTPS`);
+  }
+  return u.replace(/\/+$/, "");
+}
+
+function secureCompareStrings(a, b) {
+  const sa = String(a || "");
+  const sb = String(b || "");
+  const ba = Buffer.from(sa, "utf8");
+  const bb = Buffer.from(sb, "utf8");
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+function extractFederationApiKeyFromRequest(req) {
+  const auth = req.get("authorization") || req.get("Authorization") || "";
+  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim();
+  }
+  const xKey = req.get("x-api-key") || req.get("X-API-Key") || "";
+  if (xKey && String(xKey).trim()) return String(xKey).trim();
+  const legacy = req.get("api-key") || "";
+  if (legacy && String(legacy).trim()) return String(legacy).trim();
+  return "";
+}
+
+async function loadCredentialFromKeyRef(ref) {
+  const resolved = await resolveFederationCredentialFromKeyRef(ref);
+  return resolved.ok ? resolved.secret : null;
+}
+
+async function resolveFederationCredentialFromKeyRef(apiKeyRef) {
+  const keyRef = apiKeyRef != null ? String(apiKeyRef).trim() : "";
+  if (!keyRef) {
+    return {
+      ok: false,
+      error:
+        "This peer has no apiKeyRef saved. Open the peer, confirm the API key document ID, click Save, then use Sync (↻) again.",
+    };
+  }
+  if (!configDb) {
+    return { ok: false, error: "Config store not available" };
+  }
+  try {
+    const kd = await configDb.get(keyRef);
+    const secret = credentialFromElenkoKeyDoc(kd);
+    if (secret == null || String(secret) === "") {
+      return {
+        ok: false,
+        error: `API key document "${keyRef}" has no secret. Edit the key and set the secret value.`,
+      };
+    }
+    return { ok: true, secret: String(secret), keyRef };
+  } catch (e) {
+    if (e && e.statusCode === 404) {
+      return {
+        ok: false,
+        error: `No API key document "${keyRef}". Create the key (Federation → peer → Create API key) or fix apiKeyRef, then Save the peer.`,
+      };
+    }
+    return { ok: false, error: e.message || "Failed to load API key" };
+  }
+}
+
+async function authenticateFederationPeer(req) {
+  const provided = extractFederationApiKeyFromRequest(req);
+  if (!provided || !configDb) return null;
+  let peers = [];
+  try {
+    const find = await configDb.find({
+      selector: { type: "elenko_federation_peer" },
+      limit: 200,
+    });
+    peers = Array.isArray(find.docs) ? find.docs : [];
+  } catch (_) {
+    return null;
+  }
+  for (const peer of peers) {
+    if (peer && peer.enabled === false) continue;
+    const secret = await loadCredentialFromKeyRef(peer.apiKeyRef);
+    if (secret && secureCompareStrings(secret, provided)) {
+      return peer;
+    }
+  }
+  return null;
+}
+
+async function getFederationExchangeByExchangeId(exchangeId) {
+  const eid = exchangeId != null ? String(exchangeId).trim() : "";
+  if (!eid || !configDb) return null;
+  try {
+    const find = await configDb.find({
+      selector: { type: "elenko_federation_exchange", exchangeId: eid },
+      limit: 1,
+    });
+    return find.docs && find.docs[0] ? find.docs[0] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function findFederationStoredMessage(messageId) {
+  const mid = messageId != null ? String(messageId).trim() : "";
+  if (!mid || !configDb) return null;
+  try {
+    const find = await configDb.find({
+      selector: { type: "elenko_federation_message", messageId: mid },
+      limit: 1,
+    });
+    return find.docs && find.docs[0] ? find.docs[0] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function allocateFederationSeq(exchangeId) {
+  const eid = String(exchangeId).trim();
+  const docId = `federation_seq:${eid}`;
+  if (!configDb) throw new Error("Config store not available");
+  let doc;
+  try {
+    doc = await configDb.get(docId);
+  } catch (e) {
+    if (e.statusCode !== 404) throw e;
+    doc = {
+      _id: docId,
+      type: "elenko_federation_seq",
+      exchangeId: eid,
+      nextSeq: 1,
+    };
+  }
+  const seq = typeof doc.nextSeq === "number" && doc.nextSeq > 0 ? doc.nextSeq : 1;
+  doc.nextSeq = seq + 1;
+  const saved = await configDb.insert(doc);
+  doc._rev = saved.rev;
+  return seq;
+}
+
+function normalizeFederationOutboxCursor(cursor) {
+  const c = cursor && typeof cursor === "object" ? cursor : {};
+  const sentAt = typeof c.sentAt === "string" ? c.sentAt.trim() : "";
+  const seq = typeof c.seq === "number" && c.seq >= 0 ? c.seq : 0;
+  return { sentAt, seq };
+}
+
+function federationMessageSortKey(doc) {
+  const sentAt = doc && typeof doc.sentAt === "string" ? doc.sentAt : "";
+  const seq = doc && typeof doc.seq === "number" ? doc.seq : 0;
+  return `${sentAt}\0${String(seq).padStart(12, "0")}`;
+}
+
+function isFederationMessageAfterCursor(doc, cursor) {
+  const cur = normalizeFederationOutboxCursor(cursor);
+  if (!cur.sentAt) return true;
+  const key = federationMessageSortKey(doc);
+  const curKey = `${cur.sentAt}\0${String(cur.seq).padStart(12, "0")}`;
+  return key > curKey;
+}
+
+function validateFederationInboxBody(body) {
+  const b = body && typeof body === "object" ? body : {};
+  const schemaVersion =
+    typeof b.schemaVersion === "number" ? b.schemaVersion : FEDERATION_SCHEMA_VERSION;
+  if (schemaVersion !== FEDERATION_SCHEMA_VERSION) {
+    return { ok: false, error: `Unsupported schemaVersion (expected ${FEDERATION_SCHEMA_VERSION})` };
+  }
+  const messageId = typeof b.messageId === "string" ? b.messageId.trim() : "";
+  const exchangeId = typeof b.exchangeId === "string" ? b.exchangeId.trim() : "";
+  const msgType = typeof b.type === "string" ? b.type.trim().toLowerCase() : "";
+  const fromPeerId = typeof b.fromPeerId === "string" ? b.fromPeerId.trim() : "";
+  const toPeerId = typeof b.toPeerId === "string" ? b.toPeerId.trim() : "";
+  const sentAt = typeof b.sentAt === "string" ? b.sentAt.trim() : "";
+  const payload = b.payload && typeof b.payload === "object" && !Array.isArray(b.payload) ? b.payload : null;
+  if (!messageId) return { ok: false, error: "messageId is required" };
+  if (!exchangeId) return { ok: false, error: "exchangeId is required" };
+  if (msgType !== "entry" && msgType !== "response") return { ok: false, error: "type must be entry or response" };
+  if (!fromPeerId || !toPeerId) return { ok: false, error: "fromPeerId and toPeerId are required" };
+  if (!sentAt) return { ok: false, error: "sentAt is required" };
+  if (!payload) return { ok: false, error: "payload object is required" };
+  let inReplyTo = null;
+  if (msgType === "response") {
+    const ir = b.inReplyTo && typeof b.inReplyTo === "object" ? b.inReplyTo : null;
+    const originPeerId =
+      ir && typeof ir.originPeerId === "string" ? ir.originPeerId.trim() : "";
+    const remoteEntryId =
+      ir && typeof ir.remoteEntryId === "string" ? ir.remoteEntryId.trim() : "";
+    if (!originPeerId || !remoteEntryId) {
+      return { ok: false, error: "inReplyTo.originPeerId and inReplyTo.remoteEntryId are required for response" };
+    }
+    inReplyTo = { originPeerId, remoteEntryId };
+  }
+  return {
+    ok: true,
+    envelope: {
+      schemaVersion,
+      messageId,
+      exchangeId,
+      type: msgType,
+      fromPeerId,
+      toPeerId,
+      sentAt,
+      inReplyTo,
+      payload,
+    },
+  };
+}
+
+async function storeFederationInboxMessage(envelope, seq) {
+  const doc = {
+    type: "elenko_federation_message",
+    exchangeId: envelope.exchangeId,
+    messageId: envelope.messageId,
+    msgType: envelope.type,
+    fromPeerId: envelope.fromPeerId,
+    toPeerId: envelope.toPeerId,
+    sentAt: envelope.sentAt,
+    seq,
+    inReplyTo: envelope.inReplyTo || null,
+    payload: envelope.payload,
+  };
+  const saved = await configDb.insert(doc);
+  return { ...doc, _id: saved.id, _rev: saved.rev };
+}
+
+/**
+ * Store a validated message in the hub outbox (inbox acceptance).
+ * @param {object} body Raw envelope or partial (schemaVersion, messageId, …)
+ * @param {{ authPeer?: object }} [opts] When authPeer is set, enforces exchangeId/fromPeerId match (API key callers).
+ */
+async function acceptFederationInboxEnvelope(body, opts) {
+  if (!configDb) throw new Error("Config store not available");
+  const validated = validateFederationInboxBody(body);
+  if (!validated.ok) throw new Error(validated.error);
+  const envelope = validated.envelope;
+  const authPeer = opts && opts.authPeer ? opts.authPeer : null;
+  if (authPeer) {
+    const peerExchangeId =
+      authPeer && typeof authPeer.exchangeId === "string" ? authPeer.exchangeId.trim() : "";
+    if (peerExchangeId && peerExchangeId !== envelope.exchangeId) {
+      throw new Error("exchangeId does not match peer configuration");
+    }
+    const peerId = authPeer && typeof authPeer.peerId === "string" ? authPeer.peerId.trim() : "";
+    if (peerId && peerId !== envelope.fromPeerId) {
+      throw new Error("fromPeerId must match authenticated peer");
+    }
+  }
+  const exchangeDoc = await getFederationExchangeByExchangeId(envelope.exchangeId);
+  if (!exchangeDoc) throw new Error("Unknown exchangeId");
+  const existing = await findFederationStoredMessage(envelope.messageId);
+  if (existing) {
+    return {
+      ok: true,
+      duplicate: true,
+      messageId: envelope.messageId,
+      seq: existing.seq,
+      sentAt: existing.sentAt,
+    };
+  }
+  const seq = await allocateFederationSeq(envelope.exchangeId);
+  const stored = await storeFederationInboxMessage(envelope, seq);
+  return {
+    ok: true,
+    messageId: envelope.messageId,
+    seq: stored.seq,
+    sentAt: stored.sentAt,
+  };
+}
+
+function federationPeerUsesRemoteHub(peerDoc) {
+  const role = peerDoc && typeof peerDoc.role === "string" ? peerDoc.role.trim().toLowerCase() : "";
+  const remote =
+    peerDoc && typeof peerDoc.remoteBaseUrl === "string" ? peerDoc.remoteBaseUrl.trim() : "";
+  return role === "home" && !!remote;
+}
+
+function buildFederationPayloadFromEntry(entry, exchangeDoc, profileDoc) {
+  if (!entry || entry.type !== "elenko_record") throw new Error("Not an entry record");
+  const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const keys =
+    exchangeDoc && Array.isArray(exchangeDoc.payloadFieldNames) && exchangeDoc.payloadFieldNames.length > 0
+      ? exchangeDoc.payloadFieldNames.map((x) => String(x).trim()).filter(Boolean)
+      : fieldNames;
+  const payload = { _localEntryId: entry._id != null ? String(entry._id) : "" };
+  for (const key of keys) {
+    if (entry[key] != null && String(entry[key]).trim() !== "") {
+      payload[key] = String(entry[key]).trim();
+    }
+  }
+  const internalFields = normalizeFederationInternalFieldNames(exchangeDoc);
+  if (entry[internalFields.originEntryId]) {
+    payload[internalFields.originEntryId] = String(entry[internalFields.originEntryId]).trim();
+  }
+  return payload;
+}
+
+async function federationPublishEntryFromRecord(peerDoc, entryId, options) {
+  if (!db) throw new Error("Database not available");
+  if (!peerDoc || peerDoc.type !== "elenko_federation_peer") throw new Error("Invalid peer");
+  const eid = entryId != null ? String(entryId).trim() : "";
+  if (!eid) throw new Error("entryId is required");
+  const opts = options && typeof options === "object" ? options : {};
+  const toPeerId = opts.toPeerId != null ? String(opts.toPeerId).trim() : "";
+  if (!toPeerId) throw new Error("toPeerId is required");
+  const fromPeerId =
+    opts.fromPeerId != null && String(opts.fromPeerId).trim()
+      ? String(opts.fromPeerId).trim()
+      : typeof peerDoc.peerId === "string"
+        ? peerDoc.peerId.trim()
+        : "";
+  if (!fromPeerId) throw new Error("fromPeerId is required");
+  const exchangeId =
+    typeof peerDoc.exchangeId === "string" ? peerDoc.exchangeId.trim() : "";
+  if (!exchangeId) throw new Error("Peer has no exchangeId");
+  const exchangeDoc = await getFederationExchangeByExchangeId(exchangeId);
+  if (!exchangeDoc) throw new Error("Exchange not found: " + exchangeId);
+  const profileId =
+    (typeof peerDoc.profileId === "string" ? peerDoc.profileId.trim() : "") ||
+    (typeof exchangeDoc.profileId === "string" ? exchangeDoc.profileId.trim() : "");
+  let entry;
+  try {
+    entry = await db.get(eid);
+  } catch (e) {
+    if (e.statusCode === 404) throw new Error("Entry not found: " + eid);
+    throw e;
+  }
+  if (!entry || entry.type !== "elenko_record") throw new Error("Document is not an entry");
+  if (String(entry.profileId) !== String(profileId)) {
+    throw new Error("Entry is not in this peer's mailbox profile");
+  }
+  let profileDoc;
+  try {
+    profileDoc = await db.get(profileId);
+  } catch (e) {
+    if (e.statusCode === 404) throw new Error("Mailbox profile not found");
+    throw e;
+  }
+  const payload = buildFederationPayloadFromEntry(entry, exchangeDoc, profileDoc);
+  let inReplyTo = null;
+  if (opts.inReplyTo && typeof opts.inReplyTo === "object") {
+    inReplyTo = opts.inReplyTo;
+  } else if (entry.isResponse && entry.responseToDocId) {
+    const internalFields = normalizeFederationInternalFieldNames(exchangeDoc);
+    let parent;
+    try {
+      parent = await db.get(String(entry.responseToDocId).trim());
+    } catch (_) {
+      parent = null;
+    }
+    const originPeer =
+      (parent && parent[internalFields.originPeerId]) ||
+      entry[internalFields.originPeerId] ||
+      fromPeerId;
+    const originEntry =
+      (parent && parent[internalFields.originEntryId]) ||
+      (parent && parent._id) ||
+      "";
+    if (originPeer && originEntry) {
+      inReplyTo = {
+        originPeerId: String(originPeer).trim(),
+        remoteEntryId: String(originEntry).trim(),
+      };
+    }
+  }
+  let msgType = "entry";
+  if (inReplyTo != null || opts.type === "response") msgType = "response";
+  if (msgType === "response" && !inReplyTo) {
+    throw new Error("Response entry needs inReplyTo (parent federation origin fields or explicit inReplyTo)");
+  }
+  const envelope = {
+    schemaVersion: FEDERATION_SCHEMA_VERSION,
+    messageId:
+      opts.messageId && String(opts.messageId).trim()
+        ? String(opts.messageId).trim()
+        : crypto.randomUUID(),
+    exchangeId,
+    type: msgType,
+    fromPeerId,
+    toPeerId,
+    sentAt: new Date().toISOString(),
+    inReplyTo: inReplyTo || undefined,
+    payload,
+  };
+  let hubResult;
+  if (federationPeerUsesRemoteHub(peerDoc)) {
+    hubResult = await federationPublishToHub(peerDoc, envelope);
+  } else {
+    hubResult = await acceptFederationInboxEnvelope(envelope, {});
+  }
+  return { messageId: envelope.messageId, envelope, hub: hubResult };
+}
+
+async function listFederationOutboxMessages(exchangeId, toPeerId, cursor, limit) {
+  const eid = String(exchangeId).trim();
+  const pid = String(toPeerId).trim();
+  const lim = Math.min(Math.max(limit || 50, 1), 200);
+  const find = await configDb.find({
+    selector: {
+      type: "elenko_federation_message",
+      exchangeId: eid,
+      toPeerId: pid,
+    },
+    limit: 500,
+  });
+  let docs = Array.isArray(find.docs) ? find.docs : [];
+  docs = docs.filter((d) => isFederationMessageAfterCursor(d, cursor));
+  docs.sort((a, b) => federationMessageSortKey(a).localeCompare(federationMessageSortKey(b)));
+  return docs.slice(0, lim);
+}
+
+async function resolveFederationParentEntryId(dbInstance, profileId, internalFields, inReplyTo) {
+  if (!dbInstance || !inReplyTo) return "";
+  const originPeerId = String(inReplyTo.originPeerId || "").trim();
+  const remoteEntryId = String(inReplyTo.remoteEntryId || "").trim();
+  if (!originPeerId || !remoteEntryId) return "";
+  const fPeer = internalFields.originPeerId;
+  const fEntry = internalFields.originEntryId;
+  try {
+    const find = await dbInstance.find({
+      selector: {
+        type: "elenko_record",
+        profileId: String(profileId),
+        [fPeer]: originPeerId,
+        [fEntry]: remoteEntryId,
+      },
+      limit: 1,
+    });
+    const hit = find.docs && find.docs[0];
+    return hit && hit._id ? String(hit._id) : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+async function importFederationEnvelopeToProfile(dbInstance, exchangeDoc, peerDoc, envelope) {
+  if (!dbInstance) throw new Error("Database unavailable");
+  const profileId =
+    (peerDoc && typeof peerDoc.profileId === "string" ? peerDoc.profileId.trim() : "") ||
+    (exchangeDoc && typeof exchangeDoc.profileId === "string" ? exchangeDoc.profileId.trim() : "");
+  if (!profileId) throw new Error("No profileId configured for federation import");
+  let profileDoc;
+  try {
+    profileDoc = await dbInstance.get(profileId);
+  } catch (e) {
+    if (e.statusCode === 404) throw new Error("Exchange profile not found: " + profileId);
+    throw e;
+  }
+  if (!profileDoc || profileDoc.type !== "elenko_profile") {
+    throw new Error("Exchange profile not found: " + profileId);
+  }
+  if (isProfilePersonalEncryptionEnabled(profileDoc)) {
+    throw new Error("Cannot import federation messages into an encrypted profile.");
+  }
+  const internalFields = normalizeFederationInternalFieldNames(exchangeDoc);
+  const existingByMsg = await dbInstance.find({
+    selector: {
+      type: "elenko_record",
+      profileId,
+      [internalFields.messageId]: envelope.messageId,
+    },
+    limit: 1,
+  });
+  if (existingByMsg.docs && existingByMsg.docs[0]) {
+    return { skipped: true, reason: "duplicate", id: existingByMsg.docs[0]._id };
+  }
+  const fieldNames = Array.isArray(profileDoc.fieldNames) ? profileDoc.fieldNames : [];
+  const payloadKeys =
+    exchangeDoc && Array.isArray(exchangeDoc.payloadFieldNames) && exchangeDoc.payloadFieldNames.length > 0
+      ? exchangeDoc.payloadFieldNames.map((x) => String(x).trim()).filter(Boolean)
+      : Object.keys(envelope.payload || {});
+  const dataset = {};
+  for (const key of payloadKeys) {
+    if (fieldNames.length > 0 && !fieldNames.includes(key)) continue;
+    if (envelope.payload[key] != null) dataset[key] = String(envelope.payload[key]).trim();
+  }
+  const originPeerId = envelope.fromPeerId;
+  const originEntryId =
+    envelope.payload && envelope.payload[internalFields.originEntryId] != null
+      ? String(envelope.payload[internalFields.originEntryId]).trim()
+      : envelope.payload && envelope.payload._originEntryId != null
+        ? String(envelope.payload._originEntryId).trim()
+        : "";
+  dataset[internalFields.messageId] = envelope.messageId;
+  dataset[internalFields.originPeerId] = originPeerId;
+  if (originEntryId) dataset[internalFields.originEntryId] = originEntryId;
+  else if (envelope.type === "entry") {
+    const localOrigin =
+      envelope.payload && envelope.payload._localEntryId != null
+        ? String(envelope.payload._localEntryId).trim()
+        : "";
+    if (localOrigin) dataset[internalFields.originEntryId] = localOrigin;
+  }
+  const context = { dataset, profileId, profileDoc };
+  let parentId = "";
+  if (envelope.type === "response" && envelope.inReplyTo) {
+    parentId = await resolveFederationParentEntryId(
+      dbInstance,
+      profileId,
+      internalFields,
+      envelope.inReplyTo
+    );
+  }
+  const opts =
+    envelope.type === "response" && parentId
+      ? { isResponse: true, responseToDocId: parentId }
+      : {};
+  const created = await createEntryInProfileFromContext(dbInstance, context, profileId, opts);
+  const patch = { ...created };
+  patch[internalFields.messageId] = envelope.messageId;
+  patch[internalFields.originPeerId] = originPeerId;
+  const oe =
+    dataset[internalFields.originEntryId] ||
+    (envelope.inReplyTo && envelope.inReplyTo.remoteEntryId) ||
+    "";
+  if (oe) patch[internalFields.originEntryId] = String(oe).trim();
+  try {
+    patch._rev = created._rev;
+    const saved = await dbInstance.insert(patch);
+    clearProfileListCache(profileId);
+    return { skipped: false, id: saved.id, rev: saved.rev };
+  } catch (e) {
+    return { skipped: false, id: created._id, rev: created._rev };
+  }
+}
+
+async function federationPollAndImportForPeer(peerDoc) {
+  if (!configDb || !db) throw new Error("Database not available");
+  if (!peerDoc || peerDoc.type !== "elenko_federation_peer") throw new Error("Invalid peer");
+  if (peerDoc.enabled === false) throw new Error("Peer is disabled");
+  const role = typeof peerDoc.role === "string" ? peerDoc.role.trim().toLowerCase() : "";
+  if (role !== "home") throw new Error("Poll/import is only for home peers");
+  const remoteBaseUrl = assertFederationHttpsUrl(peerDoc.remoteBaseUrl, "remoteBaseUrl");
+  const exchangeId = typeof peerDoc.exchangeId === "string" ? peerDoc.exchangeId.trim() : "";
+  const peerId = typeof peerDoc.peerId === "string" ? peerDoc.peerId.trim() : "";
+  if (!exchangeId || !peerId) throw new Error("exchangeId and peerId are required");
+  const exchangeDoc = await getFederationExchangeByExchangeId(exchangeId);
+  if (!exchangeDoc) throw new Error("Exchange not found: " + exchangeId);
+  const cred = await resolveFederationCredentialFromKeyRef(peerDoc.apiKeyRef);
+  if (!cred.ok) throw new Error(cred.error || "API key not configured for peer");
+  const apiKey = cred.secret;
+  const cursor = normalizeFederationOutboxCursor(peerDoc.outboxCursor);
+  const qs = new URLSearchParams({
+    exchangeId,
+    peerId,
+    limit: "100",
+  });
+  if (cursor.sentAt) qs.set("sinceSentAt", cursor.sentAt);
+  if (cursor.seq) qs.set("sinceSeq", String(cursor.seq));
+  const url = `${remoteBaseUrl}/api/federation/outbox?${qs.toString()}`;
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: "application/json",
+    },
+  });
+  const text = await resp.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (_) {
+    throw new Error(`Hub outbox returned non-JSON (${resp.status})`);
+  }
+  if (!resp.ok) {
+    throw new Error(data.error || data.message || `Hub outbox HTTP ${resp.status}`);
+  }
+  const messages = Array.isArray(data.messages) ? data.messages : [];
+  let imported = 0;
+  let skipped = 0;
+  let lastCursor = { ...cursor };
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    const envelope = {
+      schemaVersion: FEDERATION_SCHEMA_VERSION,
+      messageId: msg.messageId,
+      exchangeId: msg.exchangeId || exchangeId,
+      type: msg.type || msg.msgType,
+      fromPeerId: msg.fromPeerId,
+      toPeerId: msg.toPeerId,
+      sentAt: msg.sentAt,
+      inReplyTo: msg.inReplyTo || null,
+      payload: msg.payload || {},
+    };
+    const result = await importFederationEnvelopeToProfile(db, exchangeDoc, peerDoc, envelope);
+    if (result.skipped) skipped++;
+    else imported++;
+    if (msg.sentAt && typeof msg.seq === "number") {
+      lastCursor = { sentAt: String(msg.sentAt), seq: msg.seq };
+    }
+  }
+  const now = new Date().toISOString();
+  const updatedPeer = {
+    ...peerDoc,
+    outboxCursor: lastCursor,
+    lastPollAt: now,
+    lastPollOkAt: now,
+    lastPollError: "",
+    lastImportedCount: imported,
+  };
+  await configDb.insert(updatedPeer);
+  return { imported, skipped, messages: messages.length, outboxCursor: lastCursor };
+}
+
+async function federationPublishToHub(peerDoc, envelope) {
+  if (!peerDoc || peerDoc.type !== "elenko_federation_peer") throw new Error("Invalid peer");
+  const role = typeof peerDoc.role === "string" ? peerDoc.role.trim().toLowerCase() : "";
+  if (role !== "home") throw new Error("Publish is only for home peers");
+  const remoteBaseUrl = assertFederationHttpsUrl(peerDoc.remoteBaseUrl, "remoteBaseUrl");
+  const cred = await resolveFederationCredentialFromKeyRef(peerDoc.apiKeyRef);
+  if (!cred.ok) throw new Error(cred.error || "API key not configured for peer");
+  const apiKey = cred.secret;
+  const validated = validateFederationInboxBody(envelope);
+  if (!validated.ok) throw new Error(validated.error);
+  if (federationWorker) {
+    const workerResult = await runFederationHubPublishInWorker({
+      remoteBaseUrl,
+      apiKey,
+      envelope: validated.envelope,
+    });
+    return workerResult.hub != null ? workerResult.hub : workerResult;
+  }
+  const url = `${remoteBaseUrl}/api/federation/inbox`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(validated.envelope),
+  });
+  const text = await resp.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (_) {
+    throw new Error(`Hub inbox returned non-JSON (${resp.status})`);
+  }
+  if (!resp.ok) {
+    throw new Error(data.error || data.message || `Hub inbox HTTP ${resp.status}`);
+  }
+  return data;
+}
+
 /** Update the current entry (context.entryId) from context.dataset. Used by multi-step flows. */
 async function updateCurrentEntryFromDataset(dbInstance, context) {
   if (!dbInstance) return;
@@ -3685,6 +4840,10 @@ async function runPipeline(context, flowDoc) {
         ? "appendRepeat"
         : rawTarget === "refresh"
         ? "refresh"
+        : rawTarget === "federationPublish"
+        ? "federationPublish"
+        : rawTarget === "federationSync"
+        ? "federationSync"
         : "log";
     if (target === "log") {
       sendFlowMessage("entry.sendToFlow", {
@@ -3804,6 +4963,35 @@ async function runPipeline(context, flowDoc) {
       if (context && context.skipRefreshSteps) continue;
       const param = (step && typeof step.param === "string") ? step.param.trim() : "";
       await runFlowRefreshStep(db, context, i, param);
+      continue;
+    }
+    if (target === "federationPublish") {
+      const fedParamRaw = step && typeof step.param === "string" ? step.param.trim() : "";
+      try {
+        await runFlowFederationPublishStep(db, context, step, i);
+      } catch (err) {
+        sendFlowMessage("flow.federationPublishError", {
+          stepIndex: i,
+          profileId: context.profileId,
+          entryId: context.entryId,
+          param: fedParamRaw || "@profile",
+          error: err && err.message ? String(err.message) : String(err),
+        });
+      }
+      continue;
+    }
+    if (target === "federationSync") {
+      const fedParamRaw = step && typeof step.param === "string" ? step.param.trim() : "";
+      try {
+        await runFlowFederationSyncStep(context, step, i);
+      } catch (err) {
+        sendFlowMessage("flow.federationSyncError", {
+          stepIndex: i,
+          profileId: context.profileId,
+          param: fedParamRaw || "@profile",
+          error: err && err.message ? String(err.message) : String(err),
+        });
+      }
       continue;
     }
     if (target === "script") {
@@ -3987,6 +5175,55 @@ const KEY_LEN = 32;
 let flowWorker;
 let timerWorker;
 let apiWorker;
+let federationWorker;
+const pendingFederationHubPublishes = new Map();
+
+function runFederationHubPublishInWorker(payload) {
+  if (!federationWorker) return Promise.reject(new Error("Federation worker not available"));
+  const requestId = "fed-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      if (pendingFederationHubPublishes.has(requestId)) {
+        pendingFederationHubPublishes.delete(requestId);
+        reject(new Error("Federation hub publish timeout"));
+      }
+    }, 60000);
+    pendingFederationHubPublishes.set(requestId, { resolve, reject, timeoutId });
+    try {
+      federationWorker.postMessage({
+        type: "federation.hubPublish",
+        requestId,
+        payload,
+      });
+    } catch (err) {
+      clearTimeout(timeoutId);
+      pendingFederationHubPublishes.delete(requestId);
+      reject(err);
+    }
+  });
+}
+
+function startFederationWorker() {
+  const workerPath = path.join(__dirname, "federationWorker.js");
+  try {
+    federationWorker = new Worker(workerPath);
+    federationWorker.on("error", (err) => {
+      console.error("Federation worker error:", err);
+    });
+    federationWorker.on("message", (msg) => {
+      if (!msg || msg.type !== "federation.hubPublish.result") return;
+      const pending = pendingFederationHubPublishes.get(msg.requestId);
+      if (!pending) return;
+      pendingFederationHubPublishes.delete(msg.requestId);
+      clearTimeout(pending.timeoutId);
+      if (msg.ok) pending.resolve(msg.result);
+      else pending.reject(new Error(msg.error || "Hub publish failed"));
+    });
+  } catch (err) {
+    console.error("Failed to start federation worker:", err);
+    federationWorker = null;
+  }
+}
 
 // Forward *server.js* console errors to the flow log as well.
 // Keep console.log unchanged; only wrap console.error.
@@ -4897,9 +6134,16 @@ const EXPORTABLE_CONFIG_TYPES = new Set([
   "elenko_js_processing",
   "elenko_query",
   "elenko_timer",
+  "elenko_federation_exchange",
 ]);
 /** Config DB types listed on All documents (includes API key docs; keys are never exported). */
-const ALL_DOCUMENTS_CONFIG_TYPES = [...EXPORTABLE_CONFIG_TYPES, "elenko_api_key"];
+const ALL_DOCUMENTS_CONFIG_TYPES = [
+  ...EXPORTABLE_CONFIG_TYPES,
+  "elenko_api_key",
+  "elenko_federation_peer",
+  "elenko_federation_message",
+  "elenko_federation_seq",
+];
 
 function stripForExport(doc, type) {
   if (!doc || typeof doc !== "object") return null;
@@ -4918,34 +6162,66 @@ function stripForExport(doc, type) {
   if (type === "elenko_query") {
     // No secret fields yet; keep all properties for now.
   }
+  if (type === "elenko_federation_peer") {
+    out.apiKeyRef = "";
+  }
   return out;
 }
 
-async function getFlowIdsFromFormDocs(dbInstance, formDocs) {
-  const flowIds = new Set();
+function collectRawFlowRefsFromFormDocs(formDocs) {
+  const refs = [];
   for (const form of formDocs) {
     const configs = Array.isArray(form.flowConfigs) ? form.flowConfigs : [];
     for (const c of configs) {
-      const id = (c && typeof c.flowId === "string") ? c.flowId.trim() : "";
-      if (id) flowIds.add(id);
+      const id = c && typeof c.flowId === "string" ? c.flowId.trim() : "";
+      if (id) refs.push(id);
     }
   }
-  const result = [];
-  if (!configDb) return result;
-  for (const fid of flowIds) {
-    let doc = null;
+  return refs;
+}
+
+function collectRawFlowRefsFromProfile(profileDoc) {
+  const refs = [];
+  if (!profileDoc || typeof profileDoc !== "object") return refs;
+  const listConfigs = Array.isArray(profileDoc.listFlowConfigs) ? profileDoc.listFlowConfigs : [];
+  for (const item of listConfigs) {
+    const id = item && typeof item.flowId === "string" ? item.flowId.trim() : "";
+    if (id) refs.push(id);
+  }
+  const infoFlow =
+    typeof profileDoc.infoImportFlowId === "string" && profileDoc.infoImportFlowId.trim()
+      ? profileDoc.infoImportFlowId.trim()
+      : typeof profileDoc.guardianFlowId === "string" && profileDoc.guardianFlowId.trim()
+        ? profileDoc.guardianFlowId.trim()
+        : "";
+  if (infoFlow) refs.push(infoFlow);
+  return refs;
+}
+
+async function getFlowIdsFromFormDocs(dbInstance, formDocs) {
+  const rawRefs = collectRawFlowRefsFromFormDocs(formDocs);
+  if (!configDb || rawRefs.length === 0) return [];
+  return resolveConfigDocIds(configDb, rawRefs, "elenko_flow", "name");
+}
+
+async function resolveFlowDocIdsFromRefs(refs) {
+  const raw = Array.isArray(refs) ? refs.filter((r) => r != null && String(r).trim()) : [];
+  if (!configDb || raw.length === 0) return [];
+  return resolveConfigDocIds(configDb, raw, "elenko_flow", "name");
+}
+
+async function loadElenkoFlowDocsByIds(flowIds) {
+  const flowDocs = [];
+  if (!configDb) return flowDocs;
+  for (const flid of flowIds) {
     try {
-      doc = await configDb.get(fid);
+      const flowDoc = await configDb.get(flid);
+      if (flowDoc && flowDoc.type === "elenko_flow") flowDocs.push(flowDoc);
     } catch (e) {
       if (e.statusCode !== 404) throw e;
     }
-    if (!doc && fid) {
-      const byName = await configDb.find({ selector: { type: "elenko_flow", name: fid }, limit: 1 });
-      doc = byName.docs && byName.docs[0];
-    }
-    if (doc && doc.type === "elenko_flow" && doc._id) result.push(doc._id);
   }
-  return [...new Set(result)];
+  return flowDocs;
 }
 
 function getApiAndJsIdsFromFlowDocs(flowDocs) {
@@ -5226,43 +6502,34 @@ async function buildConfigExport(scope, profileId) {
           } catch (_) {}
         }
       }
+      try {
+        const fedFind = await configDb.find({
+          selector: { type: "elenko_federation_exchange", profileId: pid },
+          limit: 50,
+        });
+        for (const x of fedFind.docs || []) {
+          if (x && x.type === "elenko_federation_exchange") addConfig(x);
+        }
+      } catch (_) {}
     }
 
-    // Flows referenced from entry forms (flow buttons)
-    const flowIdSet = new Set(await getFlowIdsFromFormDocs(db, formDocs));
-    // Also include profile-level Information Import flow linkage (new field, with legacy fallback).
-    const profileInfoFlowId =
-      typeof profile.infoImportFlowId === "string" && profile.infoImportFlowId.trim()
-        ? profile.infoImportFlowId.trim()
-        : (typeof profile.guardianFlowId === "string" && profile.guardianFlowId.trim() ? profile.guardianFlowId.trim() : "");
-    if (profileInfoFlowId) {
-      const resolvedProfileFlowIds = await resolveConfigDocIds(configDb, [profileInfoFlowId], "elenko_flow", "name");
-      for (const rf of resolvedProfileFlowIds) flowIdSet.add(rf);
-    }
-
+    // Flows: entry-form buttons, profile list buttons, information import, timers
+    const flowRefList = [
+      ...collectRawFlowRefsFromFormDocs(formDocs),
+      ...collectRawFlowRefsFromProfile(profile),
+    ];
     const profileNameTrim = typeof profile.name === "string" ? profile.name.trim() : "";
     const timerDocsForProfile = allTimerDocs.filter((t) => {
       if (!t || t.type !== "elenko_timer") return false;
       const tPid = typeof t.profileId === "string" ? t.profileId.trim() : "";
       return tPid === pid || (profileNameTrim !== "" && tPid === profileNameTrim);
     });
-    if (configDb) {
-      for (const t of timerDocsForProfile) {
-        const flowRef = typeof t.flowId === "string" ? t.flowId.trim() : "";
-        if (!flowRef) continue;
-        const resolvedTimerFlow = await resolveConfigDocIds(configDb, [flowRef], "elenko_flow", "name");
-        for (const rf of resolvedTimerFlow) flowIdSet.add(rf);
-      }
+    for (const t of timerDocsForProfile) {
+      const flowRef = typeof t.flowId === "string" ? t.flowId.trim() : "";
+      if (flowRef) flowRefList.push(flowRef);
     }
-
-    const flowIds = [...flowIdSet];
-    const flowDocs = [];
-    for (const flid of flowIds) {
-      try {
-        const flowDoc = await configDb.get(flid);
-        if (flowDoc && flowDoc.type === "elenko_flow") flowDocs.push(flowDoc);
-      } catch (_) {}
-    }
+    const flowIds = await resolveFlowDocIdsFromRefs(flowRefList);
+    const flowDocs = await loadElenkoFlowDocsByIds(flowIds);
     for (const f of flowDocs) addConfig(f);
 
     for (const t of timerDocsForProfile) addConfig(t);
@@ -7347,6 +8614,82 @@ app.get("/favicon-32x32.png", servePublicAsset("favicon-32x32.png", "image/png")
 app.get("/apple-touch-icon.png", servePublicAsset("apple-touch-icon.png", "image/png"));
 app.get("/favicon16.png", (_req, res) => res.redirect(301, "/favicon-16x16.png"));
 app.get("/favicon32.png", (_req, res) => res.redirect(301, "/favicon-32x32.png"));
+
+async function requireFederationApiKey(req, res, next) {
+  try {
+    const peer = await authenticateFederationPeer(req);
+    if (!peer) {
+      return res.status(401).json({ error: "Invalid or missing federation API key" });
+    }
+    req.federationPeer = peer;
+    return next();
+  } catch (err) {
+    console.error("Federation auth error:", err);
+    return res.status(500).json({ error: err.message || "Authentication failed" });
+  }
+}
+
+app.post("/api/federation/inbox", requireFederationApiKey, async (req, res) => {
+  try {
+    const result = await acceptFederationInboxEnvelope(req.body, { authPeer: req.federationPeer });
+    if (result.duplicate) return res.json(result);
+    return res.status(201).json(result);
+  } catch (err) {
+    console.error("Federation inbox error:", err);
+    const msg = err.message || "Inbox failed";
+    const status =
+      msg.includes("match") || msg.includes("Unsupported") ? 403 : msg.includes("Unknown") ? 404 : 400;
+    return res.status(status >= 400 ? status : 500).json({ error: msg });
+  }
+});
+
+app.get("/api/federation/outbox", requireFederationApiKey, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const peer = req.federationPeer;
+    const exchangeId =
+      typeof req.query.exchangeId === "string" ? req.query.exchangeId.trim() : "";
+    const toPeerId = typeof req.query.peerId === "string" ? req.query.peerId.trim() : "";
+    const sinceSentAt =
+      typeof req.query.sinceSentAt === "string" ? req.query.sinceSentAt.trim() : "";
+    const sinceSeqRaw = req.query.sinceSeq != null ? String(req.query.sinceSeq).trim() : "";
+    const sinceSeq = sinceSeqRaw ? parseInt(sinceSeqRaw, 10) : 0;
+    const limitRaw = req.query.limit != null ? String(req.query.limit).trim() : "";
+    const limit = limitRaw ? parseInt(limitRaw, 10) : 50;
+    if (!exchangeId || !toPeerId) {
+      return res.status(400).json({ error: "exchangeId and peerId query parameters are required" });
+    }
+    const authPeerId = peer && typeof peer.peerId === "string" ? peer.peerId.trim() : "";
+    if (authPeerId !== toPeerId) {
+      return res.status(403).json({ error: "peerId must match authenticated peer" });
+    }
+    const peerExchangeId =
+      peer && typeof peer.exchangeId === "string" ? peer.exchangeId.trim() : "";
+    if (peerExchangeId && peerExchangeId !== exchangeId) {
+      return res.status(403).json({ error: "exchangeId does not match peer configuration" });
+    }
+    const cursor = normalizeFederationOutboxCursor({
+      sentAt: sinceSentAt,
+      seq: Number.isFinite(sinceSeq) ? sinceSeq : 0,
+    });
+    const docs = await listFederationOutboxMessages(exchangeId, toPeerId, cursor, limit);
+    const messages = docs.map((d) => ({
+      messageId: d.messageId,
+      exchangeId: d.exchangeId,
+      type: d.msgType,
+      fromPeerId: d.fromPeerId,
+      toPeerId: d.toPeerId,
+      sentAt: d.sentAt,
+      seq: d.seq,
+      inReplyTo: d.inReplyTo || undefined,
+      payload: d.payload || {},
+    }));
+    return res.json({ ok: true, messages });
+  } catch (err) {
+    console.error("Federation outbox error:", err);
+    return res.status(500).json({ error: err.message || "Outbox failed" });
+  }
+});
 
 app.use(express.static(path.join(__dirname, "public")));
 app.use(requireAuth);
@@ -9492,6 +10835,466 @@ app.post("/api/queries/:id/delete", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/federation", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    if (!db) return res.status(503).send(renderErrorPage("Database not available"));
+    const [exResult, peerResult, profilesResult] = await Promise.all([
+      configDb.find({ selector: { type: "elenko_federation_exchange" }, limit: 200 }),
+      configDb.find({ selector: { type: "elenko_federation_peer" }, limit: 200 }),
+      db.find({
+        selector: { type: "elenko_profile" },
+        fields: ["_id", "name"],
+        sort: [{ name: "asc" }],
+        limit: 1000,
+      }),
+    ]);
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(
+      renderFederationListPage(
+        exResult.docs || [],
+        peerResult.docs || [],
+        profilesResult.docs || [],
+        appUi,
+        inferFederationHubPublicBaseUrl(req)
+      )
+    );
+  } catch (err) {
+    console.error("Error loading federation:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/federation/exchanges/create", requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.status(503).send(renderErrorPage("Database not available"));
+    const profilesResult = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "name"],
+      sort: [{ name: "asc" }],
+      limit: 1000,
+    });
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderEditFederationExchangePage(null, null, profilesResult.docs || [], appUi));
+  } catch (err) {
+    console.error("Error loading federation exchange create:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/federation/exchanges/:id/edit", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    if (!db) return res.status(503).send(renderErrorPage("Database not available"));
+    const doc = await configDb.get(req.params.id);
+    if (!doc || doc.type !== "elenko_federation_exchange") {
+      return res.status(404).send(renderErrorPage("Exchange not found"));
+    }
+    const profilesResult = await db.find({
+      selector: { type: "elenko_profile" },
+      fields: ["_id", "name"],
+      sort: [{ name: "asc" }],
+      limit: 1000,
+    });
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderEditFederationExchangePage(doc, null, profilesResult.docs || [], appUi));
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Exchange not found"));
+    console.error("Error loading federation exchange:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/federation/peers/create", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    if (!db) return res.status(503).send(renderErrorPage("Database not available"));
+    const [exResult, profilesResult] = await Promise.all([
+      configDb.find({ selector: { type: "elenko_federation_exchange" }, limit: 200 }),
+      db.find({
+        selector: { type: "elenko_profile" },
+        fields: ["_id", "name"],
+        sort: [{ name: "asc" }],
+        limit: 1000,
+      }),
+    ]);
+    const prefillApiKeyRef =
+      typeof req.query.apiKeyRef === "string" ? req.query.apiKeyRef.trim() : "";
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(
+      renderEditFederationPeerPage(
+        null,
+        null,
+        exResult.docs || [],
+        profilesResult.docs || [],
+        appUi,
+        prefillApiKeyRef
+      )
+    );
+  } catch (err) {
+    console.error("Error loading federation peer create:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/federation/peers/:id/edit", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).send(renderErrorPage("Config store not available"));
+    if (!db) return res.status(503).send(renderErrorPage("Database not available"));
+    const doc = await configDb.get(req.params.id);
+    if (!doc || doc.type !== "elenko_federation_peer") {
+      return res.status(404).send(renderErrorPage("Peer not found"));
+    }
+    const [exResult, profilesResult] = await Promise.all([
+      configDb.find({ selector: { type: "elenko_federation_exchange" }, limit: 200 }),
+      db.find({
+        selector: { type: "elenko_profile" },
+        fields: ["_id", "name"],
+        sort: [{ name: "asc" }],
+        limit: 1000,
+      }),
+    ]);
+    const prefillApiKeyRef =
+      typeof req.query.apiKeyRef === "string" ? req.query.apiKeyRef.trim() : "";
+    const appUi = await getAppUiConfig();
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(
+      renderEditFederationPeerPage(
+        doc,
+        null,
+        exResult.docs || [],
+        profilesResult.docs || [],
+        appUi,
+        prefillApiKeyRef,
+        inferFederationHubPublicBaseUrl(req)
+      )
+    );
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Peer not found"));
+    console.error("Error loading federation peer:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/federation/exchanges", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const body = req.body || {};
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const profileId = typeof body.profileId === "string" ? body.profileId.trim() : "";
+    let exchangeId = typeof body.exchangeId === "string" ? body.exchangeId.trim() : "";
+    if (!name) return res.status(400).json({ error: "Name is required." });
+    if (!profileId) return res.status(400).json({ error: "profileId is required." });
+    if (!exchangeId) exchangeId = crypto.randomUUID();
+    const payloadFieldNames = Array.isArray(body.payloadFieldNames)
+      ? body.payloadFieldNames.map((x) => String(x).trim()).filter(Boolean)
+      : [];
+    const doc = {
+      type: "elenko_federation_exchange",
+      name,
+      description: typeof body.description === "string" ? body.description.trim() : "",
+      exchangeId,
+      schemaVersion: FEDERATION_SCHEMA_VERSION,
+      profileId,
+      payloadFieldNames,
+    };
+    const saved = await configDb.insert(doc);
+    res.status(201).json({ ok: true, id: saved.id, rev: saved.rev, exchangeId });
+  } catch (err) {
+    console.error("Error creating federation exchange:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/federation/exchanges/:id", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const existing = await configDb.get(req.params.id);
+    if (!existing || existing.type !== "elenko_federation_exchange") {
+      return res.status(404).json({ error: "Exchange not found" });
+    }
+    const body = req.body || {};
+    existing.name = typeof body.name === "string" ? body.name.trim() : existing.name;
+    existing.description =
+      typeof body.description === "string" ? body.description.trim() : existing.description || "";
+    if (typeof body.profileId === "string" && body.profileId.trim()) {
+      existing.profileId = body.profileId.trim();
+    }
+    if (Array.isArray(body.payloadFieldNames)) {
+      existing.payloadFieldNames = body.payloadFieldNames.map((x) => String(x).trim()).filter(Boolean);
+    }
+    const saved = await configDb.insert(existing);
+    res.json({ ok: true, id: saved.id, rev: saved.rev });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Exchange not found" });
+    console.error("Error updating federation exchange:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/federation/exchanges/:id/delete", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const rev = typeof (req.body && req.body._rev) === "string" ? req.body._rev : "";
+    if (!rev) return res.status(400).json({ error: "Missing revision" });
+    const existing = await configDb.get(req.params.id);
+    if (!existing || existing.type !== "elenko_federation_exchange") {
+      return res.status(404).json({ error: "Exchange not found" });
+    }
+    await configDb.destroy(req.params.id, rev);
+    res.json({ ok: true, redirect: "/federation" });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Exchange not found" });
+    console.error("Error deleting federation exchange:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/federation/peers", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const body = req.body || {};
+    const exchangeId = typeof body.exchangeId === "string" ? body.exchangeId.trim() : "";
+    const peerId = typeof body.peerId === "string" ? body.peerId.trim() : "";
+    const role = typeof body.role === "string" ? body.role.trim().toLowerCase() : "";
+    const profileId = typeof body.profileId === "string" ? body.profileId.trim() : "";
+    const apiKeyRef = typeof body.apiKeyRef === "string" ? body.apiKeyRef.trim() : "";
+    const remoteBaseUrl = typeof body.remoteBaseUrl === "string" ? body.remoteBaseUrl.trim() : "";
+    if (!exchangeId || !peerId) return res.status(400).json({ error: "exchangeId and peerId are required." });
+    if (role !== "hub" && role !== "home") return res.status(400).json({ error: "role must be hub or home." });
+    if (!profileId) return res.status(400).json({ error: "profileId is required." });
+    if (!apiKeyRef) return res.status(400).json({ error: "apiKeyRef is required." });
+    if (role === "home") {
+      if (!remoteBaseUrl) return res.status(400).json({ error: "remoteBaseUrl is required for home peers." });
+      try {
+        assertFederationHttpsUrl(remoteBaseUrl, "remoteBaseUrl");
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    }
+    const doc = {
+      type: "elenko_federation_peer",
+      name: typeof body.name === "string" ? body.name.trim() : peerId,
+      exchangeId,
+      peerId,
+      role,
+      profileId,
+      apiKeyRef,
+      remoteBaseUrl: role === "home" ? remoteBaseUrl : "",
+      enabled: body.enabled !== false,
+      outboxCursor: normalizeFederationOutboxCursor(body.outboxCursor),
+    };
+    const saved = await configDb.insert(doc);
+    res.status(201).json({ ok: true, id: saved.id, rev: saved.rev });
+  } catch (err) {
+    console.error("Error creating federation peer:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/federation/peers/:id", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const existing = await configDb.get(req.params.id);
+    if (!existing || existing.type !== "elenko_federation_peer") {
+      return res.status(404).json({ error: "Peer not found" });
+    }
+    const body = req.body || {};
+    if (typeof body.name === "string") existing.name = body.name.trim();
+    if (typeof body.exchangeId === "string" && body.exchangeId.trim()) {
+      existing.exchangeId = body.exchangeId.trim();
+    }
+    if (typeof body.peerId === "string" && body.peerId.trim()) existing.peerId = body.peerId.trim();
+    if (typeof body.role === "string") {
+      const role = body.role.trim().toLowerCase();
+      if (role === "hub" || role === "home") existing.role = role;
+    }
+    if (typeof body.profileId === "string" && body.profileId.trim()) {
+      existing.profileId = body.profileId.trim();
+    }
+    if (typeof body.apiKeyRef === "string" && body.apiKeyRef.trim()) {
+      existing.apiKeyRef = body.apiKeyRef.trim();
+    }
+    if (typeof body.remoteBaseUrl === "string") {
+      const url = body.remoteBaseUrl.trim();
+      if (existing.role === "home" && url) {
+        try {
+          assertFederationHttpsUrl(url, "remoteBaseUrl");
+        } catch (e) {
+          return res.status(400).json({ error: e.message });
+        }
+      }
+      existing.remoteBaseUrl = existing.role === "home" ? url : "";
+    }
+    if (typeof body.enabled === "boolean") existing.enabled = body.enabled;
+    const saved = await configDb.insert(existing);
+    res.json({ ok: true, id: saved.id, rev: saved.rev });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Peer not found" });
+    console.error("Error updating federation peer:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/federation/peers/:id/delete", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const rev = typeof (req.body && req.body._rev) === "string" ? req.body._rev : "";
+    if (!rev) return res.status(400).json({ error: "Missing revision" });
+    const existing = await configDb.get(req.params.id);
+    if (!existing || existing.type !== "elenko_federation_peer") {
+      return res.status(404).json({ error: "Peer not found" });
+    }
+    await configDb.destroy(req.params.id, rev);
+    res.json({ ok: true, redirect: "/federation" });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Peer not found" });
+    console.error("Error deleting federation peer:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/federation/peers/:id/export-config", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const peerDoc = await configDb.get(req.params.id);
+    if (!peerDoc || peerDoc.type !== "elenko_federation_peer") {
+      return res.status(404).json({ error: "Peer not found" });
+    }
+    const body = req.body || {};
+    const password = typeof body.password === "string" ? body.password : "";
+    let hubBaseUrl = typeof body.hubBaseUrl === "string" ? body.hubBaseUrl.trim() : "";
+    if (!hubBaseUrl) hubBaseUrl = inferFederationHubPublicBaseUrl(req);
+    const file = await buildFederationPeerExportFile(peerDoc, { password, hubBaseUrl });
+    const filename = federationPeerExportFilename(peerDoc.peerId);
+    res.json({ ok: true, filename, file });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Peer not found" });
+    console.error("Federation peer export error:", err);
+    res.status(400).json({ error: err.message || "Export failed" });
+  }
+});
+
+app.post("/api/federation/peers/import-config", requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const file = body.file;
+    const password = typeof body.password === "string" ? body.password : "";
+    const profileId =
+      typeof body.profileId === "string" ? body.profileId.trim() : "";
+    const result = await applyFederationPeerConfigImport(file, password, profileId || undefined);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("Federation peer import error:", err);
+    res.status(400).json({ error: err.message || "Import failed" });
+  }
+});
+
+app.post("/api/federation/sync", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const peerDocId = typeof (req.body && req.body.id) === "string" ? req.body.id.trim() : "";
+    if (!peerDocId) return res.status(400).json({ error: "Peer document id (id) is required." });
+    const peerDoc = await configDb.get(peerDocId);
+    if (!peerDoc || peerDoc.type !== "elenko_federation_peer") {
+      return res.status(404).json({ error: "Peer not found" });
+    }
+    const result = await federationPollAndImportForPeer(peerDoc);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("Federation sync error:", err);
+    if (configDb && req.body && req.body.id) {
+      try {
+        const peerDoc = await configDb.get(String(req.body.id).trim());
+        if (peerDoc && peerDoc.type === "elenko_federation_peer") {
+          peerDoc.lastPollAt = new Date().toISOString();
+          peerDoc.lastPollError = err.message || String(err);
+          await configDb.insert(peerDoc);
+        }
+      } catch (_) {}
+    }
+    res.status(500).json({ error: err.message || "Sync failed" });
+  }
+});
+
+app.post("/api/federation/publish-entry", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const body = req.body || {};
+    const peerDocId = typeof body.id === "string" ? body.id.trim() : "";
+    const entryId = typeof body.entryId === "string" ? body.entryId.trim() : "";
+    if (!peerDocId) return res.status(400).json({ error: "Peer document id (id) is required." });
+    if (!entryId) return res.status(400).json({ error: "entryId is required (mailbox entry _id from All documents)." });
+    const peerDoc = await configDb.get(peerDocId);
+    if (!peerDoc || peerDoc.type !== "elenko_federation_peer") {
+      return res.status(404).json({ error: "Peer not found" });
+    }
+    const toPeerId =
+      typeof body.toPeerId === "string" && body.toPeerId.trim()
+        ? body.toPeerId.trim()
+        : typeof peerDoc.peerId === "string"
+          ? peerDoc.peerId.trim()
+          : "";
+    const fromPeerId =
+      typeof body.fromPeerId === "string" && body.fromPeerId.trim() ? body.fromPeerId.trim() : undefined;
+    const result = await federationPublishEntryFromRecord(peerDoc, entryId, {
+      toPeerId,
+      fromPeerId,
+      inReplyTo: body.inReplyTo,
+    });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("Federation publish-entry error:", err);
+    res.status(500).json({ error: err.message || "Publish failed" });
+  }
+});
+
+app.post("/api/federation/publish", requireAdmin, async (req, res) => {
+  try {
+    if (!configDb) return res.status(503).json({ error: "Config store not available" });
+    const body = req.body || {};
+    const peerDocId = typeof body.id === "string" ? body.id.trim() : "";
+    if (!peerDocId) return res.status(400).json({ error: "Home peer document id (id) is required." });
+    const peerDoc = await configDb.get(peerDocId);
+    if (!peerDoc || peerDoc.type !== "elenko_federation_peer") {
+      return res.status(404).json({ error: "Peer not found" });
+    }
+    const exchangeId =
+      typeof body.exchangeId === "string" && body.exchangeId.trim()
+        ? body.exchangeId.trim()
+        : typeof peerDoc.exchangeId === "string"
+          ? peerDoc.exchangeId.trim()
+          : "";
+    const toPeerId = typeof body.toPeerId === "string" ? body.toPeerId.trim() : "";
+    const msgType = typeof body.type === "string" ? body.type.trim().toLowerCase() : "entry";
+    const payload = body.payload && typeof body.payload === "object" && !Array.isArray(body.payload) ? body.payload : {};
+    if (!toPeerId) return res.status(400).json({ error: "toPeerId is required." });
+    const envelope = {
+      schemaVersion: FEDERATION_SCHEMA_VERSION,
+      messageId:
+        typeof body.messageId === "string" && body.messageId.trim()
+          ? body.messageId.trim()
+          : crypto.randomUUID(),
+      exchangeId,
+      type: msgType,
+      fromPeerId: typeof peerDoc.peerId === "string" ? peerDoc.peerId.trim() : "",
+      toPeerId,
+      sentAt: new Date().toISOString(),
+      inReplyTo: body.inReplyTo && typeof body.inReplyTo === "object" ? body.inReplyTo : undefined,
+      payload,
+    };
+    const hubResult = await federationPublishToHub(peerDoc, envelope);
+    res.json({ ok: true, messageId: envelope.messageId, hub: hubResult });
+  } catch (err) {
+    console.error("Federation publish error:", err);
+    res.status(500).json({ error: err.message || "Publish failed" });
+  }
+});
+
 app.get("/apis/keys/create", requireAdmin, async (req, res) => {
   const appUi = await getAppUiConfig();
   res.set("Content-Type", "text/html; charset=utf-8");
@@ -10380,12 +12183,42 @@ app.get("/profile/:id/edit", requireAdmin, async (req, res) => {
     } catch (e) {}
     const appUi = await getAppUiConfig();
     const keyFileUsers = await loadUsersWithRegisteredKeyFiles(db);
+    let federationCatalog = { exchanges: [], peers: [] };
+    if (configDb) {
+      try {
+        const [exResult, peerResult] = await Promise.all([
+          configDb.find({ selector: { type: "elenko_federation_exchange" }, limit: 200 }),
+          configDb.find({ selector: { type: "elenko_federation_peer" }, limit: 200 }),
+        ]);
+        federationCatalog = {
+          exchanges: exResult.docs || [],
+          peers: peerResult.docs || [],
+        };
+      } catch (_) {}
+    }
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderEditProfilePage(doc, forms, appUi, keyFileUsers, flows));
+    res.send(renderEditProfilePage(doc, forms, appUi, keyFileUsers, flows, federationCatalog));
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).send(renderErrorPage("Profile not found"));
     console.error("Error loading profile:", err);
     res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/profiles/:id/add-federation-fields", requireAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const doc = await db.get(id);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    const { added } = applyFederationFieldsToProfileDoc(doc);
+    const saved = await db.insert(doc);
+    res.json({ ok: true, id: saved.id, rev: saved.rev, added });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
+    console.error("Error adding federation fields:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -10396,6 +12229,8 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       _rev,
       name,
       description,
+      databaseInfo,
+      federation: rawFederation,
       fieldNames,
       customCss,
       entryFormId,
@@ -10406,6 +12241,7 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       infoImportFlowId,
       infoImportButtonTitle,
       listFlowConfigs: rawListFlowConfigs,
+      listFlowButtonMode: rawListFlowButtonMode,
       entriesPageSize,
       splitView,
       guardianFlowId,
@@ -10434,6 +12270,7 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       : (Array.isArray(doc.fieldNames) ? doc.fieldNames : []);
     doc.name = name.trim();
     doc.description = description != null ? String(description).trim() : "";
+    doc.databaseInfo = databaseInfo != null ? String(databaseInfo).trim() : "";
     doc.startIconColor =
       normalizeLayoutItemColor(rawStartIconColor) || hashColorFromName(doc.name || doc._id);
     doc.customCss = customCss != null ? String(customCss) : "";
@@ -10441,6 +12278,24 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
     doc.fieldDefaultSources = normalizeFieldDefaultSources(fields, req.body.fieldDefaultSources);
     doc.fieldDisplay = normalizeFieldDisplay(fields, req.body.fieldDisplay);
     doc.fieldKinds = normalizeFieldKinds(fields, req.body.fieldKinds);
+    doc.federation = normalizeProfileFederation(rawFederation, fields);
+    if (doc.federation.enabled) {
+      if (!doc.federation.exchangeId) {
+        return res.status(400).json({ error: "Federation exchange is required when federation is enabled." });
+      }
+      if (!doc.federation.peerDocId) {
+        return res.status(400).json({ error: "Federation outbound peer is required when federation is enabled." });
+      }
+      const missingFedFields = federationMissingProfileFields(doc);
+      if (missingFedFields.length > 0) {
+        return res.status(400).json({
+          error:
+            "Federation requires profile fields: " +
+            missingFedFields.join(", ") +
+            ". Use Add federation fields on the profile edit page.",
+        });
+      }
+    }
     let updatedEntryFormIds;
     if (Array.isArray(entryFormIds)) {
       updatedEntryFormIds = entryFormIds
@@ -10504,6 +12359,10 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
     } else if (!Array.isArray(doc.listFlowConfigs)) {
       doc.listFlowConfigs = [];
     }
+    doc.listFlowButtonMode = normalizeListFlowButtonMode({
+      listFlowButtonMode:
+        typeof rawListFlowButtonMode === "string" ? rawListFlowButtonMode : doc.listFlowButtonMode,
+    });
     const rawPageSize = Number(entriesPageSize);
     doc.entriesPageSize =
       Number.isFinite(rawPageSize) && rawPageSize >= ENTRIES_PAGE_SIZE_MIN && rawPageSize <= ENTRIES_PAGE_SIZE_MAX
@@ -14175,6 +16034,10 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   const isAdmin = role === "admin";
   const title = escapeHtml(doc.name || "Elenko database");
   const description = escapeHtml(doc.description || "").replace(/\n/g, "<br>");
+  const databaseInfoRaw =
+    typeof doc.databaseInfo === "string" ? doc.databaseInfo.trim() : "";
+  const hasDatabaseInfo = databaseInfoRaw.length > 0;
+  const databaseInfoHtml = hasDatabaseInfo ? marked.parse(databaseInfoRaw) : "";
   const fieldNames = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
   const customCss = doc.customCss || "";
   const theme = normalizeProfileTheme(doc.theme);
@@ -14192,6 +16055,8 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   } = pagination;
   const canBulkDelete = isAdmin && !encryptionLock;
   const listFlowConfigs = getProfileListFlowConfigs(doc);
+  const listFlowButtonMode = normalizeListFlowButtonMode(doc);
+  const listFlowButtonsAlways = listFlowButtonMode === "always";
   const canBulkSelect = !encryptionLock && (canBulkDelete || (canEdit && listFlowConfigs.length > 0));
   const recordsOnPage = Array.isArray(records) ? records.length : 0;
   const bulkSelectScopeCount =
@@ -14262,6 +16127,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       --profile-text: ${escapeHtml(theme.text)};
       --profile-label: ${escapeHtml(theme.label)};
       --profile-link: ${escapeHtml(theme.link)};
+      --profile-link-visited: ${escapeHtml(theme.linkVisited)};
       --profile-table-bg: ${escapeHtml(theme.tableBg)};
       --profile-table-header-bg: ${escapeHtml(theme.tableHeaderBg)};
       --profile-table-header-text: ${escapeHtml(theme.tableHeaderText)};
@@ -14364,8 +16230,11 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     .topbar-links { margin: 0; display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; }
     .topbar-links a { color: var(--profile-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
     .topbar-links a:hover { text-decoration: underline; }
-    .topbar-links a.topbar-icon-btn {
-      display: inline-block;
+    .topbar-links a.topbar-icon-btn,
+    .topbar-links button.topbar-icon-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       padding: 0.5rem 0.75rem;
       border-radius: 6px;
       font-size: 0.875rem;
@@ -14376,8 +16245,59 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       text-decoration: none;
       box-sizing: border-box;
       margin-right: 0.75rem;
+      cursor: pointer;
+      font-family: inherit;
     }
-    .topbar-links a.topbar-icon-btn:hover { text-decoration: none; background: #30363d; color: var(--profile-link, #58a6ff); }
+    .topbar-links a.topbar-icon-btn:hover,
+    .topbar-links button.topbar-icon-btn:hover { text-decoration: none; background: #30363d; color: var(--profile-link, #58a6ff); }
+    .profile-info-btn.topbar-icon-btn {
+      width: 2rem;
+      height: 2rem;
+      min-width: 2rem;
+      padding: 0;
+      border-radius: 50%;
+      font-size: 0.95rem;
+      font-weight: 700;
+      font-family: Georgia, "Times New Roman", serif;
+      line-height: 1;
+      margin-right: 0;
+    }
+    .profile-info-dialog { position: fixed; inset: 0; z-index: 500; display: flex; align-items: center; justify-content: center; padding: 1rem; background: rgba(0,0,0,0.55); }
+    .profile-info-dialog[hidden] { display: none !important; }
+    .profile-info-dialog-panel {
+      position: relative;
+      max-width: 36rem;
+      width: 100%;
+      max-height: min(85vh, 32rem);
+      overflow: auto;
+      padding: 1.25rem 1.5rem 1.5rem;
+      border-radius: 10px;
+      border: 1px solid var(--profile-table-border, #30363d);
+      background: var(--profile-table-bg, #161b22);
+      color: var(--profile-text, #e6edf3);
+      box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+    }
+    .profile-info-dialog-close {
+      position: absolute;
+      top: 0.5rem;
+      right: 0.55rem;
+      border: none;
+      background: transparent;
+      color: var(--profile-label, #8b949e);
+      font-size: 1.35rem;
+      line-height: 1;
+      cursor: pointer;
+      padding: 0.25rem 0.45rem;
+      border-radius: 6px;
+    }
+    .profile-info-dialog-close:hover { background: rgba(255,255,255,0.08); color: var(--profile-text, #e6edf3); }
+    .profile-info-dialog-title { margin: 0 2rem 0.75rem 0; font-size: 1.1rem; font-weight: 600; }
+    .profile-info-markdown { line-height: 1.55; font-size: 0.95rem; }
+    .profile-info-markdown p { margin: 0 0 0.65rem 0; }
+    .profile-info-markdown p:last-child { margin-bottom: 0; }
+    .profile-info-markdown ul, .profile-info-markdown ol { margin: 0 0 0.65rem 0; padding-left: 1.5rem; }
+    .profile-info-markdown a { color: var(--profile-link, #58a6ff); }
+    .profile-info-markdown code { font-size: 0.88em; background: rgba(255,255,255,0.06); padding: 0.1rem 0.35rem; border-radius: 4px; }
     .topbar-titleline { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; min-width: 0; }
     .topbar-actions { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: flex-end; }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.35rem 0.75rem; border-radius: 6px; text-decoration: none; font-size: 0.9rem; border: none; cursor: pointer; }
@@ -14401,8 +16321,10 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     tr:last-child td { border-bottom: none; }
     .entry-cell-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
     .response-row-marker { display: inline-block; color: var(--profile-label, #8b949e); margin-right: 0.35rem; font-weight: 600; }
-    .entry-link-cell a { color: var(--profile-link, #58a6ff); text-decoration: none; }
-    .entry-link-cell a:hover { text-decoration: underline; }
+    .entry-link-cell a.entry-open-link { color: var(--profile-link, #58a6ff); text-decoration: none; }
+    .entry-link-cell a.entry-open-link:visited,
+    .entry-link-cell a.entry-open-link.entry-link-visited { color: var(--profile-link-visited, #99caff); }
+    .entry-link-cell a.entry-open-link:hover { text-decoration: underline; }
     .empty { color: var(--profile-label, #8b949e); font-style: italic; }
     .top-tools { margin-bottom: 0.75rem; display: flex; flex-wrap: nowrap; gap: 0.75rem; align-items: center; }
     .search-bar { margin: 0; display: flex; flex-wrap: nowrap; gap: 0.5rem; align-items: center; flex: 1 1 45%; min-width: 0; }
@@ -14468,14 +16390,64 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       .split-list-pane { flex: 0 0 auto; min-height: 0; overflow: visible !important; }
       /* Row prev/next tie into split single-entry navigation; hide on phones. */
       .pagination .btn-pag-row { display: none !important; }
-      .topbar-links a.topbar-icon-btn {
-        display: inline-flex;
+      .topbar {
+        flex-wrap: wrap;
         align-items: center;
-        justify-content: center;
-        min-width: 2.75rem;
-        min-height: 2.75rem;
+        gap: 0.35rem 0.5rem;
+      }
+      .topbar-main {
+        flex: 1 1 100%;
+        width: 100%;
+        flex-wrap: nowrap;
+        align-items: center;
+        min-width: 0;
+        gap: 0.5rem;
+      }
+      .topbar-links {
+        flex-shrink: 0;
+        flex-wrap: nowrap;
+        align-items: center;
+        gap: 0.35rem;
+      }
+      .topbar-links a.topbar-icon-btn,
+      .topbar-links button.topbar-icon-btn {
+        min-width: 2.5rem;
+        min-height: 2.5rem;
         padding: 0.45rem 0.65rem;
-        margin: -0.45rem 0.5rem -0.45rem -0.5rem;
+        margin: 0;
+      }
+      .topbar-links a.topbar-icon-btn:first-child {
+        margin: -0.45rem 0.25rem -0.45rem -0.5rem;
+      }
+      .topbar-titleline {
+        flex: 1 1 auto;
+        min-width: 0;
+        flex-wrap: nowrap;
+        overflow: hidden;
+        gap: 0.5rem;
+      }
+      .topbar-titleline h1,
+      .topbar-titleline .sub {
+        white-space: nowrap;
+        margin: 0;
+      }
+      .topbar-titleline h1 {
+        flex: 0 0 auto;
+        overflow: visible;
+        text-overflow: clip;
+        font-size: 1.05rem;
+      }
+      .topbar-titleline .sub {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-size: 0.78rem;
+      }
+      .topbar-actions {
+        flex: 1 1 100%;
+        width: 100%;
+        justify-content: flex-end;
       }
       th.col-mobile-hidden,
       td.col-mobile-hidden { display: none; }
@@ -14493,7 +16465,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
 <body>
   <div class="topbar">
     <div class="topbar-main">
-      <div class="topbar-links"><a href="/" class="topbar-icon-btn" title="Profiles" aria-label="Profiles">◀</a>${canEdit && isAdmin ? `<a href="/profile/${encodeURIComponent(doc._id)}/edit">Edit profile</a>` : ""}</div>
+      <div class="topbar-links"><a href="/" class="topbar-icon-btn" title="Profiles" aria-label="Profiles">◀</a>${canEdit && isAdmin ? `<a href="/profile/${encodeURIComponent(doc._id)}/edit" class="topbar-icon-btn" title="Edit profile" aria-label="Edit profile">⚙</a>` : ""}${hasDatabaseInfo ? `<button type="button" class="profile-info-btn topbar-icon-btn" id="profile-database-info-btn" title="Database info" aria-label="Database info">i</button>` : ""}</div>
       <div class="topbar-titleline">
         <h1>${title}</h1>
         ${description ? `<span class="sub">${description}</span>` : ""}
@@ -14504,12 +16476,13 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
         ? `<button type="button" id="toggle-select-mode" class="btn btn-secondary">Select entries</button>${listFlowConfigs
             .map(
               (cfg) =>
-                `<button type="button" class="btn btn-secondary entry-bulk-flow-btn" data-flow-id="${escapeHtml(cfg.flowId)}" style="display:none;" disabled>${escapeHtml(cfg.label)}</button>`
+                `<button type="button" class="btn btn-secondary entry-bulk-flow-btn" data-flow-id="${escapeHtml(cfg.flowId)}" style="display:${listFlowButtonsAlways ? "inline-block" : "none"};" disabled>${escapeHtml(cfg.label)}</button>`
             )
             .join("")}${canBulkDelete ? `<button type="button" id="delete-selected-btn" class="btn btn-danger" style="display:none;" disabled>Delete selected</button>` : ""}`
         : ""
     }${canEdit && !encryptionLock ? `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn btn-create-entry">Create entry</a>` : ""}</div>
   </div>
+  ${hasDatabaseInfo ? `<div id="profile-database-info-dialog" class="profile-info-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="profile-database-info-title"><div class="profile-info-dialog-panel"><button type="button" class="profile-info-dialog-close" id="profile-database-info-close" aria-label="Close">×</button><h2 class="profile-info-dialog-title" id="profile-database-info-title">Database info</h2><div class="profile-info-markdown">${databaseInfoHtml}</div></div></div>` : ""}
   ${encryptionBanner}
   ${splitViewEnabled && splitViewOrientation !== "horizontal" ? `<div class="split-view-wrap split-${splitViewOrientation}" data-orientation="${splitViewOrientation}"><div class="split-list-pane">` : ""}
   <div class="top-tools">
@@ -14701,6 +16674,68 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       if (first) openInSplit(first.getAttribute('href'), first.getAttribute('data-entry-id') || '');
     })();
   </script>` : ""}
+  ${hasDatabaseInfo ? `<script>
+    (function() {
+      var dlg = document.getElementById('profile-database-info-dialog');
+      var openBtn = document.getElementById('profile-database-info-btn');
+      var closeBtn = document.getElementById('profile-database-info-close');
+      if (!dlg || !openBtn) return;
+      function openDialog() {
+        dlg.hidden = false;
+        if (closeBtn) closeBtn.focus();
+      }
+      function closeDialog() {
+        dlg.hidden = true;
+        openBtn.focus();
+      }
+      openBtn.addEventListener('click', openDialog);
+      if (closeBtn) closeBtn.addEventListener('click', closeDialog);
+      dlg.addEventListener('click', function(ev) {
+        if (ev.target === dlg) closeDialog();
+      });
+      document.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Escape' && !dlg.hidden) closeDialog();
+      });
+    })();
+  </script>` : ""}
+  <script>
+    (function() {
+      var profileId = ${JSON.stringify(String(doc._id || ""))};
+      var storageKey = 'elenkoProfileVisitedEntries:' + profileId;
+      function loadVisitedSet() {
+        try {
+          var raw = sessionStorage.getItem(storageKey);
+          if (!raw) return new Set();
+          var arr = JSON.parse(raw);
+          return new Set(Array.isArray(arr) ? arr.filter(function(id) { return id; }) : []);
+        } catch (_) {
+          return new Set();
+        }
+      }
+      function saveVisitedSet(set) {
+        try {
+          sessionStorage.setItem(storageKey, JSON.stringify(Array.from(set)));
+        } catch (_) {}
+      }
+      var visited = loadVisitedSet();
+      function markEntryLinkVisited(link) {
+        if (!link) return;
+        link.classList.add('entry-link-visited');
+        var eid = link.getAttribute('data-entry-id');
+        if (eid) {
+          visited.add(eid);
+          saveVisitedSet(visited);
+        }
+      }
+      document.querySelectorAll('a.entry-open-link').forEach(function(a) {
+        var eid = a.getAttribute('data-entry-id');
+        if (eid && visited.has(eid)) a.classList.add('entry-link-visited');
+        a.addEventListener('click', function() {
+          markEntryLinkVisited(a);
+        });
+      });
+    })();
+  </script>
   <script>
     (function() {
       var prevBtn = document.getElementById('btn-prev-row');
@@ -14760,6 +16795,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       var searchQuery = ${JSON.stringify(searchQuery || "")};
       var scopeCount = ${JSON.stringify(bulkSelectScopeCount)};
       var recordsOnPage = ${JSON.stringify(recordsOnPage)};
+      var listFlowButtonMode = ${JSON.stringify(listFlowButtonMode)};
       var selectMode = false;
       var deleteAllInScope = false;
 
@@ -14785,7 +16821,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
           deleteBtn.textContent = n > 0 ? ('Delete selected (' + n + ')') : 'Delete selected';
         }
         flowBtns.forEach(function(btn) {
-          btn.disabled = n === 0;
+          btn.disabled = n === 0 && listFlowButtonMode !== 'always';
         });
       }
       function syncSelectAllState() {
@@ -14805,14 +16841,18 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
         selectAll.checked = checked.length === boxes.length;
         selectAll.indeterminate = checked.length > 0 && checked.length < boxes.length;
       }
+      function syncFlowButtonVisibility() {
+        flowBtns.forEach(function(btn) {
+          btn.style.display =
+            listFlowButtonMode === 'always' || selectMode ? 'inline-block' : 'none';
+        });
+      }
       function setSelectMode(on) {
         selectMode = !!on;
         document.body.classList.toggle('entry-select-mode', selectMode);
         if (toggleBtn) toggleBtn.textContent = selectMode ? 'Cancel selection' : 'Select entries';
         if (deleteBtn) deleteBtn.style.display = selectMode ? 'inline-block' : 'none';
-        flowBtns.forEach(function(btn) {
-          btn.style.display = selectMode ? 'inline-block' : 'none';
-        });
+        syncFlowButtonVisibility();
         if (!selectMode) {
           deleteAllInScope = false;
           rowChecks().forEach(function(cb) { cb.checked = false; });
@@ -14855,13 +16895,36 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       flowBtns.forEach(function(btn) {
         btn.addEventListener('click', async function() {
           var count = selectedCount();
-          if (count === 0) {
-            setMsg('Select at least one entry.', 'err');
-            return;
-          }
           var flowId = btn.getAttribute('data-flow-id') || '';
           var actionLabel = (btn.textContent || 'flow').trim();
           if (!flowId) return;
+          if (count === 0) {
+            if (listFlowButtonMode !== 'always') {
+              setMsg('Select at least one entry.', 'err');
+              return;
+            }
+            flowBtns.forEach(function(b) { b.disabled = true; });
+            setMsg('Running ' + actionLabel + '…');
+            try {
+              var r0 = await fetch('/api/profile/' + encodeURIComponent(profileId) + '/run-flow', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ flowId: flowId })
+              });
+              var data0 = await r0.json();
+              if (!r0.ok) {
+                setMsg(data0.error || 'Flow run failed', 'err');
+                updateActionButtons();
+                return;
+              }
+              setMsg(actionLabel + ' finished.', 'ok');
+              setTimeout(function() { window.location.reload(); }, 700);
+            } catch (err0) {
+              setMsg((err0 && err0.message) ? err0.message : 'Request failed', 'err');
+              updateActionButtons();
+            }
+            return;
+          }
           if (!confirmLargeSelection(count, actionLabel)) return;
           flowBtns.forEach(function(b) { b.disabled = true; });
           if (deleteBtn) deleteBtn.disabled = true;
@@ -14903,6 +16966,8 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
           }
         });
       });
+      syncFlowButtonVisibility();
+      updateActionButtons();
       if (deleteBtn) {
         deleteBtn.addEventListener('click', async function() {
           var count = selectedCount();
@@ -16115,6 +18180,10 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'purgeOld'
           : (step && step.target === 'appendRepeat')
           ? 'appendRepeat'
+          : (step && step.target === 'federationPublish')
+          ? 'federationPublish'
+          : (step && step.target === 'federationSync')
+          ? 'federationSync'
           : (step && step.target === 'refresh')
           ? 'refresh'
           : 'log';
@@ -16137,6 +18206,10 @@ function renderEditFlowPage(doc, err, appUi) {
           ? 'Age: 7d or 2w (days/weeks)'
           : target === 'appendRepeat'
           ? 'Profile repeat fields (e.g. PROMPT,RESPONSE)'
+          : target === 'federationPublish'
+          ? '@profile or peer CouchDB _id / peerId'
+          : target === 'federationSync'
+          ? '@profile or peer CouchDB _id / peerId'
           : target === 'refresh'
           ? 'Timeout seconds (default 15)'
           : '—';
@@ -16152,6 +18225,8 @@ function renderEditFlowPage(doc, err, appUi) {
         '<option value="create"' + (target === 'create' ? ' selected' : '') + '>Create new document in this profile</option>' +
         '<option value="purgeOld"' + (target === 'purgeOld' ? ' selected' : '') + '>Delete old entries in this profile</option>' +
         '<option value="appendRepeat"' + (target === 'appendRepeat' ? ' selected' : '') + '>Append repeat row</option>' +
+        '<option value="federationPublish"' + (target === 'federationPublish' ? ' selected' : '') + '>Federation publish entry</option>' +
+        '<option value="federationSync"' + (target === 'federationSync' ? ' selected' : '') + '>Federation sync (pull hub outbox)</option>' +
         '<option value="refresh"' + (target === 'refresh' ? ' selected' : '') + '>Refresh entry view</option>' +
         '</select></td>' +
         '<td><input type="text" class="step-label" placeholder="Step label" value="' + label + '"></td>' +
@@ -16181,6 +18256,10 @@ function renderEditFlowPage(doc, err, appUi) {
             stepParam.placeholder = 'Age: 7d or 2w (days/weeks)';
           } else if (this.value === 'appendRepeat') {
             stepParam.placeholder = 'Profile repeat fields (e.g. PROMPT,RESPONSE)';
+          } else if (this.value === 'federationPublish') {
+            stepParam.placeholder = '@profile or peer CouchDB _id / peerId';
+          } else if (this.value === 'federationSync') {
+            stepParam.placeholder = '@profile or peer CouchDB _id / peerId';
           } else if (this.value === 'refresh') {
             stepParam.placeholder = 'Timeout seconds (default 15)';
           } else {
@@ -17164,6 +19243,862 @@ function renderEditQueryPage(doc, err, appUi, profiles) {
 </html>`;
 }
 
+function renderFederationListPage(exchanges, peers, profiles, appUi, defaultHubBaseUrl) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const profileNameById = new Map(
+    (Array.isArray(profiles) ? profiles : [])
+      .filter((p) => p && p._id)
+      .map((p) => [String(p._id), (p.name && String(p.name).trim()) || String(p._id)])
+  );
+  const profLabel = (id) => {
+    const s = id != null ? String(id).trim() : "";
+    return s ? escapeHtml(profileNameById.get(s) || s) : "";
+  };
+  const exRows =
+    (Array.isArray(exchanges) ? exchanges : []).length > 0
+      ? exchanges
+          .map(
+            (x) => `
+        <tr>
+          <td><a href="/federation/exchanges/${encodeURIComponent(x._id)}/edit">${escapeHtml(x.name || x.exchangeId || x._id)}</a></td>
+          <td><code>${escapeHtml(x.exchangeId || "")}</code></td>
+          <td>${profLabel(x.profileId)}</td>
+          <td class="row-actions"><a href="/federation/exchanges/${encodeURIComponent(x._id)}/edit" class="edit-link icon-action" title="Edit">✎</a><button type="button" class="delete-fed-exchange-btn icon-action delete-action" data-id="${escapeHtml(x._id)}" data-rev="${escapeHtml(x._rev || "")}" title="Delete">✕</button></td>
+        </tr>`
+          )
+          .join("")
+      : `<tr><td colspan="4" class="empty">No exchanges yet. Create one and export/import it to other Elenko instances.</td></tr>`;
+  const peerRows =
+    (Array.isArray(peers) ? peers : []).length > 0
+      ? peers
+          .map((p) => {
+            const cursor = p.outboxCursor && typeof p.outboxCursor === "object" ? p.outboxCursor : {};
+            const pollHint = p.lastPollAt
+              ? `Last poll: ${escapeHtml(String(p.lastPollAt))}${p.lastPollError ? " — " + escapeHtml(String(p.lastPollError)) : ""}`
+              : "";
+            const hasKeyRef = !!(p.apiKeyRef && String(p.apiKeyRef).trim());
+            const syncBtn =
+              p.role === "home"
+                ? `<button type="button" class="sync-peer-btn fed-client-only icon-action" data-id="${escapeHtml(p._id)}" title="${hasKeyRef ? "Poll hub outbox" : "Save peer with apiKeyRef first"}" ${hasKeyRef ? "" : "disabled"}>↻</button>`
+                : "";
+            return `
+        <tr>
+          <td><a href="/federation/peers/${encodeURIComponent(p._id)}/edit">${escapeHtml(p.name || p.peerId || p._id)}</a></td>
+          <td><code>${escapeHtml(p.peerId || "")}</code></td>
+          <td>${escapeHtml(p.role || "")}</td>
+          <td><code>${escapeHtml(p.exchangeId || "")}</code></td>
+          <td>${profLabel(p.profileId)}</td>
+          <td class="row-actions">${syncBtn}<a href="/federation/peers/${encodeURIComponent(p._id)}/edit" class="edit-link icon-action" title="Edit">✎</a><button type="button" class="delete-fed-peer-btn icon-action delete-action" data-id="${escapeHtml(p._id)}" data-rev="${escapeHtml(p._rev || "")}" title="Delete">✕</button></td>
+        </tr>
+        ${pollHint ? `<tr class="fed-client-only"><td colspan="6" class="id-cell">${pollHint}</td></tr>` : ""}`;
+          })
+          .join("")
+      : `<tr><td colspan="6" class="empty">No peers yet. Register hub spokes and home instances with matching API keys.</td></tr>`;
+  const importProfileOpts = (Array.isArray(profiles) ? profiles : [])
+    .map((p) => {
+      const pid = String(p._id);
+      const label = escapeHtml((p.name && String(p.name).trim()) || pid);
+      return `<option value="${escapeHtml(pid)}">${label}</option>`;
+    })
+    .join("");
+  const hubBaseDefault =
+    typeof defaultHubBaseUrl === "string" ? defaultHubBaseUrl.trim() : "";
+  const exportPeerOpts = (Array.isArray(peers) ? peers : [])
+    .map((p) => {
+      const label = escapeHtml(p.name || p.peerId || p._id);
+      const pid = escapeHtml(p.peerId || "");
+      const fn = escapeHtml(federationPeerExportFilename(p.peerId || "peer"));
+      return `<option value="${escapeHtml(p._id)}" data-peer-id="${pid}" data-filename="${fn}">${label} (${pid})</option>`;
+    })
+    .join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Federation</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 56rem; }
+    h1, h2 { font-weight: 600; }
+    h2 { margin-top: 2rem; font-size: 1.1rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; line-height: 1.45; }
+    .fed-guide { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; line-height: 1.5; font-size: 0.95rem; }
+    .fed-guide h2 { font-size: 1rem; color: var(--app-text, #e6edf3); margin: 1.25rem 0 0.5rem; font-weight: 600; }
+    .fed-guide ol { margin: 0.35rem 0 0.75rem 1.25rem; padding: 0; }
+    .fed-guide li { margin-bottom: 0.45rem; }
+    .fed-guide strong { color: var(--app-text, #e6edf3); font-weight: 600; }
+    .actions { margin-bottom: 1rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
+    .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-right: 0.5rem; margin-bottom: 0.5rem; }
+    .btn-secondary { background: var(--app-table-header-bg, #21262d); border: 1px solid var(--app-table-border, #30363d); }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; margin-bottom: 1rem; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .row-actions .icon-action { border: none; background: none; color: var(--app-link, #58a6ff); font-size: 1.15rem; cursor: pointer; margin-right: 0.25rem; }
+    .row-actions .delete-action { color: #f85149; }
+    .row-actions .delete-action:hover { color: #ff7b72; }
+    .row-actions .delete-action:disabled { opacity: 0.5; cursor: not-allowed; }
+    .id-cell { font-size: 0.85em; color: var(--app-label, #8b949e); }
+    code { font-size: 0.85em; word-break: break-all; }
+    #fed-msg { margin-top: 0.75rem; }
+    .msg.ok { color: #3fb950; }
+    .msg.err { color: #f85149; }
+    .fed-role-switch { margin: 0.75rem 0 1.25rem; padding: 0.75rem 1rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 8px; }
+    .fed-role-switch label { display: inline; margin: 0; color: var(--app-text, #e6edf3); cursor: pointer; }
+    .fed-role-switch input { width: auto; margin-right: 0.35rem; vertical-align: middle; }
+    .fed-role-panel { margin-bottom: 1rem; }
+    .fed-role-panel label.block { display: block; margin: 0.75rem 0 0.35rem; color: var(--app-label, #8b949e); font-size: 0.9rem; }
+    .fed-role-panel input, .fed-role-panel select { width: 100%; max-width: 24rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: inherit; }
+  </style>
+</head>
+<body>
+  <div class="actions"><a href="/">← Start</a></div>
+  <h1>Federation</h1>
+  <div class="fed-role-switch">
+    <span style="color:var(--app-label,#8b949e);margin-right:0.75rem;">This instance</span>
+    <label><input type="radio" name="fed-ui-role" value="hub"> Hub (VPS)</label>
+    <label style="margin-left:1.25rem;"><input type="radio" name="fed-ui-role" value="client" checked> Client (home)</label>
+    <p class="sub" style="margin:0.5rem 0 0;font-size:0.85rem;">UI layout only — does not change server behaviour. Use <strong>Hub</strong> on the VPS to export peer configs; use <strong>Client</strong> on home to import and sync.</p>
+  </div>
+  <div class="fed-guide fed-hub-only">
+    <p class="sub" style="margin-bottom:0.75rem;">Hub mode: register peers and API keys, export encrypted peer config files for each client. The mailbox profile and exchange are copied via <strong>Export / Import configuration</strong> (with the database), not here.</p>
+    <ol style="margin:0 0 0.75rem 1.25rem;padding:0;color:var(--app-label,#8b949e);line-height:1.5;">
+      <li>Create <strong>exchange</strong> and <strong>peer</strong> per client site (<code>peerId</code>, API key secret, Save).</li>
+      <li><strong>Export peer config</strong> below (same secret as the API key) and transfer the file to the client instance.</li>
+      <li>Optional: <strong>Add federation fields</strong> on the mailbox profile if this hub also hosts a mailbox UI.</li>
+    </ol>
+  </div>
+  <div class="fed-guide fed-client-only">
+    <p class="sub" style="margin-bottom:0.75rem;">Client mode: import the database + exchange from the hub, then <strong>Import peer config</strong> below (or create a peer manually). Publish pushes to the hub; ↻ Sync pulls the hub outbox into the mailbox.</p>
+    <p class="sub" style="margin-bottom:0;">Local HTTP testing: <code>ELENKO_FEDERATION_ALLOW_HTTP=1</code>. Flows: <code>federationPublish</code> / <code>federationSync</code>.</p>
+  </div>
+  <p><a href="/federation/exchanges/create" class="btn">Create exchange</a><a href="/federation/peers/create" class="btn btn-secondary">Create peer</a></p>
+  <h2>Exchanges</h2>
+  <table><thead><tr><th>Name</th><th>exchangeId</th><th>Profile</th><th></th></tr></thead><tbody>${exRows}</tbody></table>
+  <h2>Peers</h2>
+  <table><thead><tr><th>Name</th><th>peerId</th><th>Role</th><th>exchangeId</th><th>Profile</th><th></th></tr></thead><tbody>${peerRows}</tbody></table>
+  <div class="fed-role-panel fed-hub-only">
+    <h2>Export peer config for client</h2>
+    <p class="sub" style="margin-top:0;">Encrypted with the federation secret (must match the peer’s API key on this hub). Filename includes <code>peerId</code>.</p>
+    <label class="block">Peer<select id="fed-export-peer"><option value="">— select —</option>${exportPeerOpts || ""}</select></label>
+    <label class="block">Hub public URL (for clients)<input id="fed-export-hub-url" type="url" value="${escapeHtml(hubBaseDefault)}" placeholder="https://hub.example.com"></label>
+    <p class="sub" style="margin:0.25rem 0 0.75rem;font-size:0.85rem;">Set <code>ELENKO_PUBLIC_BASE_URL</code> in <code>.env</code> if this default is wrong.</p>
+    <label class="block">Federation secret<input id="fed-export-password" type="password" autocomplete="off" placeholder="Same as API key secret"></label>
+    <button type="button" id="fed-export-btn" class="btn btn-secondary" style="margin-top:0.5rem;">Export peer config</button>
+  </div>
+  <div class="fed-role-panel fed-client-only">
+    <h2>Import peer config from hub</h2>
+    <p class="sub" style="margin-top:0;">Upload the file exported from the hub. The federation secret decrypts the file and creates the API key + home peer.</p>
+    <div class="fed-import-row" style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:flex-end;margin-bottom:0.5rem;">
+      <label>Peer config file<input id="fed-import-file" type="file" accept=".json,application/json" style="max-width:16rem;"></label>
+      <label>Federation secret<input id="fed-import-password" type="password" autocomplete="off" placeholder="Same as hub API key secret" style="min-width:10rem;padding:0.35rem;background:var(--app-table-bg,#161b22);color:inherit;border:1px solid var(--app-table-border,#30363d);border-radius:6px;"></label>
+      <label>Mailbox database <span style="font-weight:normal;opacity:0.85">(optional)</span><select id="fed-import-profile" style="min-width:12rem;padding:0.35rem;background:var(--app-table-bg,#161b22);color:inherit;border:1px solid var(--app-table-border,#30363d);border-radius:6px;"><option value="">— auto-match —</option>${importProfileOpts}</select></label>
+      <button type="button" id="fed-import-btn" class="btn btn-secondary" style="margin:0;">Import peer config</button>
+    </div>
+  </div>
+  <div class="fed-client-only">
+  <h2>Publish &amp; synchronize (testing)</h2>
+  <p class="sub" style="margin-top:0;">Queue an existing mailbox entry for another <code>peerId</code>, then <strong>↻ Sync</strong> on the recipient peer to import it.</p>
+  <div class="fed-publish-row" style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:flex-end;margin-bottom:1rem;">
+    <label>Peer<select id="fed-publish-peer" style="min-width:12rem;padding:0.35rem;background:var(--app-table-bg,#161b22);color:inherit;border:1px solid var(--app-table-border,#30363d);border-radius:6px;">${(Array.isArray(peers) ? peers : [])
+      .map((p) => {
+        const label = escapeHtml(p.name || p.peerId || p._id);
+        const pid = escapeHtml(p.peerId || "");
+        return `<option value="${escapeHtml(p._id)}" data-peer-id="${pid}">${label} (${pid})</option>`;
+      })
+      .join("") || '<option value="">No peers</option>'}</select></label>
+    <label>Entry _id<input id="fed-publish-entry" type="text" placeholder="From All documents" style="min-width:14rem;padding:0.35rem;background:var(--app-table-bg,#161b22);color:inherit;border:1px solid var(--app-table-border,#30363d);border-radius:6px;"></label>
+    <label>To peerId<input id="fed-publish-to" type="text" placeholder="recipient peerId" style="min-width:8rem;padding:0.35rem;background:var(--app-table-bg,#161b22);color:inherit;border:1px solid var(--app-table-border,#30363d);border-radius:6px;"></label>
+    <label>From peerId <span style="font-weight:normal;opacity:0.85">(optional)</span><input id="fed-publish-from" type="text" placeholder="defaults to peer" style="min-width:8rem;padding:0.35rem;background:var(--app-table-bg,#161b22);color:inherit;border:1px solid var(--app-table-border,#30363d);border-radius:6px;"></label>
+    <button type="button" id="fed-publish-btn" class="btn" style="margin:0;">Publish entry</button>
+  </div>
+  </div>
+  <p id="fed-msg" class="msg" style="display:none;"></p>
+  <script>
+    (function() {
+      var msg = document.getElementById('fed-msg');
+      var FED_ROLE_KEY = 'elenkoFederationUiRole';
+      function applyFedUiRole(role) {
+        var hub = role === 'hub';
+        document.querySelectorAll('.fed-hub-only').forEach(function(el) {
+          el.style.display = hub ? '' : 'none';
+        });
+        document.querySelectorAll('.fed-client-only').forEach(function(el) {
+          el.style.display = hub ? 'none' : '';
+        });
+        try { localStorage.setItem(FED_ROLE_KEY, role); } catch (_) {}
+      }
+      document.querySelectorAll('input[name="fed-ui-role"]').forEach(function(radio) {
+        radio.addEventListener('change', function() {
+          if (this.checked) applyFedUiRole(this.value);
+        });
+      });
+      var savedRole = 'client';
+      try { savedRole = localStorage.getItem(FED_ROLE_KEY) || 'client'; } catch (_) {}
+      if (savedRole !== 'hub' && savedRole !== 'client') savedRole = 'client';
+      var roleRadio = document.querySelector('input[name="fed-ui-role"][value="' + savedRole + '"]');
+      if (roleRadio) roleRadio.checked = true;
+      applyFedUiRole(savedRole);
+      var exportBtn = document.getElementById('fed-export-btn');
+      if (exportBtn) exportBtn.addEventListener('click', function() {
+        var peerSel = document.getElementById('fed-export-peer');
+        var peerDocId = peerSel ? String(peerSel.value || '').trim() : '';
+        var pwdEl = document.getElementById('fed-export-password');
+        var hubEl = document.getElementById('fed-export-hub-url');
+        var password = pwdEl ? String(pwdEl.value || '') : '';
+        var hubBaseUrl = hubEl ? String(hubEl.value || '').trim() : '';
+        if (!peerDocId) {
+          msg.style.display = 'block';
+          msg.textContent = 'Select a peer to export.';
+          msg.className = 'msg err';
+          return;
+        }
+        if (!password || !hubBaseUrl) {
+          msg.style.display = 'block';
+          msg.textContent = 'Enter federation secret and hub public URL.';
+          msg.className = 'msg err';
+          return;
+        }
+        exportBtn.disabled = true;
+        msg.style.display = 'none';
+        fetch('/api/federation/peers/' + encodeURIComponent(peerDocId) + '/export-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: password, hubBaseUrl: hubBaseUrl })
+        })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+          .then(function(o) {
+            exportBtn.disabled = false;
+            msg.style.display = 'block';
+            if (!o.ok) {
+              msg.textContent = (o.data && o.data.error) ? o.data.error : 'Export failed';
+              msg.className = 'msg err';
+              return;
+            }
+            var blob = new Blob([JSON.stringify(o.data.file, null, 2)], { type: 'application/json' });
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = o.data.filename || 'elenko-federation-peer.json';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(a.href);
+            msg.textContent = 'Download started.';
+            msg.className = 'msg ok';
+            if (pwdEl) pwdEl.value = '';
+          })
+          .catch(function(e) {
+            exportBtn.disabled = false;
+            msg.style.display = 'block';
+            msg.textContent = e.message || 'Export failed';
+            msg.className = 'msg err';
+          });
+      });
+      document.querySelectorAll('.sync-peer-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          msg.style.display = 'none';
+          fetch('/api/federation/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: id })
+          }).then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              msg.style.display = 'block';
+              if (o.ok) {
+                var n = o.data.messages || 0;
+                var line = 'Imported ' + (o.data.imported || 0) + ', skipped ' + (o.data.skipped || 0) + ' (' + n + ' message' + (n === 1 ? '' : 's') + ' in hub outbox).';
+                if (n === 0) line += ' The queue was empty — use Publish entry first; ↻ does not send local mailbox rows.';
+                msg.textContent = line;
+                msg.className = 'msg ok';
+                if ((o.data.imported || 0) > 0) setTimeout(function() { location.reload(); }, 800);
+              } else {
+                msg.textContent = (o.data && o.data.error) ? o.data.error : 'Sync failed';
+                msg.className = 'msg err';
+              }
+            })
+            .catch(function(e) {
+              msg.style.display = 'block';
+              msg.textContent = e.message || 'Sync failed';
+              msg.className = 'msg err';
+            })
+            .finally(function() { btn.disabled = false; });
+        });
+      });
+      function bindFedDelete(selector, urlPrefix, label) {
+        document.querySelectorAll(selector).forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            var id = btn.getAttribute('data-id');
+            var rev = btn.getAttribute('data-rev');
+            if (!id || !rev) {
+              msg.style.display = 'block';
+              msg.textContent = 'Missing document revision — refresh the page and try again.';
+              msg.className = 'msg err';
+              return;
+            }
+            if (!confirm('Delete this ' + label + '?')) return;
+            btn.disabled = true;
+            msg.style.display = 'none';
+            fetch(urlPrefix + encodeURIComponent(id) + '/delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ _rev: rev })
+            })
+              .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+              .then(function(o) {
+                if (o.ok) location.reload();
+                else {
+                  msg.style.display = 'block';
+                  msg.textContent = (o.data && o.data.error) ? o.data.error : 'Delete failed';
+                  msg.className = 'msg err';
+                  btn.disabled = false;
+                }
+              })
+              .catch(function(e) {
+                msg.style.display = 'block';
+                msg.textContent = e.message || 'Delete failed';
+                msg.className = 'msg err';
+                btn.disabled = false;
+              });
+          });
+        });
+      }
+      bindFedDelete('.delete-fed-exchange-btn', '/api/federation/exchanges/', 'exchange');
+      bindFedDelete('.delete-fed-peer-btn', '/api/federation/peers/', 'peer');
+      var importBtn = document.getElementById('fed-import-btn');
+      if (importBtn) importBtn.addEventListener('click', function() {
+        var fileEl = document.getElementById('fed-import-file');
+        var pwdEl = document.getElementById('fed-import-password');
+        var profEl = document.getElementById('fed-import-profile');
+        if (!fileEl || !fileEl.files || !fileEl.files[0]) {
+          msg.style.display = 'block';
+          msg.textContent = 'Choose a peer config JSON file.';
+          msg.className = 'msg err';
+          return;
+        }
+        var pwd = pwdEl ? String(pwdEl.value || '') : '';
+        if (!pwd) {
+          msg.style.display = 'block';
+          msg.textContent = 'Enter the federation secret (file password).';
+          msg.className = 'msg err';
+          return;
+        }
+        importBtn.disabled = true;
+        msg.style.display = 'none';
+        var reader = new FileReader();
+        reader.onload = function() {
+          var parsed;
+          try { parsed = JSON.parse(String(reader.result || '')); } catch (e) {
+            msg.style.display = 'block';
+            msg.textContent = 'Invalid JSON file.';
+            msg.className = 'msg err';
+            importBtn.disabled = false;
+            return;
+          }
+          var body = { file: parsed, password: pwd };
+          if (profEl && profEl.value) body.profileId = profEl.value;
+          fetch('/api/federation/peers/import-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+          }).then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              msg.style.display = 'block';
+              if (o.ok) {
+                msg.textContent = 'Imported peer ' + (o.data.peerId || '') + '. API key and home peer are ready — try Sync (↻).';
+                msg.className = 'msg ok';
+                setTimeout(function() { location.reload(); }, 900);
+              } else {
+                msg.textContent = (o.data && o.data.error) ? o.data.error : 'Import failed';
+                msg.className = 'msg err';
+                importBtn.disabled = false;
+              }
+            })
+            .catch(function(e) {
+              msg.style.display = 'block';
+              msg.textContent = e.message || 'Import failed';
+              msg.className = 'msg err';
+              importBtn.disabled = false;
+            });
+        };
+        reader.onerror = function() {
+          msg.style.display = 'block';
+          msg.textContent = 'Could not read file.';
+          msg.className = 'msg err';
+          importBtn.disabled = false;
+        };
+        reader.readAsText(fileEl.files[0]);
+      });
+      var pubPeer = document.getElementById('fed-publish-peer');
+      var pubTo = document.getElementById('fed-publish-to');
+      function syncPublishToDefault() {
+        if (!pubPeer || !pubTo || (pubTo.value || '').trim()) return;
+        var opt = pubPeer.options[pubPeer.selectedIndex];
+        if (opt && opt.getAttribute('data-peer-id')) pubTo.value = opt.getAttribute('data-peer-id');
+      }
+      if (pubPeer) pubPeer.addEventListener('change', syncPublishToDefault);
+      syncPublishToDefault();
+      var pubBtn = document.getElementById('fed-publish-btn');
+      if (pubBtn) pubBtn.addEventListener('click', function() {
+        var peerId = pubPeer ? pubPeer.value : '';
+        var entryId = document.getElementById('fed-publish-entry');
+        entryId = entryId ? String(entryId.value || '').trim() : '';
+        var toPeer = pubTo ? String(pubTo.value || '').trim() : '';
+        var fromEl = document.getElementById('fed-publish-from');
+        var fromPeer = fromEl ? String(fromEl.value || '').trim() : '';
+        if (!peerId || !entryId || !toPeer) {
+          msg.style.display = 'block';
+          msg.textContent = 'Choose peer, entry _id, and to peerId.';
+          msg.className = 'msg err';
+          return;
+        }
+        pubBtn.disabled = true;
+        msg.style.display = 'none';
+        var body = { id: peerId, entryId: entryId, toPeerId: toPeer };
+        if (fromPeer) body.fromPeerId = fromPeer;
+        fetch('/api/federation/publish-entry', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        }).then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+          .then(function(o) {
+            msg.style.display = 'block';
+            if (o.ok) {
+              msg.textContent = 'Queued message ' + (o.data.messageId || '') + '. On the recipient home, click ↻ Sync to import.';
+              msg.className = 'msg ok';
+            } else {
+              msg.textContent = (o.data && o.data.error) ? o.data.error : 'Publish failed';
+              msg.className = 'msg err';
+            }
+          })
+          .catch(function(e) {
+            msg.style.display = 'block';
+            msg.textContent = e.message || 'Publish failed';
+            msg.className = 'msg err';
+          })
+          .finally(function() { pubBtn.disabled = false; });
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderEditFederationExchangePage(doc, err, profiles, appUi) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const isEdit = !!(doc && doc._id);
+  const id = doc && doc._id;
+  const rev = doc && doc._rev;
+  const nameVal = doc && doc.name ? escapeHtml(doc.name) : "";
+  const descVal = doc && doc.description ? escapeHtml(doc.description) : "";
+  const exchangeIdVal = doc && doc.exchangeId ? escapeHtml(doc.exchangeId) : "";
+  const profileIdVal = doc && doc.profileId ? String(doc.profileId) : "";
+  const payloadFields =
+    doc && Array.isArray(doc.payloadFieldNames) ? doc.payloadFieldNames.join(", ") : "";
+  const profileOpts = (Array.isArray(profiles) ? profiles : [])
+    .map((p) => {
+      const pid = String(p._id);
+      const sel = pid === profileIdVal ? " selected" : "";
+      const label = (p.name && String(p.name).trim()) || pid;
+      return `<option value="${escapeHtml(pid)}"${sel}>${escapeHtml(label)}</option>`;
+    })
+    .join("");
+  const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – ${isEdit ? "Edit exchange" : "Create exchange"}</title>
+  <style>
+    ${themeVars}
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 40rem; }
+    label { display: block; margin: 1rem 0 0.35rem; color: var(--app-label, #8b949e); }
+    input, select, textarea { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
+    .hint { font-size: 0.85rem; color: var(--app-label, #8b949e); margin-top: 0.25rem; }
+    .actions { margin-top: 1.5rem; }
+    .btn { background: #238636; color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; }
+    .msg.err { color: #f85149; }
+    .msg.ok { color: #3fb950; }
+    a { color: var(--app-link, #58a6ff); }
+  </style>
+</head>
+<body>
+  <p><a href="/federation">← Federation</a></p>
+  <h1>${isEdit ? "Edit exchange" : "Create exchange"}</h1>
+  ${errHtml}
+  <form id="ex-form">
+    ${isEdit ? `<input type="hidden" name="_rev" value="${escapeHtml(rev || "")}">` : ""}
+    <label>Name</label><input name="name" required value="${nameVal}">
+    <label>Description</label><textarea name="description" rows="2">${descVal}</textarea>
+    <label>Exchange profile</label>
+    <select name="profileId" required><option value="">— select —</option>${profileOpts}</select>
+    <p class="hint">Database that holds federated entries on this instance.</p>
+    ${isEdit ? `<label>exchangeId</label><input value="${exchangeIdVal}" readonly>` : `<p class="hint">A new exchangeId is generated on save.</p>`}
+    <label>Payload field names (comma-separated, optional)</label>
+    <input name="payloadFieldNames" value="${escapeHtml(payloadFields)}" placeholder="body, author">
+    <p class="hint">If empty, all payload keys that exist on the profile are imported. Internal fields: fedMessageId, fedOriginPeerId, fedOriginEntryId.</p>
+    <div class="actions"><button type="submit" class="btn">Save</button></div>
+  </form>
+  <p id="msg" class="msg" style="display:none;"></p>
+  ${isEdit ? `<p style="margin-top:2rem;"><button type="button" id="del-btn" style="background:#da3633;color:#fff;border:none;padding:0.5rem 1rem;border-radius:6px;cursor:pointer;">Delete exchange</button></p>` : ""}
+  <script>
+    (function() {
+      var form = document.getElementById('ex-form');
+      var msg = document.getElementById('msg');
+      form.addEventListener('submit', function(ev) {
+        ev.preventDefault();
+        var fd = new FormData(form);
+        var fields = String(fd.get('payloadFieldNames') || '').split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+        var body = {
+          name: fd.get('name'),
+          description: fd.get('description'),
+          profileId: fd.get('profileId'),
+          payloadFieldNames: fields
+        };
+        var url = ${isEdit ? `'/api/federation/exchanges/' + encodeURIComponent(${JSON.stringify(id)})` : "'/api/federation/exchanges'"};
+        fetch(url, { method: ${isEdit ? "'PUT'" : "'POST'"}, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+          .then(function(o) {
+            msg.style.display = 'block';
+            if (o.ok) {
+              msg.textContent = 'Saved.';
+              msg.className = 'msg ok';
+              if (!${isEdit ? "true" : "false"} && o.data.id) location.href = '/federation/exchanges/' + encodeURIComponent(o.data.id) + '/edit';
+            } else {
+              msg.textContent = (o.data && o.data.error) || 'Save failed';
+              msg.className = 'msg err';
+            }
+          });
+      });
+      var del = document.getElementById('del-btn');
+      if (del) del.addEventListener('click', function() {
+        if (!confirm('Delete this exchange?')) return;
+        del.disabled = true;
+        fetch('/api/federation/exchanges/' + encodeURIComponent(${JSON.stringify(id)}) + '/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ _rev: ${JSON.stringify(rev || "")} })
+        })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+          .then(function(o) {
+            if (o.ok && o.data.redirect) location.href = o.data.redirect;
+            else {
+              msg.style.display = 'block';
+              msg.textContent = (o.data && o.data.error) ? o.data.error : 'Delete failed';
+              msg.className = 'msg err';
+              del.disabled = false;
+            }
+          })
+          .catch(function(e) {
+            msg.style.display = 'block';
+            msg.textContent = e.message || 'Delete failed';
+            msg.className = 'msg err';
+            del.disabled = false;
+          });
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderEditFederationPeerPage(doc, err, exchanges, profiles, appUi, prefillApiKeyRef, defaultHubBaseUrl) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const isEdit = !!(doc && doc._id);
+  const id = doc && doc._id;
+  const rev = doc && doc._rev;
+  const returnToPath = federationPeerReturnToPath(isEdit, id);
+  const peerIdInitial = doc && doc.peerId ? String(doc.peerId) : "";
+  const apiKeyRefInitial =
+    (doc && doc.apiKeyRef ? String(doc.apiKeyRef).trim() : "") ||
+    (typeof prefillApiKeyRef === "string" ? prefillApiKeyRef.trim() : "");
+  const suggestedKeyIdFromPeer = federationApiKeyDocIdFromPeerId(peerIdInitial);
+  const exchangeIdVal = doc && doc.exchangeId ? String(doc.exchangeId) : "";
+  const exOpts = (Array.isArray(exchanges) ? exchanges : [])
+    .map((x) => {
+      const eid = x.exchangeId ? String(x.exchangeId) : "";
+      const sel = eid === exchangeIdVal ? " selected" : "";
+      return `<option value="${escapeHtml(eid)}"${sel}>${escapeHtml(x.name || eid)}</option>`;
+    })
+    .join("");
+  const profileIdVal = doc && doc.profileId ? String(doc.profileId) : "";
+  const profileOpts = (Array.isArray(profiles) ? profiles : [])
+    .map((p) => {
+      const pid = String(p._id);
+      const sel = pid === profileIdVal ? " selected" : "";
+      return `<option value="${escapeHtml(pid)}"${sel}>${escapeHtml((p.name && String(p.name).trim()) || pid)}</option>`;
+    })
+    .join("");
+  const role = doc && doc.role ? String(doc.role) : "home";
+  const enabled = !doc || doc.enabled !== false;
+  const hubBaseDefault =
+    typeof defaultHubBaseUrl === "string" ? defaultHubBaseUrl.trim() : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – ${isEdit ? "Edit peer" : "Create peer"}</title>
+  <style>
+    ${themeVars}
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 40rem; }
+    label { display: block; margin: 1rem 0 0.35rem; color: var(--app-label, #8b949e); }
+    input, select { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); }
+    .hint { font-size: 0.85rem; color: var(--app-label, #8b949e); margin-top: 0.25rem; line-height: 1.4; }
+    .key-preview { font-size: 0.9rem; margin-top: 0.35rem; }
+    .key-preview code { background: var(--app-table-bg, #161b22); padding: 0.15rem 0.35rem; border-radius: 4px; }
+    .peer-tools { margin: 0.75rem 0 1rem; }
+    .peer-tools a { margin-right: 1rem; }
+    .btn { background: #238636; color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; margin-top: 1.5rem; }
+    a { color: var(--app-link, #58a6ff); }
+    .msg-inline.err { color: #f85149; font-size: 0.85rem; margin-top: 0.35rem; }
+  </style>
+</head>
+<body>
+  <p><a href="/federation">← Federation</a></p>
+  <h1>${isEdit ? "Edit peer" : "Create peer"}</h1>
+  <p class="peer-tools">
+    <a href="#" id="create-api-key-link">Create API key for this peer</a>
+    <span id="open-api-key-wrap" style="display:${apiKeyRefInitial ? "inline" : "none"}"><a href="#" id="open-api-key-link">Open API key document</a></span>
+  </p>
+  ${isEdit ? `
+  <div id="fed-export-panel" style="margin:1rem 0 1.25rem;padding:1rem;border:1px solid var(--app-table-border,#30363d);border-radius:8px;background:var(--app-table-bg,#161b22);">
+    <strong>Export peer config for home</strong>
+    <p class="hint" style="margin:0.5rem 0 0.75rem;">After the API key secret is saved on the hub, download an encrypted file for the home server (<code>${escapeHtml(federationPeerExportFilename(peerIdInitial || "peerId"))}</code>). Use the <strong>same federation secret</strong> as the API key to encrypt the file and to import on home.</p>
+    <label for="fed-export-hub-url">Hub public URL (for home)</label>
+    <input id="fed-export-hub-url" type="url" value="${escapeHtml(hubBaseDefault)}" placeholder="https://hub.example.com" style="margin-bottom:0.5rem;">
+    <p class="hint">Used as <strong>Hub base URL</strong> on the imported home peer. Set <code>ELENKO_PUBLIC_BASE_URL</code> in <code>.env</code> if auto-detection is wrong.</p>
+    <label for="fed-export-password">Federation secret (encrypt file)</label>
+    <input id="fed-export-password" type="password" autocomplete="off" placeholder="Must match API key secret" style="margin-bottom:0.75rem;">
+    <button type="button" id="fed-export-btn" class="btn" style="margin-top:0;background:#21262d;border:1px solid var(--app-table-border,#30363d);">Export peer config</button>
+  </div>` : ""}
+  <form id="peer-form">
+    <label>Name</label><input name="name" value="${doc && doc.name ? escapeHtml(doc.name) : ""}">
+    <label>Role</label>
+    <select name="role"><option value="hub"${role === "hub" ? " selected" : ""}>hub (VPS inbox/outbox)</option><option value="home"${role === "home" ? " selected" : ""}>home (poll hub)</option></select>
+    <label for="peerId">peerId</label>
+    <input id="peerId" name="peerId" required value="${peerIdInitial ? escapeHtml(peerIdInitial) : ""}" placeholder="office">
+    <p class="hint">Stable federation identity for this instance (e.g. <code>office</code>). Set this <strong>before</strong> creating the API key — the suggested key document ID is derived from it. Use the same <code>peerId</code> and secret on the hub spoke registration.</p>
+    <p class="key-preview" id="key-id-preview-row" style="display:${peerIdInitial ? "block" : "none"}">Suggested API key document ID: <code id="fed-key-id-preview">${escapeHtml(suggestedKeyIdFromPeer || "—")}</code></p>
+    <p id="peer-id-err" class="msg-inline err" style="display:none"></p>
+    <label>Exchange</label><select name="exchangeId" required><option value="">—</option>${exOpts}</select>
+    <label>Local exchange profile</label><select name="profileId" required><option value="">—</option>${profileOpts}</select>
+    <label for="apiKeyRef">API key document ID (elenko_api_key _id)</label>
+    <input id="apiKeyRef" name="apiKeyRef" required value="${apiKeyRefInitial ? escapeHtml(apiKeyRefInitial) : ""}">
+    <p class="hint">Document ID in the config store — not the secret itself. After creating the key, this field is filled when you return here; <strong>Save</strong> the peer. You choose the secret when creating the key; hub and home must use the <strong>same secret value</strong> for this <code>peerId</code>. Document IDs may differ on each server.</p>
+    <label>Hub base URL (home role only)</label>
+    <input name="remoteBaseUrl" value="${doc && doc.remoteBaseUrl ? escapeHtml(doc.remoteBaseUrl) : ""}" placeholder="https://hub.example.com">
+    <label><input type="checkbox" name="enabled" ${enabled ? "checked" : ""}> Enabled</label>
+    <button type="submit" class="btn">Save</button>
+  </form>
+  <p id="key-save-banner" class="hint" style="display:none;background:#3d2e00;color:#f0c040;padding:0.65rem 0.85rem;border-radius:6px;"></p>
+  <p id="msg"></p>
+  ${isEdit ? `<button type="button" id="del-btn" style="margin-top:1rem;background:#da3633;color:#fff;border:none;padding:0.5rem 1rem;border-radius:6px;cursor:pointer;">Delete peer</button>` : ""}
+  <script>
+    (function() {
+      var returnToPath = ${JSON.stringify(returnToPath)};
+      var peerDocId = ${isEdit ? JSON.stringify(id) : "null"};
+      var apiKeyRefEdited = ${apiKeyRefInitial ? "true" : "false"};
+      function slugifyForKeyId(name) {
+        var s = String(name == null ? '' : name).trim().toLowerCase();
+        var slug = s.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'key';
+        return 'key_' + (slug.slice(0, 80) || 'key');
+      }
+      function suggestedKeyDocId(peerId) {
+        var p = String(peerId || '').trim();
+        return p ? slugifyForKeyId('federation ' + p) : '';
+      }
+      function syncKeyPreview() {
+        var peerEl = document.getElementById('peerId');
+        var previewRow = document.getElementById('key-id-preview-row');
+        var preview = document.getElementById('fed-key-id-preview');
+        var refEl = document.getElementById('apiKeyRef');
+        var openWrap = document.getElementById('open-api-key-wrap');
+        var openLink = document.getElementById('open-api-key-link');
+        var pid = peerEl ? String(peerEl.value || '').trim() : '';
+        var sid = suggestedKeyDocId(pid);
+        if (previewRow) previewRow.style.display = pid ? 'block' : 'none';
+        if (preview) preview.textContent = sid || '—';
+        if (refEl && !apiKeyRefEdited && sid) refEl.value = sid;
+        var refVal = refEl ? String(refEl.value || '').trim() : '';
+        if (openWrap) openWrap.style.display = refVal ? 'inline' : 'none';
+        if (openLink && refVal) {
+          openLink.href = '/apis/keys/' + encodeURIComponent(refVal) + '/edit?returnTo=' + encodeURIComponent(returnToPath);
+        }
+      }
+      var peerEl = document.getElementById('peerId');
+      var refEl = document.getElementById('apiKeyRef');
+      if (peerEl) peerEl.addEventListener('input', syncKeyPreview);
+      if (refEl) refEl.addEventListener('input', function() { apiKeyRefEdited = true; syncKeyPreview(); });
+      syncKeyPreview();
+      var params = new URLSearchParams(window.location.search);
+      if (params.get('apiKeyRef') && refEl) {
+        var returnedRef = String(params.get('apiKeyRef') || '').trim();
+        refEl.value = returnedRef;
+        apiKeyRefEdited = true;
+        syncKeyPreview();
+        var banner = document.getElementById('key-save-banner');
+        if (peerDocId && returnedRef) {
+          fetch('/api/federation/peers/' + encodeURIComponent(peerDocId), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ apiKeyRef: returnedRef })
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              if (banner) {
+                banner.style.display = 'block';
+                banner.textContent = o.ok
+                  ? 'API key document ID saved on this peer. You can use Sync (↻) on the Federation list.'
+                  : ((o.data && o.data.error) ? o.data.error : 'Could not save apiKeyRef — click Save on the peer form.');
+              }
+            })
+            .catch(function(e) {
+              if (banner) {
+                banner.style.display = 'block';
+                banner.textContent = e.message || 'Could not save apiKeyRef — click Save on the peer form.';
+              }
+            });
+        } else if (banner) {
+          banner.style.display = 'block';
+          banner.textContent = 'API key document ID filled in — click Save on this peer before using Sync (↻) on the Federation list.';
+        }
+        if (window.history && window.history.replaceState) {
+          params.delete('apiKeyRef');
+          var q = params.toString();
+          window.history.replaceState({}, '', returnToPath + (q ? '?' + q : ''));
+        }
+      }
+      var exportBtn = document.getElementById('fed-export-btn');
+      if (exportBtn && peerDocId) {
+        exportBtn.addEventListener('click', function() {
+          var pwdEl = document.getElementById('fed-export-password');
+          var hubEl = document.getElementById('fed-export-hub-url');
+          var password = pwdEl ? String(pwdEl.value || '') : '';
+          var hubBaseUrl = hubEl ? String(hubEl.value || '').trim() : '';
+          if (!password) {
+            document.getElementById('msg').textContent = 'Enter the federation secret (must match the API key on this peer).';
+            return;
+          }
+          if (!hubBaseUrl) {
+            document.getElementById('msg').textContent = 'Enter the hub public URL for home instances.';
+            return;
+          }
+          exportBtn.disabled = true;
+          fetch('/api/federation/peers/' + encodeURIComponent(peerDocId) + '/export-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: password, hubBaseUrl: hubBaseUrl })
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              exportBtn.disabled = false;
+              if (!o.ok) {
+                document.getElementById('msg').textContent = (o.data && o.data.error) ? o.data.error : 'Export failed';
+                return;
+              }
+              var blob = new Blob([JSON.stringify(o.data.file, null, 2)], { type: 'application/json' });
+              var a = document.createElement('a');
+              a.href = URL.createObjectURL(blob);
+              a.download = o.data.filename || 'elenko-federation-peer.json';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              URL.revokeObjectURL(a.href);
+              document.getElementById('msg').textContent = 'Download started. Import on the home server under Federation.';
+              if (pwdEl) pwdEl.value = '';
+            })
+            .catch(function(e) {
+              exportBtn.disabled = false;
+              document.getElementById('msg').textContent = e.message || 'Export failed';
+            });
+        });
+      }
+      document.getElementById('create-api-key-link').addEventListener('click', function(ev) {
+        ev.preventDefault();
+        var pid = peerEl ? String(peerEl.value || '').trim() : '';
+        if (!pid) {
+          var errEl = document.getElementById('peer-id-err');
+          if (errEl) {
+            errEl.textContent = 'Enter peerId before creating the API key.';
+            errEl.style.display = 'block';
+          }
+          if (peerEl) peerEl.focus();
+          return;
+        }
+        var errClear = document.getElementById('peer-id-err');
+        if (errClear) errClear.style.display = 'none';
+        var keyDocId = suggestedKeyDocId(pid);
+        var qs = new URLSearchParams();
+        qs.set('returnTo', returnToPath);
+        qs.set('apiKeyDocId', keyDocId);
+        qs.set('defaultName', 'Federation peer ' + pid);
+        qs.set('credentialField', 'apiKeyRef');
+        window.location.href = '/apis/keys/create?' + qs.toString();
+      });
+      document.getElementById('peer-form').addEventListener('submit', function(ev) {
+        ev.preventDefault();
+        var fd = new FormData(ev.target);
+        var body = {
+          name: fd.get('name'),
+          role: fd.get('role'),
+          peerId: fd.get('peerId'),
+          exchangeId: fd.get('exchangeId'),
+          profileId: fd.get('profileId'),
+          apiKeyRef: fd.get('apiKeyRef'),
+          remoteBaseUrl: fd.get('remoteBaseUrl'),
+          enabled: !!fd.get('enabled')
+        };
+        var url = ${isEdit ? `'/api/federation/peers/' + encodeURIComponent(${JSON.stringify(id)})` : "'/api/federation/peers'"};
+        fetch(url, { method: ${isEdit ? "'PUT'" : "'POST'"}, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+          .then(function(o) {
+            document.getElementById('msg').textContent = o.ok ? 'Saved.' : ((o.data && o.data.error) || 'Failed');
+            if (o.ok && !${isEdit ? "true" : "false"} && o.data.id) location.href = '/federation/peers/' + encodeURIComponent(o.data.id) + '/edit';
+          });
+      });
+      var del = document.getElementById('del-btn');
+      if (del) del.addEventListener('click', function() {
+        if (!confirm('Delete peer?')) return;
+        del.disabled = true;
+        fetch('/api/federation/peers/' + encodeURIComponent(${JSON.stringify(id)}) + '/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ _rev: ${JSON.stringify(rev || "")} })
+        })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+          .then(function(o) {
+            if (o.ok && o.data.redirect) location.href = o.data.redirect;
+            else {
+              document.getElementById('msg').textContent = (o.data && o.data.error) ? o.data.error : 'Delete failed';
+              del.disabled = false;
+            }
+          })
+          .catch(function(e) {
+            document.getElementById('msg').textContent = e.message || 'Delete failed';
+            del.disabled = false;
+          });
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef, prefillUserRef, prefillPasswordRef) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
@@ -17504,12 +20439,21 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
         ? "Stored value is used as the HTTP password (Basic/Digest)."
         : "Stored value is used as Bearer token and api-key header when the API uses bearer auth.";
   const keyPlaceholder = isEdit ? "Leave blank to keep current value" : "Secret value";
-  const returnToVal = typeof returnTo === "string" && returnTo.trim() ? escapeHtml(returnTo.trim()) : "";
+  const returnToRaw = typeof returnTo === "string" && returnTo.trim() ? returnTo.trim() : "";
+  const returnToVal = returnToRaw ? escapeHtml(returnToRaw) : "";
   const returnToInput = returnToVal ? `<input type="hidden" name="returnTo" id="returnTo" value="${returnToVal}">` : "";
+  const federationReturn = returnToRaw.startsWith("/federation");
+  const backLinkPath = federationReturn ? returnToRaw.split("?")[0] : "/apis";
+  const backLinkHref = escapeHtml(backLinkPath);
+  const backLinkLabel = federationReturn ? "← Federation peer" : "← REST APIs";
+  const cancelHref = backLinkHref;
   const errHtml = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
   const title = isEdit ? "Edit API key" : "Create / Update API key";
   const submitLabel = isEdit ? "Save" : "Create";
   const revInput = rev ? `<input type="hidden" id="rev" value="${escapeHtml(rev)}">` : "";
+  const federationHint = federationReturn
+    ? "<p class=\"sub\">This key is used for federation (hub inbox/outbox). Enter a <strong>Secret value</strong> you choose (not generated). The same secret must be stored in the matching key on the hub and on the home server. After saving you will return to the peer form.</p>"
+    : "";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -17558,11 +20502,12 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
 </head>
 <body>
   <div class="actions">
-    <a href="/apis">← REST APIs</a>
+    <a href="${backLinkHref}">${backLinkLabel}</a>
     <button type="submit" form="api-key-form" class="btn btn-primary" style="margin-left:1rem;">${submitLabel}</button>
-    <a href="/apis" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
+    <a href="${cancelHref}" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
   </div>
   <h1>${title}</h1>
+  ${federationHint}
   <p class="sub">Stored in the config store. The document ID is derived from the name (e.g. &quot;My Service&quot; → key_my-service). ${escapeHtml(keyLabelHint)}</p>
   ${errHtml}
   <form id="api-key-form" autocomplete="off">
@@ -17621,7 +20566,7 @@ function renderEditApiKeyPage(doc, err, returnTo, defaultName, appUi, defaultApi
           var sep = returnToVal.indexOf('?') !== -1 ? '&' : '?';
           setTimeout(function() { window.location.href = returnToVal + sep + credentialField + '=' + encodeURIComponent(data.id); }, 500);
         } else {
-          setTimeout(function() { window.location.href = '/apis'; }, keyId ? 600 : 800);
+          setTimeout(function() { window.location.href = ${JSON.stringify(backLinkPath)}; }, keyId ? 600 : 800);
         }
       } catch (err) {
         msgEl.textContent = err.message || 'Request failed';
@@ -18795,7 +21740,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice, appConfigAttachme
   const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
   const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option><option value="/account/unlock-keyfile">Provide key file</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/debug">Debug / flow log</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/debug">Debug / flow log</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/federation">Federation</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
 
   return `<!DOCTYPE html>
@@ -19266,11 +22211,36 @@ function toHex6(hex) {
   return "#" + s;
 }
 
-function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows = []) {
+function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows = [], federationCatalog = {}) {
   const appTheme = normalizeAppTheme(appUi && appUi.theme);
   const appThemeVars = getAppThemeVars(appTheme);
   const name = escapeHtml(doc.name || "");
   const description = escapeHtml(doc.description || "");
+  const databaseInfo = escapeHtml(doc.databaseInfo || "");
+  const fieldNamesEarly = Array.isArray(doc.fieldNames) ? doc.fieldNames : [];
+  const fedCfg = normalizeProfileFederation(doc.federation, fieldNamesEarly);
+  const fedExchanges = Array.isArray(federationCatalog.exchanges) ? federationCatalog.exchanges : [];
+  const fedPeers = Array.isArray(federationCatalog.peers) ? federationCatalog.peers : [];
+  const fedExchangeOptions = fedExchanges
+    .map((x) => {
+      const eid = x.exchangeId ? String(x.exchangeId) : "";
+      const sel = eid === fedCfg.exchangeId ? " selected" : "";
+      return `<option value="${escapeHtml(eid)}"${sel}>${escapeHtml(x.name || eid)}</option>`;
+    })
+    .join("");
+  const fedPeerOptions = fedPeers
+    .filter((p) => !fedCfg.exchangeId || String(p.exchangeId || "") === fedCfg.exchangeId)
+    .map((p) => {
+      const sel = p._id === fedCfg.peerDocId ? " selected" : "";
+      const label = (p.name || p.peerId || p._id) + " (" + (p.peerId || "") + ")";
+      return `<option value="${escapeHtml(p._id)}"${sel}>${escapeHtml(label)}</option>`;
+    })
+    .join("");
+  const fedMissing = federationMissingProfileFields(doc);
+  const fedFieldsHint =
+    fedMissing.length > 0
+      ? `<p class="sub" style="color:#f0c040;">Missing federation fields: ${escapeHtml(fedMissing.join(", "))}. Click <strong>Add federation fields</strong> before enabling.</p>`
+      : `<p class="sub">Federation field set is complete (${escapeHtml(getFederationProfileFieldNames().join(", "))}).</p>`;
   const hasStartIcon = profileHasStartIcon(doc);
   const startIconPreviewUrl = hasStartIcon
     ? `/api/profiles/${encodeURIComponent(doc._id)}/start-icon?t=${encodeURIComponent(doc._rev || "")}`
@@ -19296,6 +22266,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
   const themeText = toHex6(theme.text);
   const themeLabel = toHex6(theme.label);
   const themeLink = toHex6(theme.link);
+  const themeLinkVisited = toHex6(theme.linkVisited);
   const themeTableBg = toHex6(theme.tableBg);
   const themeTableHeaderBg = toHex6(theme.tableHeaderBg);
   const themeTableHeaderText = toHex6(theme.tableHeaderText);
@@ -19350,6 +22321,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
       : "Import from Guardian";
   const listFlowConfigsRaw = Array.isArray(doc.listFlowConfigs) ? doc.listFlowConfigs : [];
   const listFlowConfigs = listFlowConfigsRaw.map(normalizeListFlowConfigItem).filter(Boolean);
+  const listFlowButtonMode = normalizeListFlowButtonMode(doc);
   const allFlows = Array.isArray(flows)
     ? flows.map((f) => ({ id: f._id, name: f.name || f._id }))
     : [];
@@ -19548,6 +22520,24 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
     <input type="text" id="name" name="name" required placeholder="Profile name" value="${name}">
     <label for="description">Description</label>
     <textarea id="description" name="description" placeholder="Optional description">${description}</textarea>
+    <label for="databaseInfo" style="margin-top:1rem;">Database info (Markdown)</label>
+    <p class="sub" style="margin-top:0.25rem;">Optional. Add database usage information in Markdown format (links, lists, emphasis). When set, an info button on the database view opens this text for all users.</p>
+    <textarea id="databaseInfo" name="databaseInfo" placeholder="e.g. Feed mirrors, import notes…" rows="6">${databaseInfo}</textarea>
+    <h2 style="margin-top:1.5rem;font-size:1.1rem;">Federation</h2>
+    <p class="sub" style="margin-top:0.25rem;">Link this mailbox to an exchange and outbound peer. Flow steps <code>federationPublish</code> / <code>federationSync</code> use these settings when Param is empty or <code>@profile</code>.</p>
+    ${fedFieldsHint}
+    <p><button type="button" class="btn btn-secondary" id="add-federation-fields-btn" style="margin:0.5rem 0;">Add federation fields</button></p>
+    <label><input type="checkbox" id="federation-enabled" ${fedCfg.enabled ? "checked" : ""}> Enable federation for this profile</label>
+    <label for="federation-exchange-id" style="margin-top:0.75rem;">Exchange</label>
+    <select id="federation-exchange-id"><option value="">— select —</option>${fedExchangeOptions}</select>
+    <label for="federation-peer-doc-id">Outbound peer (this instance)</label>
+    <select id="federation-peer-doc-id"><option value="">— select —</option>${fedPeerOptions}</select>
+    <label for="federation-default-to">Default toPeerId (optional)</label>
+    <input type="text" id="federation-default-to" value="${escapeHtml(fedCfg.defaultToPeerId || "")}" placeholder="Recipient peerId when entry field is empty">
+    <label for="federation-to-field">Entry field for toPeerId</label>
+    <input type="text" id="federation-to-field" value="${escapeHtml(fedCfg.routing.toPeerIdField || "toPeerId")}">
+    <label for="federation-from-field">Entry field for fromPeerId (optional override)</label>
+    <input type="text" id="federation-from-field" value="${escapeHtml(fedCfg.routing.fromPeerIdField || "fromPeerId")}" placeholder="Default: peer document peerId">
     <label style="margin-top:1rem;">Start page icon</label>
     <p class="sub" style="margin-top:0.25rem;">Round icon on the home page (about 3.5&nbsp;rem on large screens). Colour fills the circle or becomes a 1&nbsp;mm border when an image is set. Square artwork is fine; stored as WebP with long edge ${PROFILE_START_ICON_MAX_EDGE}&nbsp;px (enough for Retina). JPEG, PNG, WebP, or GIF; max ${Math.round(MAX_START_ICON_BYTES / 1024)}&nbsp;KiB upload. Defaults from the profile name (hash).</p>
     <div class="profile-start-icon-block">
@@ -19577,6 +22567,8 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
       <div class="el-theme-row"><label for="theme-text">Text</label><input type="color" id="theme-text" value="${escapeHtml(themeText)}" aria-label="Text colour"><input type="text" id="theme-text-hex" value="${escapeHtml(themeText)}" placeholder="#e6edf3"></div>
       <div class="el-theme-row"><label for="theme-label">Label</label><input type="color" id="theme-label" value="${escapeHtml(themeLabel)}" aria-label="Label colour"><input type="text" id="theme-label-hex" value="${escapeHtml(themeLabel)}" placeholder="#8b949e"></div>
       <div class="el-theme-row"><label for="theme-link">Link</label><input type="color" id="theme-link" value="${escapeHtml(themeLink)}" aria-label="Link colour"><input type="text" id="theme-link-hex" value="${escapeHtml(themeLink)}" placeholder="#58a6ff"></div>
+      <div class="el-theme-row"><label for="theme-linkVisited">Visited link</label><input type="color" id="theme-linkVisited" value="${escapeHtml(themeLinkVisited)}" aria-label="Visited link colour"><input type="text" id="theme-linkVisited-hex" value="${escapeHtml(themeLinkVisited)}" placeholder="#99caff"></div>
+      <p class="sub" style="margin:0 0 0.5rem 0;">Visited colour applies to entry links you have already opened (browser history; also remembered in this tab for split view).</p>
       <div class="el-theme-row"><label for="theme-tableBg">Table background</label><input type="color" id="theme-tableBg" value="${escapeHtml(themeTableBg)}" aria-label="Table background"><input type="text" id="theme-tableBg-hex" value="${escapeHtml(themeTableBg)}" placeholder="#161b22"></div>
       <div class="el-theme-row"><label for="theme-tableHeaderBg">Table header bg</label><input type="color" id="theme-tableHeaderBg" value="${escapeHtml(themeTableHeaderBg)}" aria-label="Table header background"><input type="text" id="theme-tableHeaderBg-hex" value="${escapeHtml(themeTableHeaderBg)}" placeholder="#21262d"></div>
       <div class="el-theme-row"><label for="theme-tableHeaderText">Table header text</label><input type="color" id="theme-tableHeaderText" value="${escapeHtml(themeTableHeaderText)}" aria-label="Table header text"><input type="text" id="theme-tableHeaderText-hex" value="${escapeHtml(themeTableHeaderText)}" placeholder="#8b949e"></div>
@@ -19609,7 +22601,11 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
     <p class="sub" style="margin-top:0.25rem;">Text shown on the import button in the database view.</p>
     <input type="text" id="infoImportButtonTitle" name="infoImportButtonTitle" placeholder="e.g. Import from Guardian" value="${escapeHtml(infoImportButtonTitle)}">
     <label style="margin-top:1.5rem;">Database list flow buttons</label>
-    <p class="sub" style="margin-top:0.25rem;">When <strong>Select entries</strong> is active on the database list, these flows can be run on the selected entries. Buttons appear to the left of <strong>Delete selected</strong>. A warning is shown when more than 10 entries are selected.</p>
+    <p class="sub" style="margin-top:0.25rem;">Flows run on selected entries (bulk), or with no selection when <strong>Always show in list</strong> is set (profile-level run — e.g. federation sync). A warning is shown when more than 10 entries are selected.</p>
+    <div class="radio-group" style="margin:0.75rem 0;">
+      <label style="display:block;margin:0.35rem 0;"><input type="radio" name="listFlowButtonMode" value="select"${listFlowButtonMode === "select" ? " checked" : ""} style="width:auto;"> Show only when <strong>Select entries</strong> is active</label>
+      <label style="display:block;margin:0.35rem 0;"><input type="radio" name="listFlowButtonMode" value="always"${listFlowButtonMode === "always" ? " checked" : ""} style="width:auto;"> Always show in the database list (top bar)</label>
+    </div>
     <div id="list-flow-configs" style="margin-top:0.5rem;"></div>
     <button type="button" class="btn btn-secondary" id="add-list-flow-btn" style="margin-top:0.5rem;">Add flow button</button>
     <label for="entriesPageSize" style="margin-top:0.75rem;">Entries per page</label>
@@ -19996,6 +22992,22 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
         if (el) { navigator.clipboard.writeText(el.textContent).then(() => { copyProfileIdBtn.textContent = 'Copied'; setTimeout(() => { copyProfileIdBtn.textContent = 'Copy'; }, 1500); }); }
       };
     }
+    const addFedBtn = document.getElementById('add-federation-fields-btn');
+    if (addFedBtn) {
+      addFedBtn.onclick = async () => {
+        addFedBtn.disabled = true;
+        try {
+          const r = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/add-federation-fields', { method: 'POST' });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Failed');
+          window.location.reload();
+        } catch (e) {
+          msgEl.textContent = e.message || 'Failed';
+          msgEl.className = 'msg err';
+          addFedBtn.disabled = false;
+        }
+      };
+    }
     const reassignBtn = document.getElementById('reassign-entries-btn');
     const reassignMsg = document.getElementById('reassign-msg');
     const previousProfileIdInput = document.getElementById('previous-profile-id');
@@ -20022,7 +23034,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
       if (s.length === 3) s = s[0] + s[0] + s[1] + s[1] + s[2] + s[2];
       return '#' + s;
     }
-    const themeKeys = ['background', 'text', 'label', 'link', 'tableBg', 'tableHeaderBg', 'tableHeaderText', 'tableBorder'];
+    const themeKeys = ['background', 'text', 'label', 'link', 'linkVisited', 'tableBg', 'tableHeaderBg', 'tableHeaderText', 'tableBorder'];
     themeKeys.forEach(key => {
       const colorEl = document.getElementById('theme-' + key);
       const hexEl = document.getElementById('theme-' + key + '-hex');
@@ -20041,6 +23053,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
       msgEl.className = 'msg';
       const name = document.getElementById('name').value.trim();
       const description = document.getElementById('description').value.trim();
+      const databaseInfo = document.getElementById('databaseInfo') ? document.getElementById('databaseInfo').value : '';
       const customCss = document.getElementById('customCss').value;
       const _rev = document.getElementById('rev').value;
       const fieldRows = Array.from(document.getElementById('field-list').querySelectorAll('.field-row'));
@@ -20070,6 +23083,10 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
         text: toHex6Sync(document.getElementById('theme-text-hex')?.value) || document.getElementById('theme-text')?.value || '#e6edf3',
         label: toHex6Sync(document.getElementById('theme-label-hex')?.value) || document.getElementById('theme-label')?.value || '#8b949e',
         link: toHex6Sync(document.getElementById('theme-link-hex')?.value) || document.getElementById('theme-link')?.value || '#58a6ff',
+        linkVisited:
+          toHex6Sync(document.getElementById('theme-linkVisited-hex')?.value) ||
+          document.getElementById('theme-linkVisited')?.value ||
+          '#99caff',
         tableBg: toHex6Sync(document.getElementById('theme-tableBg-hex')?.value) || document.getElementById('theme-tableBg')?.value || '#161b22',
         tableHeaderBg: toHex6Sync(document.getElementById('theme-tableHeaderBg-hex')?.value) || document.getElementById('theme-tableHeaderBg')?.value || '#21262d',
         tableHeaderText: toHex6Sync(document.getElementById('theme-tableHeaderText-hex')?.value) || document.getElementById('theme-tableHeaderText')?.value || '#8b949e',
@@ -20083,6 +23100,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
             _rev,
             name,
             description,
+            databaseInfo: databaseInfo.trim(),
             startIconColor: (document.getElementById('start-icon-color-hex') && document.getElementById('start-icon-color-hex').value.trim()) || '',
             customCss,
             fieldNames,
@@ -20116,6 +23134,10 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
                 enabled: !!(enabledCb && enabledCb.checked)
               };
             }).filter(function(cfg) { return cfg.flowId; }),
+            listFlowButtonMode: (function() {
+              var r = document.querySelector('input[name="listFlowButtonMode"]:checked');
+              return r && r.value === 'always' ? 'always' : 'select';
+            })(),
             entriesPageSize: (document.getElementById('entriesPageSize') && document.getElementById('entriesPageSize').value) || '${ENTRIES_PAGE_SIZE}',
             searchAccentFolding: !!(document.getElementById('searchAccentFolding') && document.getElementById('searchAccentFolding').checked),
             splitView: {
@@ -20156,6 +23178,16 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
             encryption: {
               enabled: !!(document.getElementById('encryptionEnabled') && document.getElementById('encryptionEnabled').checked),
               ownerUsername: (document.getElementById('encryptionOwnerUsername') && document.getElementById('encryptionOwnerUsername').value) || ''
+            },
+            federation: {
+              enabled: !!(document.getElementById('federation-enabled') && document.getElementById('federation-enabled').checked),
+              exchangeId: (document.getElementById('federation-exchange-id') && document.getElementById('federation-exchange-id').value) || '',
+              peerDocId: (document.getElementById('federation-peer-doc-id') && document.getElementById('federation-peer-doc-id').value) || '',
+              defaultToPeerId: (document.getElementById('federation-default-to') && document.getElementById('federation-default-to').value.trim()) || '',
+              routing: {
+                toPeerIdField: (document.getElementById('federation-to-field') && document.getElementById('federation-to-field').value.trim()) || 'toPeerId',
+                fromPeerIdField: (document.getElementById('federation-from-field') && document.getElementById('federation-from-field').value.trim()) || 'fromPeerId'
+              }
             }
           })
         });
@@ -22756,6 +25788,7 @@ async function main() {
   await initCouch();
   await getAppUiConfig();
   startApiWorker();
+  startFederationWorker();
   startFlowWorker();
   await applyFlowLogLevelFromConfig();
   startTimerWorker();
