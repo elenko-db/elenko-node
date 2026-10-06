@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Shared helpers for install/upgrade-almalinux.sh (source, do not run directly).
+# Shared helpers for install/upgrade scripts (source, do not run directly).
+
+elenko_strip_cr() {
+  printf '%s' "$1" | tr -d '\r'
+}
 
 elenko_chmod_install_scripts() {
   local script_dir="$1"

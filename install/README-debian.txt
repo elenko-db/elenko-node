@@ -88,3 +88,16 @@ Upgrade
 Configuration
 -------------
 Edit .env in the install directory. See install/.env.example for variables.
+
+Troubleshooting
+---------------
+"Unknown option:" then help (no "Install complete."):
+  The script exited before doing anything — usually Windows CRLF in install/*.sh
+  or a stray character in the command. Fix on the server:
+    sed -i 's/\r$//' /opt/elenko/install/*.sh
+  Then re-run:
+    sudo bash /opt/elenko/install/install-debian.sh --install-dir /opt/elenko
+
+Check whether install actually ran:
+  test -d /opt/elenko/node_modules && test -f /opt/elenko/.env && echo ok
+  systemctl status elenko

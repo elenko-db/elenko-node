@@ -37,13 +37,14 @@ log_step() { printf '==> %s\n' "$1"; }
 log_ok() { printf '    %s\n' "$1"; }
 
 while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --install-dir) INSTALL_DIR="$2"; shift 2 ;;
-    --service-name) SERVICE_NAME="$2"; shift 2 ;;
-    --service-user) SERVICE_USER="$2"; shift 2 ;;
+  opt="$(elenko_strip_cr "$1")"
+  case "$opt" in
+    --install-dir) INSTALL_DIR="$(elenko_strip_cr "$2")"; shift 2 ;;
+    --service-name) SERVICE_NAME="$(elenko_strip_cr "$2")"; shift 2 ;;
+    --service-user) SERVICE_USER="$(elenko_strip_cr "$2")"; shift 2 ;;
     --no-restart) RESTART_SERVICE=0; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *) printf 'Unknown option: %q\n' "$opt" >&2; usage >&2; exit 1 ;;
   esac
 done
 

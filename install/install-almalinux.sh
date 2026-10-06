@@ -52,19 +52,20 @@ log_ok() { printf '    %s\n' "$1"; }
 log_warn() { printf '    WARNING: %s\n' "$1"; }
 
 while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --install-dir) INSTALL_DIR="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
-    --couchdb-url) COUCHDB_URL="$2"; shift 2 ;;
-    --couchdb-db) COUCHDB_DB="$2"; shift 2 ;;
-    --config-db) CONFIG_DB="$2"; shift 2 ;;
-    --service-user) SERVICE_USER="$2"; shift 2 ;;
-    --service-name) SERVICE_NAME="$2"; shift 2 ;;
-    --deploy-user) DEPLOY_USER="$2"; shift 2 ;;
+  opt="$(elenko_strip_cr "$1")"
+  case "$opt" in
+    --install-dir) INSTALL_DIR="$(elenko_strip_cr "$2")"; shift 2 ;;
+    --port) PORT="$(elenko_strip_cr "$2")"; shift 2 ;;
+    --couchdb-url) COUCHDB_URL="$(elenko_strip_cr "$2")"; shift 2 ;;
+    --couchdb-db) COUCHDB_DB="$(elenko_strip_cr "$2")"; shift 2 ;;
+    --config-db) CONFIG_DB="$(elenko_strip_cr "$2")"; shift 2 ;;
+    --service-user) SERVICE_USER="$(elenko_strip_cr "$2")"; shift 2 ;;
+    --service-name) SERVICE_NAME="$(elenko_strip_cr "$2")"; shift 2 ;;
+    --deploy-user) DEPLOY_USER="$(elenko_strip_cr "$2")"; shift 2 ;;
     --no-systemd) INSTALL_SYSTEMD=0; shift ;;
     --no-start) START_SERVICE=0; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *) printf 'Unknown option: %q\n' "$opt" >&2; usage >&2; exit 1 ;;
   esac
 done
 
