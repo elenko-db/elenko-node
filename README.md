@@ -2,6 +2,8 @@
 
 Node.js web app with **CouchDB**, run via **Docker**. The start page lists CouchDB documents that act as **Profiles** for "Elenko databases" (to be implemented later as sets of CouchDB documents).
 
+A description of the project with screenshots and an architecture overview can be found at [www.elenko.eu](https://www.elenko.eu/index.html)
+
 ## Quick start
 
 ```shell
