@@ -6,7 +6,10 @@ elenko_chmod_install_scripts() {
   if [[ ! -d "$script_dir" ]]; then
     return 0
   fi
-  chmod 755 "${script_dir}/install-almalinux.sh" "${script_dir}/upgrade-almalinux.sh" 2>/dev/null || true
+  chmod 755 \
+    "${script_dir}/install-almalinux.sh" "${script_dir}/upgrade-almalinux.sh" \
+    "${script_dir}/install-debian.sh" "${script_dir}/upgrade-debian.sh" \
+    2>/dev/null || true
   for f in "${script_dir}"/*.sh; do
     [[ -f "$f" ]] && chmod 755 "$f"
   done

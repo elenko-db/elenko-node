@@ -2372,6 +2372,8 @@ function buildProfileDocFromSource(baseProfile, name) {
   delete raw._id;
   delete raw._rev;
   delete raw.dbCode8;
+  /** Stubs without binary data break db.insert; copy route re-attaches start icon separately. */
+  delete raw._attachments;
   raw.type = "elenko_profile";
   raw.name = name;
   raw.createdAt = new Date().toISOString();
@@ -2435,53 +2437,62 @@ function buildProfileEntrySearchSelector(profileId, fieldNames, searchQuery, use
   return selector;
 }
 
-/** One semicolon-separated CSV line; supports "quoted" fields and doubled quotes (""). */
-function splitSemicolonCsvLine(line) {
-  const out = [];
+/**
+ * Parse semicolon-separated CSV (RFC 4180-style quoted fields).
+ * Newlines inside "..." belong to that field — must not split on line breaks first.
+ */
+function parseSemicolonCsvText(text) {
+  const s = String(text).replace(/^\uFEFF/, "");
+  const rows = [];
+  let row = [];
   let cur = "";
-  let i = 0;
   let inQuotes = false;
-  const s = String(line);
-  while (i < s.length) {
+
+  function finishRow() {
+    row.push(String(cur).trim());
+    cur = "";
+    if (row.some((cell) => cell !== "")) rows.push(row);
+    row = [];
+  }
+
+  for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (inQuotes) {
       if (c === '"') {
         if (s[i + 1] === '"') {
           cur += '"';
-          i += 2;
-          continue;
+          i++;
+        } else {
+          inQuotes = false;
         }
-        inQuotes = false;
-        i++;
-        continue;
+      } else {
+        cur += c;
       }
-      cur += c;
-      i++;
       continue;
     }
     if (c === '"') {
       inQuotes = true;
-      i++;
       continue;
     }
     if (c === ";") {
-      out.push(cur);
+      row.push(String(cur).trim());
       cur = "";
-      i++;
+      continue;
+    }
+    if (c === "\r") {
+      if (s[i + 1] === "\n") i++;
+      finishRow();
+      continue;
+    }
+    if (c === "\n") {
+      finishRow();
       continue;
     }
     cur += c;
-    i++;
   }
-  out.push(cur);
-  return out.map((cell) => String(cell).trim());
-}
-
-function parseSemicolonCsvText(text) {
-  const normalized = String(text).replace(/^\uFEFF/, "");
-  const lines = normalized.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-  const rows = lines.map((line) => splitSemicolonCsvLine(line));
-  while (rows.length > 0 && rows[rows.length - 1].every((c) => String(c).trim() === "")) {
+  row.push(String(cur).trim());
+  if (row.some((cell) => cell !== "")) rows.push(row);
+  while (rows.length > 0 && rows[rows.length - 1].every((cell) => cell === "")) {
     rows.pop();
   }
   return rows;
@@ -2492,13 +2503,10 @@ function csvDataRowIsEmpty(row) {
   return row.every((c) => String(c).trim() === "");
 }
 
-/** Escape one CSV cell for semicolon-separated export (RFC-style quoted fields). */
+/** Escape one CSV cell for semicolon-separated export (always quoted for safe round-trip). */
 function formatSemicolonCsvField(value) {
   const s = value == null ? "" : String(value);
-  if (/[;"\r\n]/.test(s) || /^\s|\s$/.test(s)) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
-  return s;
+  return `"${s.replace(/"/g, '""')}"`;
 }
 
 function formatSemicolonCsvRow(cells) {
@@ -3053,27 +3061,31 @@ async function recomputePrimaryKeysForProfileRecords(dbInstance, profileDoc) {
   }
 }
 
-function normalizeListFlowConfigItem(item) {
+function normalizeListFlowConfigItem(item, profileDoc) {
   if (!item || typeof item !== "object") return null;
   const flowId = typeof item.flowId === "string" ? item.flowId.trim() : "";
   if (!flowId) return null;
   const label = typeof item.label === "string" && item.label.trim() ? item.label.trim() : "Run flow";
   const enabled = item.enabled !== false && item.enabled !== "false";
-  return { flowId, label, enabled };
-}
-
-/** Database list flow buttons: "select" = show with Select entries mode; "always" = always in top bar. */
-function normalizeListFlowButtonMode(profileDoc) {
-  const raw =
-    profileDoc && typeof profileDoc.listFlowButtonMode === "string"
-      ? profileDoc.listFlowButtonMode.trim().toLowerCase()
-      : "";
-  return raw === "always" ? "always" : "select";
+  let showOnlyWhenSelect = true;
+  if (Object.prototype.hasOwnProperty.call(item, "showOnlyWhenSelect")) {
+    showOnlyWhenSelect = item.showOnlyWhenSelect !== false && item.showOnlyWhenSelect !== "false";
+  } else if (
+    profileDoc &&
+    typeof profileDoc.listFlowButtonMode === "string" &&
+    profileDoc.listFlowButtonMode.trim().toLowerCase() === "always"
+  ) {
+    showOnlyWhenSelect = false;
+  }
+  return { flowId, label, enabled, showOnlyWhenSelect };
 }
 
 function getProfileListFlowConfigs(profileDoc) {
   const raw = Array.isArray(profileDoc && profileDoc.listFlowConfigs) ? profileDoc.listFlowConfigs : [];
-  return raw.map(normalizeListFlowConfigItem).filter(Boolean).filter((c) => c.enabled);
+  return raw
+    .map((item) => normalizeListFlowConfigItem(item, profileDoc))
+    .filter(Boolean)
+    .filter((c) => c.enabled);
 }
 
 function profileAllowsListFlow(profileDoc, flowRef) {
@@ -12241,7 +12253,6 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
       infoImportFlowId,
       infoImportButtonTitle,
       listFlowConfigs: rawListFlowConfigs,
-      listFlowButtonMode: rawListFlowButtonMode,
       entriesPageSize,
       splitView,
       guardianFlowId,
@@ -12355,14 +12366,15 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
         : "Import from Guardian";
     doc.infoImportButtonTitle = importButtonTitle;
     if (Array.isArray(rawListFlowConfigs)) {
-      doc.listFlowConfigs = rawListFlowConfigs.map(normalizeListFlowConfigItem).filter(Boolean);
+      doc.listFlowConfigs = rawListFlowConfigs
+        .map((item) => normalizeListFlowConfigItem(item, doc))
+        .filter(Boolean);
     } else if (!Array.isArray(doc.listFlowConfigs)) {
       doc.listFlowConfigs = [];
     }
-    doc.listFlowButtonMode = normalizeListFlowButtonMode({
-      listFlowButtonMode:
-        typeof rawListFlowButtonMode === "string" ? rawListFlowButtonMode : doc.listFlowButtonMode,
-    });
+    if (Object.prototype.hasOwnProperty.call(doc, "listFlowButtonMode")) {
+      delete doc.listFlowButtonMode;
+    }
     const rawPageSize = Number(entriesPageSize);
     doc.entriesPageSize =
       Number.isFinite(rawPageSize) && rawPageSize >= ENTRIES_PAGE_SIZE_MIN && rawPageSize <= ENTRIES_PAGE_SIZE_MAX
@@ -16055,8 +16067,6 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
   } = pagination;
   const canBulkDelete = isAdmin && !encryptionLock;
   const listFlowConfigs = getProfileListFlowConfigs(doc);
-  const listFlowButtonMode = normalizeListFlowButtonMode(doc);
-  const listFlowButtonsAlways = listFlowButtonMode === "always";
   const canBulkSelect = !encryptionLock && (canBulkDelete || (canEdit && listFlowConfigs.length > 0));
   const recordsOnPage = Array.isArray(records) ? records.length : 0;
   const bulkSelectScopeCount =
@@ -16474,10 +16484,10 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
     <div class="topbar-actions">${
       canBulkSelect
         ? `<button type="button" id="toggle-select-mode" class="btn btn-secondary">Select entries</button>${listFlowConfigs
-            .map(
-              (cfg) =>
-                `<button type="button" class="btn btn-secondary entry-bulk-flow-btn" data-flow-id="${escapeHtml(cfg.flowId)}" style="display:${listFlowButtonsAlways ? "inline-block" : "none"};" disabled>${escapeHtml(cfg.label)}</button>`
-            )
+            .map((cfg) => {
+              const selectOnly = cfg.showOnlyWhenSelect !== false;
+              return `<button type="button" class="btn btn-secondary entry-bulk-flow-btn" data-flow-id="${escapeHtml(cfg.flowId)}" data-show-only-when-select="${selectOnly ? "1" : "0"}" style="display:${selectOnly ? "none" : "inline-block"};" disabled>${escapeHtml(cfg.label)}</button>`;
+            })
             .join("")}${canBulkDelete ? `<button type="button" id="delete-selected-btn" class="btn btn-danger" style="display:none;" disabled>Delete selected</button>` : ""}`
         : ""
     }${canEdit && !encryptionLock ? `<a href="/profile/${encodeURIComponent(doc._id)}/entry/new" class="btn btn-create-entry">Create entry</a>` : ""}</div>
@@ -16795,9 +16805,12 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       var searchQuery = ${JSON.stringify(searchQuery || "")};
       var scopeCount = ${JSON.stringify(bulkSelectScopeCount)};
       var recordsOnPage = ${JSON.stringify(recordsOnPage)};
-      var listFlowButtonMode = ${JSON.stringify(listFlowButtonMode)};
       var selectMode = false;
       var deleteAllInScope = false;
+
+      function flowBtnShowOnlyWhenSelect(btn) {
+        return btn && btn.getAttribute('data-show-only-when-select') !== '0';
+      }
 
       function rowChecks() {
         return Array.prototype.slice.call(document.querySelectorAll('.entry-delete-cb'));
@@ -16821,7 +16834,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
           deleteBtn.textContent = n > 0 ? ('Delete selected (' + n + ')') : 'Delete selected';
         }
         flowBtns.forEach(function(btn) {
-          btn.disabled = n === 0 && listFlowButtonMode !== 'always';
+          btn.disabled = n === 0 && flowBtnShowOnlyWhenSelect(btn);
         });
       }
       function syncSelectAllState() {
@@ -16843,8 +16856,8 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
       }
       function syncFlowButtonVisibility() {
         flowBtns.forEach(function(btn) {
-          btn.style.display =
-            listFlowButtonMode === 'always' || selectMode ? 'inline-block' : 'none';
+          var selectOnly = flowBtnShowOnlyWhenSelect(btn);
+          btn.style.display = !selectOnly || selectMode ? 'inline-block' : 'none';
         });
       }
       function setSelectMode(on) {
@@ -16899,7 +16912,7 @@ function renderElenkoDatabasePage(doc, records, role, pagination = {}) {
           var actionLabel = (btn.textContent || 'flow').trim();
           if (!flowId) return;
           if (count === 0) {
-            if (listFlowButtonMode !== 'always') {
+            if (flowBtnShowOnlyWhenSelect(btn)) {
               setMsg('Select at least one entry.', 'err');
               return;
             }
@@ -22320,8 +22333,9 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
       ? doc.infoImportButtonTitle.trim()
       : "Import from Guardian";
   const listFlowConfigsRaw = Array.isArray(doc.listFlowConfigs) ? doc.listFlowConfigs : [];
-  const listFlowConfigs = listFlowConfigsRaw.map(normalizeListFlowConfigItem).filter(Boolean);
-  const listFlowButtonMode = normalizeListFlowButtonMode(doc);
+  const listFlowConfigs = listFlowConfigsRaw
+    .map((item) => normalizeListFlowConfigItem(item, doc))
+    .filter(Boolean);
   const allFlows = Array.isArray(flows)
     ? flows.map((f) => ({ id: f._id, name: f.name || f._id }))
     : [];
@@ -22601,11 +22615,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
     <p class="sub" style="margin-top:0.25rem;">Text shown on the import button in the database view.</p>
     <input type="text" id="infoImportButtonTitle" name="infoImportButtonTitle" placeholder="e.g. Import from Guardian" value="${escapeHtml(infoImportButtonTitle)}">
     <label style="margin-top:1.5rem;">Database list flow buttons</label>
-    <p class="sub" style="margin-top:0.25rem;">Flows run on selected entries (bulk), or with no selection when <strong>Always show in list</strong> is set (profile-level run — e.g. federation sync). A warning is shown when more than 10 entries are selected.</p>
-    <div class="radio-group" style="margin:0.75rem 0;">
-      <label style="display:block;margin:0.35rem 0;"><input type="radio" name="listFlowButtonMode" value="select"${listFlowButtonMode === "select" ? " checked" : ""} style="width:auto;"> Show only when <strong>Select entries</strong> is active</label>
-      <label style="display:block;margin:0.35rem 0;"><input type="radio" name="listFlowButtonMode" value="always"${listFlowButtonMode === "always" ? " checked" : ""} style="width:auto;"> Always show in the database list (top bar)</label>
-    </div>
+    <p class="sub" style="margin-top:0.25rem;">Each button can stay visible in the top bar or appear only in <strong>Select entries</strong> mode. With no tick on that option, the flow runs at profile level when nothing is selected (e.g. federation sync). A warning is shown when more than 10 entries are selected.</p>
     <div id="list-flow-configs" style="margin-top:0.5rem;"></div>
     <button type="button" class="btn btn-secondary" id="add-list-flow-btn" style="margin-top:0.5rem;">Add flow button</button>
     <label for="entriesPageSize" style="margin-top:0.75rem;">Entries per page</label>
@@ -22879,6 +22889,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
       const flowId = cfg && cfg.flowId ? cfg.flowId : '';
       const label = cfg && cfg.label ? cfg.label : '';
       const enabled = !cfg || cfg.enabled !== false;
+      const showOnlyWhenSelect = !cfg || cfg.showOnlyWhenSelect !== false;
       let flowOpts = '<option value="">— Choose flow —</option>';
       allFlows.forEach(function(f) {
         flowOpts += '<option value="' + esc(f.id) + '"' + (flowId === f.id ? ' selected' : '') + '>' + esc(f.name || f.id) + '</option>';
@@ -22893,13 +22904,16 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
         '<select class="list-flow-id" title="Flow">' + flowOpts + '</select>' +
         '<input type="text" class="list-flow-label" placeholder="Button label" value="' + esc(label) + '" style="min-width:10rem;">' +
         '<label style="display:flex;align-items:center;gap:0.35rem;margin:0;white-space:nowrap;"><input type="checkbox" class="list-flow-enabled"' + (enabled ? ' checked' : '') + ' style="width:auto;"> Enabled</label>' +
+        '<label style="display:flex;align-items:center;gap:0.35rem;margin:0;white-space:nowrap;font-size:0.85rem;"><input type="checkbox" class="list-flow-select-only"' + (showOnlyWhenSelect ? ' checked' : '') + ' style="width:auto;"> Show only when Select entries is active</label>' +
         '<button type="button" class="btn btn-remove" aria-label="Remove" title="Remove">✕</button>';
       row.querySelector('.btn-remove').onclick = function() { row.remove(); };
       listFlowConfigsEl.appendChild(row);
     }
 
     if (addListFlowBtn) {
-      addListFlowBtn.onclick = function() { addListFlowRow({ enabled: true, label: 'Run flow', flowId: '' }); };
+      addListFlowBtn.onclick = function() {
+        addListFlowRow({ enabled: true, label: 'Run flow', flowId: '', showOnlyWhenSelect: true });
+      };
     }
     (initialListFlowConfigs.length ? initialListFlowConfigs : []).forEach(function(cfg) { addListFlowRow(cfg); });
 
@@ -23128,16 +23142,14 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
               var flowSel = row.querySelector('.list-flow-id');
               var labelIn = row.querySelector('.list-flow-label');
               var enabledCb = row.querySelector('.list-flow-enabled');
+              var selectOnlyCb = row.querySelector('.list-flow-select-only');
               return {
                 flowId: flowSel ? flowSel.value.trim() : '',
                 label: labelIn ? labelIn.value.trim() : '',
-                enabled: !!(enabledCb && enabledCb.checked)
+                enabled: !!(enabledCb && enabledCb.checked),
+                showOnlyWhenSelect: !!(selectOnlyCb && selectOnlyCb.checked)
               };
             }).filter(function(cfg) { return cfg.flowId; }),
-            listFlowButtonMode: (function() {
-              var r = document.querySelector('input[name="listFlowButtonMode"]:checked');
-              return r && r.value === 'always' ? 'always' : 'select';
-            })(),
             entriesPageSize: (document.getElementById('entriesPageSize') && document.getElementById('entriesPageSize').value) || '${ENTRIES_PAGE_SIZE}',
             searchAccentFolding: !!(document.getElementById('searchAccentFolding') && document.getElementById('searchAccentFolding').checked),
             splitView: {
@@ -24371,7 +24383,7 @@ function renderDataExportImportPage(profiles, appUi) {
 
   <div id="export-data-section" class="section">
     <button type="button" id="export-data-btn" class="btn btn-primary" disabled title="Select an Elenko database first">Export data</button>
-    <p class="sub" style="margin-top:0.75rem;">Downloads a semicolon-separated CSV file. The first row lists profile field names (same format as import with header matching enabled).</p>
+    <p class="sub" style="margin-top:0.75rem;">Downloads a semicolon-separated CSV file (every cell quoted; line breaks inside text stay inside quotes). The first row lists profile field names (same format as import with header matching enabled).</p>
   </div>
 
   <div id="import-data-section" class="section" style="display:none;">
