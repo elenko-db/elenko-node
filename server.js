@@ -411,6 +411,40 @@ const DEFAULT_APP_THEME = {
   tableHeaderBg: "#21262d",
   tableHeaderText: "#8b949e",
   tableBorder: "#21262d",
+  btnPrimaryBg: "#238636",
+  btnPrimaryText: "#ffffff",
+  btnPrimaryHoverBg: "#2ea043",
+  btnSecondaryBg: "#21262d",
+  btnSecondaryText: "#ffffff",
+  btnSecondaryHoverBg: "#30363d",
+  mainNavBg: "#21262d",
+  mainNavText: "#ffffff",
+  mainNavBorder: "#30363d",
+  mainNavHoverBg: "#30363d",
+  backNavColor: "#58a6ff",
+};
+
+/** Light theme preset (from standard bright app design export). Colours only — not logo/login copy. */
+const BRIGHT_APP_THEME_PRESET = {
+  background: "#ffffff",
+  text: "#000000",
+  label: "#800000",
+  link: "#2254ff",
+  tableBg: "#d2d2d2",
+  tableHeaderBg: "#556375",
+  tableHeaderText: "#000000",
+  tableBorder: "#3e4755",
+  btnPrimaryBg: "#238636",
+  btnPrimaryText: "#ffffff",
+  btnPrimaryHoverBg: "#2ea043",
+  btnSecondaryBg: "#777a84",
+  btnSecondaryText: "#ffffff",
+  btnSecondaryHoverBg: "#777a84",
+  mainNavBg: "#21262d",
+  mainNavText: "#ffffff",
+  mainNavBorder: "#30363d",
+  mainNavHoverBg: "#30363d",
+  backNavColor: "#2254ff",
 };
 
 function normalizeAppTheme(theme) {
@@ -428,11 +462,109 @@ function normalizeAppTheme(theme) {
     tableHeaderBg: get("tableHeaderBg"),
     tableHeaderText: get("tableHeaderText"),
     tableBorder: get("tableBorder"),
+    btnPrimaryBg: get("btnPrimaryBg"),
+    btnPrimaryText: get("btnPrimaryText"),
+    btnPrimaryHoverBg: get("btnPrimaryHoverBg"),
+    btnSecondaryBg: get("btnSecondaryBg"),
+    btnSecondaryText: get("btnSecondaryText"),
+    btnSecondaryHoverBg: get("btnSecondaryHoverBg"),
+    mainNavBg: get("mainNavBg"),
+    mainNavText: get("mainNavText"),
+    mainNavBorder: get("mainNavBorder"),
+    mainNavHoverBg: get("mainNavHoverBg"),
+    backNavColor: get("backNavColor"),
   };
 }
 
+function getAppThemeBackNavCss() {
+  return `
+    .actions { margin-bottom: 1.5rem; }
+    a.app-back-start,
+    .actions > a.app-back-start,
+    .actions > a:first-of-type:not(.btn):not(.btn-secondary) {
+      color: var(--app-back-nav-color, var(--app-link, #58a6ff));
+      text-decoration: none;
+      margin-right: 1rem;
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    a.app-back-start:hover,
+    .actions > a.app-back-start:hover,
+    .actions > a:first-of-type:not(.btn):not(.btn-secondary):hover {
+      text-decoration: underline;
+    }
+    @media (max-width: 768px) {
+      a.app-back-start,
+      .actions > a.app-back-start,
+      .actions > a:first-of-type:not(.btn):not(.btn-secondary) {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
+    .form-cancel {
+      display: inline-block;
+      margin-top: 1rem;
+      color: var(--app-link, #58a6ff);
+      text-decoration: none;
+      font-size: 1rem;
+    }
+    .form-cancel:hover { text-decoration: underline; }`;
+}
+
+function getAppThemeButtonCss() {
+  return `
+    .btn-primary,
+    .btn-flow,
+    button.btn:not(.btn-secondary):not(.btn-logout):not(.btn-upload-key):not(.btn-regen-key):not(.btn-remove-key):not(.btn-delete-user):not(.btn-danger),
+    a.btn:not(.btn-secondary):not(.btn-logout),
+    input[type="submit"].btn:not(.btn-secondary) {
+      background: var(--app-btn-primary-bg) !important;
+      color: var(--app-btn-primary-text) !important;
+    }
+    .btn-primary:hover,
+    .btn-flow:hover,
+    button.btn:not(.btn-secondary):not(.btn-logout):not(.btn-upload-key):not(.btn-regen-key):not(.btn-remove-key):not(.btn-delete-user):not(.btn-danger):hover,
+    a.btn:not(.btn-secondary):not(.btn-logout):hover,
+    .btn:hover:not(.btn-secondary):not(.btn-logout):not(.btn-upload-key):not(.btn-regen-key):not(.btn-remove-key):not(.btn-delete-user):not(.btn-danger) {
+      background: var(--app-btn-primary-hover-bg) !important;
+      color: var(--app-btn-primary-text) !important;
+    }
+    .btn-secondary,
+    a.btn-secondary,
+    button.btn-secondary {
+      background: var(--app-btn-secondary-bg) !important;
+      color: var(--app-btn-secondary-text) !important;
+      border: none !important;
+    }
+    .btn-secondary:hover,
+    a.btn-secondary:hover,
+    button.btn-secondary:hover {
+      background: var(--app-btn-secondary-hover-bg) !important;
+      color: var(--app-btn-secondary-text) !important;
+    }
+    .nav-select,
+    .btn-logout {
+      background: var(--app-main-nav-bg) !important;
+      color: var(--app-main-nav-text) !important;
+      border: 1px solid var(--app-main-nav-border) !important;
+    }
+    .nav-select:hover,
+    .btn-logout:hover {
+      background: var(--app-main-nav-hover-bg) !important;
+      color: var(--app-main-nav-text) !important;
+    }
+    a.btn-logout:hover { text-decoration: none !important; }`;
+}
+
 function getAppThemeVars(theme) {
-  const t = theme && typeof theme === "object" ? theme : { ...DEFAULT_APP_THEME };
+  const t = normalizeAppTheme(theme);
   return `
     :root {
       --app-bg: ${escapeHtml(t.background)};
@@ -443,7 +575,20 @@ function getAppThemeVars(theme) {
       --app-table-header-bg: ${escapeHtml(t.tableHeaderBg)};
       --app-table-header-text: ${escapeHtml(t.tableHeaderText)};
       --app-table-border: ${escapeHtml(t.tableBorder)};
-    }`;
+      --app-btn-primary-bg: ${escapeHtml(t.btnPrimaryBg)};
+      --app-btn-primary-text: ${escapeHtml(t.btnPrimaryText)};
+      --app-btn-primary-hover-bg: ${escapeHtml(t.btnPrimaryHoverBg)};
+      --app-btn-secondary-bg: ${escapeHtml(t.btnSecondaryBg)};
+      --app-btn-secondary-text: ${escapeHtml(t.btnSecondaryText)};
+      --app-btn-secondary-hover-bg: ${escapeHtml(t.btnSecondaryHoverBg)};
+      --app-main-nav-bg: ${escapeHtml(t.mainNavBg)};
+      --app-main-nav-text: ${escapeHtml(t.mainNavText)};
+      --app-main-nav-border: ${escapeHtml(t.mainNavBorder)};
+      --app-main-nav-hover-bg: ${escapeHtml(t.mainNavHoverBg)};
+      --app-back-nav-color: ${escapeHtml(t.backNavColor)};
+    }
+    ${getAppThemeButtonCss()}
+    ${getAppThemeBackNavCss()}`;
 }
 
 function normalizeEntryFieldType(raw) {
@@ -5496,6 +5641,67 @@ function normalizeProfileListLayout(raw) {
   return out;
 }
 
+/** Group row plus consecutive profile rows until the next folder (for folder-scoped export). */
+function extractProfileListLayoutFolderSlice(layout, groupId) {
+  const layoutNorm = normalizeProfileListLayout(layout);
+  const gid = typeof groupId === "string" ? groupId.trim() : "";
+  if (!gid) return null;
+  const idx = layoutNorm.findIndex((x) => x.kind === "group" && x.id === gid);
+  if (idx < 0) return null;
+  const slice = [layoutNorm[idx]];
+  for (let i = idx + 1; i < layoutNorm.length && layoutNorm[i].kind === "profile"; i++) {
+    slice.push(layoutNorm[i]);
+  }
+  return slice;
+}
+
+function mergeGroupLayoutItemFromImport(existing, incoming) {
+  const ex = existing && existing.kind === "group" ? existing : null;
+  const inc = incoming && incoming.kind === "group" ? incoming : null;
+  if (!inc) return ex;
+  if (!ex) return { ...inc };
+  const out = { kind: "group", id: ex.id, label: inc.label || ex.label };
+  const color = inc.color != null && String(inc.color).trim() ? normalizeLayoutItemColor(inc.color) : "";
+  if (color) out.color = color;
+  else if (ex.color) out.color = ex.color;
+  const iconFile = inc.iconFile != null ? normalizeGroupIconFile(inc.iconFile) : "";
+  if (iconFile) out.iconFile = iconFile;
+  return out;
+}
+
+/**
+ * Merge a folder application package into the live start-page layout.
+ * Imported profiles move into the target folder; other folder members stay; theme is not touched here.
+ */
+function mergeFolderPackageIntoProfileListLayout(existingLayout, incomingSlice) {
+  const incoming = normalizeProfileListLayout(incomingSlice);
+  if (!incoming.length || incoming[0].kind !== "group") {
+    return normalizeProfileListLayout(existingLayout);
+  }
+  const inGroup = incoming[0];
+  const importedProfiles = incoming.slice(1).filter((x) => x.kind === "profile");
+  const importedIds = new Set(importedProfiles.map((p) => p.profileId));
+
+  let layout = normalizeProfileListLayout(existingLayout);
+  layout = layout.filter((item) => !(item.kind === "profile" && importedIds.has(item.profileId)));
+
+  let groupIdx = layout.findIndex((x) => x.kind === "group" && x.id === inGroup.id);
+  if (groupIdx >= 0) {
+    const mergedGroup = mergeGroupLayoutItemFromImport(layout[groupIdx], inGroup);
+    const keptFolderProfiles = [];
+    let endIdx = groupIdx + 1;
+    while (endIdx < layout.length && layout[endIdx].kind === "profile") {
+      if (!importedIds.has(layout[endIdx].profileId)) keptFolderProfiles.push(layout[endIdx]);
+      endIdx++;
+    }
+    const newBlock = [mergedGroup, ...importedProfiles, ...keptFolderProfiles];
+    layout = [...layout.slice(0, groupIdx), ...newBlock, ...layout.slice(endIdx)];
+  } else {
+    layout = [...layout, inGroup, ...importedProfiles];
+  }
+  return normalizeProfileListLayout(layout);
+}
+
 /** Ordered sections for home / profiles list (groups, loose blocks, unlisted profiles at end). */
 function buildProfileListSections(profiles, layout) {
   const list = Array.isArray(profiles) ? profiles : [];
@@ -6293,8 +6499,33 @@ async function pushExportAttachment(attachments, dbInstance, store, docId, attac
   }
 }
 
-async function collectStartIconExportAttachments(attachments, scope, docsDb, docsConfig, profileIdForScope) {
+async function collectStartIconExportAttachments(
+  attachments,
+  scope,
+  docsDb,
+  docsConfig,
+  profileIdForScope,
+  folderGroupId
+) {
   const profileScopeId = profileIdForScope != null ? String(profileIdForScope) : "";
+  const folderGid = folderGroupId != null ? String(folderGroupId).trim() : "";
+  if (scope === "folder") {
+    for (const doc of docsDb || []) {
+      if (!doc || doc.type !== "elenko_profile") continue;
+      const fn = typeof doc.startIconFile === "string" ? doc.startIconFile.trim() : "";
+      if (fn) await pushExportAttachment(attachments, db, "db", doc._id, fn);
+    }
+    if (folderGid && configDb) {
+      for (const doc of docsConfig || []) {
+        if (!doc || doc.type !== "elenko_app_config") continue;
+        const layout = normalizeProfileListLayout(doc.profileListLayout);
+        const group = layout.find((x) => x.kind === "group" && x.id === folderGid);
+        const fn = group && typeof group.iconFile === "string" ? group.iconFile.trim() : "";
+        if (fn) await pushExportAttachment(attachments, configDb, "configDb", doc._id, fn);
+      }
+    }
+    return;
+  }
   for (const doc of docsDb || []) {
     if (!doc || doc.type !== "elenko_profile") continue;
     if (scope === "profile" && doc._id !== profileScopeId) continue;
@@ -6399,11 +6630,13 @@ async function applyExportAttachments(attachments, errors) {
   return applied;
 }
 
-async function buildConfigExport(scope, profileId) {
+async function buildConfigExport(scope, profileId, groupId) {
   const docsDb = [];
   const docsConfig = [];
   const seenConfig = new Set();
   const seenDb = new Set();
+  let exportFolderGroupId = null;
+  let exportFolderLabel = null;
 
   const addDb = (doc) => {
     if (!doc || !EXPORTABLE_DB_TYPES.has(doc.type)) return;
@@ -6434,7 +6667,7 @@ async function buildConfigExport(scope, profileId) {
       if (appDoc) addConfig(appDoc);
     }
     const attachments = [];
-    await collectStartIconExportAttachments(attachments, scope, docsDb, docsConfig, profileId);
+    await collectStartIconExportAttachments(attachments, scope, docsDb, docsConfig, profileId, null);
     return {
       version: CONFIG_EXPORT_VERSION,
       scope: "profile",
@@ -6445,9 +6678,38 @@ async function buildConfigExport(scope, profileId) {
     };
   }
 
-  const profileIds = scope === "all"
-    ? (await db.find({ selector: { type: "elenko_profile" }, fields: ["_id"], limit: 1000 })).docs.map((p) => p._id)
-    : (profileId ? [profileId] : []);
+  if (scope === "folder") {
+    exportFolderGroupId = typeof groupId === "string" ? groupId.trim() : "";
+    if (!exportFolderGroupId) {
+      throw new Error("Select a start page folder to export.");
+    }
+    if (!configDb) throw new Error("Config store not available");
+    const appDoc = await findCanonicalAppConfigDoc();
+    if (!appDoc) throw new Error("No application configuration found.");
+    const slice = extractProfileListLayoutFolderSlice(appDoc.profileListLayout, exportFolderGroupId);
+    if (!slice) throw new Error("Folder not found in start page layout.");
+    exportFolderLabel = slice[0].label || exportFolderGroupId;
+    addConfig({
+      type: "elenko_app_config",
+      _id: appDoc._id,
+      profileListLayout: slice,
+    });
+  }
+
+  let profileIds = [];
+  if (scope === "all") {
+    profileIds = (await db.find({ selector: { type: "elenko_profile" }, fields: ["_id"], limit: 1000 })).docs.map(
+      (p) => p._id
+    );
+  } else if (scope === "folder") {
+    const slice = extractProfileListLayoutFolderSlice(
+      (docsConfig.find((d) => d && d.type === "elenko_app_config") || {}).profileListLayout,
+      exportFolderGroupId
+    );
+    profileIds = (slice || []).filter((x) => x.kind === "profile").map((x) => x.profileId);
+  } else if (profileId) {
+    profileIds = [profileId];
+  }
 
   let allTimerDocs = [];
   if (configDb && profileIds.length > 0) {
@@ -6589,8 +6851,15 @@ async function buildConfigExport(scope, profileId) {
   }
 
   const attachments = [];
-  await collectStartIconExportAttachments(attachments, scope, docsDb, docsConfig, profileId);
-  return {
+  await collectStartIconExportAttachments(
+    attachments,
+    scope,
+    docsDb,
+    docsConfig,
+    profileId,
+    exportFolderGroupId
+  );
+  const out = {
     version: CONFIG_EXPORT_VERSION,
     scope,
     profileId: scope === "profile" ? profileId || null : null,
@@ -6598,6 +6867,11 @@ async function buildConfigExport(scope, profileId) {
     documents: { db: docsDb, configDb: docsConfig },
     attachments: attachments.length > 0 ? attachments : undefined,
   };
+  if (scope === "folder") {
+    out.groupId = exportFolderGroupId;
+    out.folderLabel = exportFolderLabel;
+  }
+  return out;
 }
 
 /**
@@ -6659,6 +6933,37 @@ async function upsertAppConfigFromImport(rawDoc, overwrite) {
   return 1;
 }
 
+/** Folder application packages carry only a layout slice; merge without changing theme or CouchDB settings. */
+async function upsertAppConfigFromFolderImport(rawDoc, overwrite) {
+  if (!configDb) return 0;
+  if (!overwrite) return 0;
+  const incoming = stripImportDocAttachments(rawDoc);
+  const incomingSlice = normalizeProfileListLayout(incoming.profileListLayout);
+  if (!incomingSlice.length || incomingSlice[0].kind !== "group") {
+    throw new Error("Invalid folder package: missing folder layout.");
+  }
+
+  const canonical = await findCanonicalAppConfigDoc();
+  const mergedLayout = mergeFolderPackageIntoProfileListLayout(
+    canonical ? canonical.profileListLayout : [],
+    incomingSlice
+  );
+
+  if (!canonical) {
+    await configDb.insert({
+      type: "elenko_app_config",
+      theme: { ...DEFAULT_APP_THEME },
+      profileListLayout: mergedLayout,
+    });
+  } else {
+    await configDb.insert({
+      ...canonical,
+      profileListLayout: mergedLayout,
+    });
+  }
+  return 1;
+}
+
 /** Export strips api*Ref; on overwrite keep target secrets when import carries no refs. */
 function preserveElenkoApiCredentialRefsOnImport(incoming, existing) {
   if (!incoming || incoming.type !== "elenko_api" || !existing || existing.type !== "elenko_api") {
@@ -6678,6 +6983,7 @@ async function applyConfigImport(data, overwrite) {
   const errors = [];
   let importedDb = 0;
   let importedConfig = 0;
+  const importScope = data && data.scope === "folder" ? "folder" : "full";
   const payload = data && data.documents;
   if (!payload || typeof payload !== "object") {
     return { ok: false, error: "Invalid export format: missing documents" };
@@ -6725,8 +7031,20 @@ async function applyConfigImport(data, overwrite) {
         continue;
       }
       if (toInsert.type === "elenko_app_config") {
-        await upsertAppConfigFromImport(doc, overwrite);
-        importedConfig++;
+        try {
+          if (importScope === "folder") {
+            await upsertAppConfigFromFolderImport(doc, overwrite);
+          } else {
+            await upsertAppConfigFromImport(doc, overwrite);
+          }
+          importedConfig++;
+        } catch (mergeErr) {
+          errors.push({
+            id: id || "(app config)",
+            type: doc.type,
+            message: mergeErr.message || String(mergeErr),
+          });
+        }
         continue;
       }
       if (id) {
@@ -9783,12 +10101,18 @@ app.post(
 app.post("/api/config-export", requireAdmin, async (req, res) => {
   try {
     const body = req.body || {};
-    const scope = body.scope === "all" ? "all" : "profile";
+    const scopeRaw = typeof body.scope === "string" ? body.scope.trim() : "profile";
+    const scope =
+      scopeRaw === "all" ? "all" : scopeRaw === "folder" ? "folder" : "profile";
     const profileId = scope === "profile" && typeof body.profileId === "string" ? body.profileId.trim() : null;
+    const groupId = scope === "folder" && typeof body.groupId === "string" ? body.groupId.trim() : null;
     if (scope === "profile" && !profileId) {
       return res.status(400).json({ error: "Select an Elenko database for export." });
     }
-    const data = await buildConfigExport(scope, profileId);
+    if (scope === "folder" && !groupId) {
+      return res.status(400).json({ error: "Select a start page folder to export." });
+    }
+    const data = await buildConfigExport(scope, profileId, groupId);
     res.json({ ok: true, data });
   } catch (err) {
     console.error("Config export error:", err);
@@ -17098,7 +17422,7 @@ function renderDeletionsPage(batches, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Profiles</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a></div>
   <h1>Marked for deletion</h1>
   <p class="sub">Documents marked when deleting a profile. Delete them permanently below.</p>
   ${batchRows}
@@ -17225,7 +17549,7 @@ function renderEntryFormsListPage(forms, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Profiles</a><a href="/entry-forms/create" class="btn">Create Single Entry form</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a><a href="/entry-forms/create" class="btn">Create Single Entry form</a></div>
   <h1>Entry forms</h1>
   <p class="sub">Configure how a single database entry is displayed (colours and field layout). Assign a form to a profile on the profile edit page.</p>
   <table>
@@ -17473,7 +17797,7 @@ function renderFlowsListPage(flows, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Start</a><a href="/flows/create" class="btn">Create Flow</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a><a href="/flows/create" class="btn">Create Flow</a></div>
   <h1>Flows</h1>
   <p class="sub">Multi-step pipelines: log (passthrough), Call API, Send to Local Database. Steps run in order; each step receives the previous step&apos;s output. Use a Flow in an entry form by selecting it in the flow configuration.</p>
   <table>
@@ -17644,7 +17968,7 @@ function renderProfilesListPage(profiles, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Start</a><a href="/profile/create" class="btn">Create Elenko database</a><a href="/profile-list-layout">List layout</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a><a href="/profile/create" class="btn">Create Elenko database</a><a href="/profile-list-layout">List layout</a></div>
   <h1>Elenko profiles</h1>
   <p class="sub">All database profiles. Folders match the start page layout (<a href="/profile-list-layout">edit layout</a>). Name opens the profile edit page (not the entry list). Use ⧉ to duplicate a profile (entries are not copied).</p>
   <table>
@@ -17825,7 +18149,7 @@ function renderTimersListPage(timers, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Start</a><a href="/timers/create" class="btn">Create timer</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a><a href="/timers/create" class="btn">Create timer</a></div>
   <h1>Timers</h1>
   <p class="sub">Run a flow on a schedule. Start date and time use the server&apos;s local timezone. Toggle off to pause without deleting. Without an entry ID, the flow bulk-runs on every document in the database (refresh steps are skipped).</p>
   <table>
@@ -18427,7 +18751,7 @@ function renderJsProcessingListPage(list, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Start</a><a href="/js-processing/create" class="btn">Create JS Processing</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a><a href="/js-processing/create" class="btn">Create JS Processing</a></div>
   <h1>JS Processing</h1>
   <p class="sub">Scripts run in a sandbox (input/output only; no file or DB access). Only admins can create or edit; when saved, a hash protects the script so non-admin users can run flows that use it.</p>
   <table>
@@ -18797,7 +19121,7 @@ function renderApisListPage(apis, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Start</a><a href="/apis/create" class="btn">Create REST API</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a><a href="/apis/create" class="btn">Create REST API</a></div>
   <h1>REST APIs</h1>
   <p class="sub">Configure REST API targets for the &quot;Call API&quot; flow. Use the API document ID or name in the entry form flow parameter.</p>
   <table class="apis-list-table">
@@ -18985,7 +19309,7 @@ function renderQueriesListPage(queries, appUi, profiles) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Start</a><a href="/queries/create" class="btn">Create linked query</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a><a href="/queries/create" class="btn">Create linked query</a></div>
   <h1>Linked queries</h1>
   <p class="sub">Configure lookups from one Elenko database (base) into another (query) to show related rows in the single-entry view.</p>
   <table>
@@ -19345,8 +19669,26 @@ function renderFederationListPage(exchanges, peers, profiles, appUi, defaultHubB
     .fed-guide ol { margin: 0.35rem 0 0.75rem 1.25rem; padding: 0; }
     .fed-guide li { margin-bottom: 0.45rem; }
     .fed-guide strong { color: var(--app-text, #e6edf3); font-weight: 600; }
-    .actions { margin-bottom: 1rem; }
+    .actions { margin-bottom: 1.5rem; }
     .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
+    .actions a:hover { text-decoration: underline; }
+    .actions > a:first-of-type {
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    @media (max-width: 768px) {
+      .actions > a:first-of-type {
+        font-size: 1.9rem;
+        line-height: 1;
+        padding: 0.45rem 0.65rem;
+        margin: -0.45rem 0.5rem -0.45rem 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+    }
     .btn { display: inline-block; background: #238636; color: #fff; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; margin-right: 0.5rem; margin-bottom: 0.5rem; }
     .btn-secondary { background: var(--app-table-header-bg, #21262d); border: 1px solid var(--app-table-border, #30363d); }
     table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; margin-bottom: 1rem; }
@@ -19372,7 +19714,7 @@ function renderFederationListPage(exchanges, peers, profiles, appUi, defaultHubB
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Start</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a></div>
   <h1>Federation</h1>
   <div class="fed-role-switch">
     <span style="color:var(--app-label,#8b949e);margin-right:0.75rem;">This instance</span>
@@ -21435,7 +21777,7 @@ function renderDeleteProfilePage(doc) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Profiles</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a></div>
   <h1>Delete profile</h1>
   <p class="sub">Really delete this profile?</p>
   <p><strong>${name}</strong></p>
@@ -21632,7 +21974,7 @@ function renderAllDocumentsPage(docs, appUi, configDbName) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Profiles</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a></div>
   <h1>All documents</h1>
   <p class="sub">Main database (${escapeHtml(COUCHDB_DB)}): profiles, entries, forms. Config database (${escapeHtml(configDbLabel)}): REST APIs, API keys, flows, timers, and other configuration (config rows cannot be deleted here).</p>
   <div class="doc-search-row">
@@ -21734,17 +22076,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice, appConfigAttachme
     ? `<div class="logo-wrap" style="margin-bottom:1rem;"><img src="${escapeHtml(logoUrl)}" style="max-width:100%;${logoWidth ? `width:${logoWidth}px;` : ""}${logoHeight ? `height:${logoHeight}px;` : ""}" alt="Elenko logo"></div>`
     : "";
   const titleHtml = logoUrl ? "" : "<h1>Elenko</h1>";
-  const themeVars = `
-    :root {
-      --app-bg: ${escapeHtml(theme.background)};
-      --app-text: ${escapeHtml(theme.text)};
-      --app-label: ${escapeHtml(theme.label)};
-      --app-link: ${escapeHtml(theme.link)};
-      --app-table-bg: ${escapeHtml(theme.tableBg)};
-      --app-table-header-bg: ${escapeHtml(theme.tableHeaderBg)};
-      --app-table-header-text: ${escapeHtml(theme.tableHeaderText)};
-      --app-table-border: ${escapeHtml(theme.tableBorder)};
-    }`;
+  const themeVars = getAppThemeVars(theme);
   const sections = buildProfileListSections(profiles, appUi && appUi.profileListLayout);
   const iconGridHtml = profiles.length
     ? renderStartPageIconGrid(sections, appConfigAttachments)
@@ -21753,7 +22085,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice, appConfigAttachme
   const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
   const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option><option value="/account/unlock-keyfile">Provide key file</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/debug">Debug / flow log</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/federation">Federation</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/debug">Debug / Flow Log</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/federation">Federation</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
 
   return `<!DOCTYPE html>
@@ -21892,7 +22224,7 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
 </head>
 <body>
   <div class="actions">
-    <a href="/">← Start</a>
+    <a href="/" class="app-back-start">← Start</a>
     <button type="button" id="save-layout-btn" class="btn btn-primary">Save layout</button>
     <a href="/profiles" class="btn btn-secondary">Elenko profiles</a>
   </div>
@@ -21908,6 +22240,7 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
     <button type="button" id="add-folder-btn" class="btn btn-secondary">Add folder</button>
     <select id="add-profile-select" aria-label="Database to add"><option value="">Add database…</option></select>
     <button type="button" id="add-profile-btn" class="btn btn-secondary">Add database</button>
+    <select id="add-profile-folder-select" aria-label="Target folder" title="Folder on the start page"><option value="">Ungrouped</option></select>
   </div>
   <div id="msg" class="msg" style="display:none;"></div>
   <script>
@@ -21920,6 +22253,7 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
       var emptyEl = document.getElementById('layout-empty');
       var msgEl = document.getElementById('msg');
       var addSelect = document.getElementById('add-profile-select');
+      var addFolderSelect = document.getElementById('add-profile-folder-select');
 
       function hslToHex(h, s, l) {
         s /= 100; l /= 100;
@@ -21985,6 +22319,47 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
         });
       }
 
+      function refreshAddProfileFolderSelect() {
+        if (!addFolderSelect) return;
+        var prev = addFolderSelect.value;
+        addFolderSelect.innerHTML = '<option value="">Ungrouped</option>';
+        layout.forEach(function(item) {
+          if (item.kind !== 'group') return;
+          var opt = document.createElement('option');
+          opt.value = item.id;
+          opt.textContent = item.label || 'Folder';
+          addFolderSelect.appendChild(opt);
+        });
+        if (prev) {
+          for (var o = 0; o < addFolderSelect.options.length; o++) {
+            if (addFolderSelect.options[o].value === prev) {
+              addFolderSelect.value = prev;
+              break;
+            }
+          }
+        }
+      }
+
+      function insertIndexForNewProfile(folderGroupId) {
+        if (!folderGroupId) {
+          for (var i = 0; i < layout.length; i++) {
+            if (layout[i].kind === 'group') return i;
+          }
+          return layout.length;
+        }
+        var groupIndex = -1;
+        for (var g = 0; g < layout.length; g++) {
+          if (layout[g].kind === 'group' && layout[g].id === folderGroupId) {
+            groupIndex = g;
+            break;
+          }
+        }
+        if (groupIndex < 0) return layout.length;
+        var insertAt = groupIndex + 1;
+        while (insertAt < layout.length && layout[insertAt].kind === 'profile') insertAt++;
+        return insertAt;
+      }
+
       function moveItem(index, delta) {
         var next = index + delta;
         if (next < 0 || next >= layout.length) return;
@@ -21997,6 +22372,34 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
       function removeItem(index) {
         layout.splice(index, 1);
         render();
+      }
+
+      async function downloadFolderPackage(groupId, folderLabel) {
+        msgEl.style.display = 'none';
+        try {
+          var r = await fetch('/api/config-export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope: 'folder', groupId: groupId })
+          });
+          var data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Export failed');
+          var payload = data.data;
+          var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+          var a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          var safeLabel = (folderLabel || groupId || 'folder').replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 40);
+          a.download = 'elenko-folder-package-' + safeLabel + '-' + (payload.exportedAt || '').slice(0, 10) + '.json';
+          a.click();
+          URL.revokeObjectURL(a.href);
+          msgEl.textContent = 'Application package downloaded.';
+          msgEl.className = 'msg ok';
+          msgEl.style.display = 'block';
+        } catch (e) {
+          msgEl.textContent = e.message || 'Export failed';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+        }
       }
 
       function render() {
@@ -22154,11 +22557,22 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
           rm.addEventListener('click', function() { removeItem(index); });
           actTd.appendChild(up);
           actTd.appendChild(down);
+          if (item.kind === 'group') {
+            var expPkg = document.createElement('button');
+            expPkg.type = 'button';
+            expPkg.title = 'Export application package';
+            expPkg.textContent = '⬇';
+            expPkg.addEventListener('click', function() {
+              downloadFolderPackage(item.id, item.label || item.id);
+            });
+            actTd.appendChild(expPkg);
+          }
           actTd.appendChild(rm);
           tr.appendChild(actTd);
           bodyEl.appendChild(tr);
         });
         refreshAddProfileSelect();
+        refreshAddProfileFolderSelect();
       }
 
       document.getElementById('add-folder-btn').addEventListener('click', function() {
@@ -22175,9 +22589,9 @@ function renderProfileListLayoutPage(profiles, appUi, err) {
       document.getElementById('add-profile-btn').addEventListener('click', function() {
         var id = addSelect.value;
         if (!id) return;
-        var p = profileById[id];
-        var name = p ? (p.name || p._id) : id;
-        layout.push({ kind: 'profile', profileId: id });
+        var folderId = addFolderSelect ? addFolderSelect.value : '';
+        var insertAt = insertIndexForNewProfile(folderId);
+        layout.splice(insertAt, 0, { kind: 'profile', profileId: id });
         render();
       });
 
@@ -22520,7 +22934,7 @@ function renderEditProfilePage(doc, forms = [], appUi, keyFileUsers = [], flows 
 </head>
 <body>
   <div class="actions">
-    <a href="/">← Profiles</a>
+    <a href="/" class="app-back-start">← Start</a>
     <button type="submit" form="edit-form" class="btn btn-primary" style="margin-left:1rem;">Save</button>
     <button type="button" class="btn btn-danger" id="delete-profile-btn" style="margin-left:0.5rem;">Delete profile</button>
     <a href="/" class="btn btn-secondary" style="margin-left:0.5rem;">Cancel</a>
@@ -23468,15 +23882,7 @@ function renderLoginPage(errorMessage, appUi) {
   const loginTextBelowRaw = appUi && typeof appUi.loginTextBelow === "string" ? appUi.loginTextBelow.trim() : "";
   const loginTextAboveHtml = loginTextAboveRaw ? marked.parse(loginTextAboveRaw) : "";
   const loginTextBelowHtml = loginTextBelowRaw ? marked.parse(loginTextBelowRaw) : "";
-  const themeVars = `
-    :root {
-      --app-bg: ${escapeHtml(theme.background)};
-      --app-text: ${escapeHtml(theme.text)};
-      --app-label: ${escapeHtml(theme.label)};
-      --app-link: ${escapeHtml(theme.link)};
-      --app-table-bg: ${escapeHtml(theme.tableBg)};
-      --app-table-border: ${escapeHtml(theme.tableBorder)};
-    }`;
+  const themeVars = getAppThemeVars(theme);
   const logoHtml = logoUrl
     ? `<div class="logo-wrap" style="margin-bottom:1rem;">
          <img src="${escapeHtml(logoUrl)}"
@@ -23562,14 +23968,12 @@ function renderChangePasswordPage(errorMessage, appUi) {
     input:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
     .btn:hover { background: #2ea043; }
-    .btn-secondary { display: inline-block; margin-top: 0.5rem; background: #21262d; color: #e6edf3; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; }
-    .btn-secondary:hover { background: #30363d; }
     .login-err { color: #f85149; margin-top: 1rem; }
   </style>
 </head>
 <body>
-  <h1>Elenko</h1>
-  <p class="sub">Change password</p>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a></div>
+  <h1>Change password</h1>
   ${err}
   <form method="post" action="/account/change-password">
     <label for="currentPassword">Current password</label>
@@ -23580,7 +23984,7 @@ function renderChangePasswordPage(errorMessage, appUi) {
     <input type="password" id="confirmPassword" name="confirmPassword" required>
     <button type="submit" class="btn">Change password</button>
   </form>
-  <a href="/" class="btn-secondary">Cancel</a>
+  <a href="/" class="form-cancel">Cancel</a>
 </body>
 </html>`;
 }
@@ -23595,6 +23999,7 @@ function renderCouchDbPasswordPage(appUi, errorMessage, successMessage, formActi
     ? "You are connected with the default password. Set a new password below; it will be saved to CouchDB and to the bootstrap file so the app can connect after restart."
     : "Change the password for the CouchDB <code>admin</code> user. The new password is written to CouchDB, then verified by reconnecting. The encrypted bootstrap file and Application config are updated so the app can connect after restart.";
   const cancelHref = isSetupFlow ? "/setup" : "/";
+  const backLabel = isSetupFlow ? "Setup" : "Start";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -23613,15 +24018,13 @@ function renderCouchDbPasswordPage(appUi, errorMessage, successMessage, formActi
     input:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
     .btn:hover { background: #2ea043; }
-    .btn-secondary { display: inline-block; margin-top: 0.5rem; background: #21262d; color: #e6edf3; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; }
-    .btn-secondary:hover { background: #30363d; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .msg.ok { background: #1a2e1a; color: #7ee787; }
   </style>
 </head>
 <body>
-  <div class="actions" style="margin-bottom:1rem;"><a href="${escapeHtml(cancelHref)}" class="btn-secondary">← ${isSetupFlow ? "Setup" : "Profiles"}</a></div>
+  <div class="actions"><a href="${escapeHtml(cancelHref)}" class="app-back-start">← ${backLabel}</a></div>
   <h1>CouchDB password</h1>
   <p class="sub">${sub}</p>
   ${err}
@@ -23635,13 +24038,14 @@ function renderCouchDbPasswordPage(appUi, errorMessage, successMessage, formActi
     <input type="password" id="confirmPassword" name="confirmPassword" required autocomplete="new-password">
     <button type="submit" class="btn">Change CouchDB password</button>
   </form>
-  <a href="${escapeHtml(cancelHref)}" class="btn-secondary">Cancel</a>
+  <a href="${escapeHtml(cancelHref)}" class="form-cancel">Cancel</a>
 </body>
 </html>`;
 }
 
 function renderEditAppConfigPage(appUi, err) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
   const bg = toHex6(theme.background);
   const text = toHex6(theme.text);
   const label = toHex6(theme.label);
@@ -23650,6 +24054,17 @@ function renderEditAppConfigPage(appUi, err) {
   const tableHeaderBg = toHex6(theme.tableHeaderBg);
   const tableHeaderText = toHex6(theme.tableHeaderText);
   const tableBorder = toHex6(theme.tableBorder);
+  const btnPrimaryBg = toHex6(theme.btnPrimaryBg);
+  const btnPrimaryText = toHex6(theme.btnPrimaryText);
+  const btnPrimaryHoverBg = toHex6(theme.btnPrimaryHoverBg);
+  const btnSecondaryBg = toHex6(theme.btnSecondaryBg);
+  const btnSecondaryText = toHex6(theme.btnSecondaryText);
+  const btnSecondaryHoverBg = toHex6(theme.btnSecondaryHoverBg);
+  const mainNavBg = toHex6(theme.mainNavBg);
+  const mainNavText = toHex6(theme.mainNavText);
+  const mainNavBorder = toHex6(theme.mainNavBorder);
+  const mainNavHoverBg = toHex6(theme.mainNavHoverBg);
+  const backNavColor = toHex6(theme.backNavColor);
   const logoUrl = appUi && typeof appUi.logoUrl === "string" ? appUi.logoUrl : "";
   const logoWidth = appUi && appUi.logoWidth ? String(appUi.logoWidth) : "";
   const logoHeight = appUi && appUi.logoHeight ? String(appUi.logoHeight) : "";
@@ -23658,6 +24073,8 @@ function renderEditAppConfigPage(appUi, err) {
   const id = appUi && appUi._id ? String(appUi._id) : "";
   const rev = appUi && appUi._rev ? String(appUi._rev) : "";
   const msgErr = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
+  const darkThemePresetJson = JSON.stringify(DEFAULT_APP_THEME).replace(/<\//g, "<\\/");
+  const brightThemePresetJson = JSON.stringify(BRIGHT_APP_THEME_PRESET).replace(/<\//g, "<\\/");
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -23666,20 +24083,18 @@ function renderEditAppConfigPage(appUi, err) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Elenko – Application design</title>
   <style>
+    ${themeVars}
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0f1419; color: #e6edf3; max-width: 40rem; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 40rem; }
     h1 { font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #8b949e; margin-bottom: 1rem; }
-    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: #8b949e; }
-    input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 1rem; }
-    input[type="text"]:focus, input[type="number"]:focus { outline: none; border-color: #58a6ff; }
+    h2 { font-weight: 600; font-size: 1.05rem; margin-top: 1.5rem; margin-bottom: 0.35rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1rem; }
+    label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
+    input[type="text"], input[type="number"] { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
+    input[type="text"]:focus, input[type="number"]:focus { outline: none; border-color: var(--app-link, #58a6ff); }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
-    .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
-    .btn-primary:hover { background: #2ea043; }
-    .btn-secondary { background: var(--app-bg, #0f1419); color: #e6edf3; text-decoration: none; margin-left: 0.5rem; border: 1px solid var(--app-table-border, #30363d); }
-    .btn-secondary:hover { background: #161b22; }
     .actions { margin-bottom: 1.5rem; }
-    .actions a { color: #58a6ff; text-decoration: none; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
     .actions a:hover { text-decoration: underline; }
     .actions > a:first-of-type {
       font-size: 1.35rem;
@@ -23698,9 +24113,9 @@ function renderEditAppConfigPage(appUi, err) {
         min-height: 2.75rem;
       }
     }
-    .actions a.btn:not(.btn-secondary), a.btn:not(.btn-secondary) { color: #fff; }
-    .actions a.btn:hover:not(.btn-secondary), a.btn:hover:not(.btn-secondary) { color: #fff; text-decoration: none; }
     .el-theme-colours { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem; width: 100%; }
+    .theme-preview-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
+    .theme-preview-bar .nav-select { padding: 0.35rem 0.5rem; font-size: 0.85rem; border-radius: 6px; cursor: default; }
     .el-theme-row {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 2.5rem minmax(0, 1fr);
@@ -23712,23 +24127,28 @@ function renderEditAppConfigPage(appUi, err) {
     .el-theme-row > label { display: block; margin: 0; font-size: 0.875rem; min-width: 0; word-break: break-word; }
     .el-theme-row > input[type="color"] {
       width: 2.5rem; height: 2.5rem; min-width: 2.5rem; min-height: 2.5rem; max-width: 2.5rem; max-height: 2.5rem;
-      padding: 2px; margin: 0; cursor: pointer; border: 1px solid #30363d; border-radius: 4px; background: #161b22; box-sizing: border-box; justify-self: center;
+      padding: 2px; margin: 0; cursor: pointer; border: 1px solid var(--app-table-border, #30363d); border-radius: 4px; background: var(--app-table-bg, #161b22); box-sizing: border-box; justify-self: center;
     }
     .el-theme-row > input[type="text"] {
-      width: 100%; min-width: 0; margin: 0; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 0.875rem;
+      width: 100%; min-width: 0; margin: 0; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 0.875rem;
     }
+    textarea.app-field-input {
+      width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; font-family: inherit; resize: vertical;
+    }
+    .actions .btn-primary, .actions .btn-secondary { margin-left: 0.75rem; margin-top: 0; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
     .logo-preview { margin-top: 0.75rem; }
-    .logo-preview img { max-width: 100%; border-radius: 4px; border: 1px solid #30363d; background: #161b22; padding: 0.5rem; }
+    .logo-preview img { max-width: 100%; border-radius: 4px; border: 1px solid var(--app-table-border, #30363d); background: var(--app-table-bg, #161b22); padding: 0.5rem; }
   </style>
 </head>
 <body>
   <div class="actions">
-    <a href="/" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem 0.5rem 1rem;">← Profiles</a>
-    <button type="submit" form="app-config-form" class="btn btn-primary" style="margin-left:1rem;">Save</button>
-    <button type="button" id="set-default-theme-btn" class="btn btn-secondary" style="margin-left:0.5rem;">Set to default</button>
-    <a href="/" class="btn btn-secondary">Cancel</a>
+    <a href="/" class="app-back-start">← Start</a>
+    <button type="submit" form="app-config-form" class="btn btn-primary">Save</button>
+    <button type="button" id="dark-default-theme-btn" class="btn btn-secondary">Dark Default</button>
+    <button type="button" id="bright-default-theme-btn" class="btn btn-secondary">Bright Default</button>
+    <a href="/" class="form-cancel" style="margin-top:0;margin-left:0.75rem;">Cancel</a>
   </div>
   <h1>Application design</h1>
   <p class="sub">Global colours and logo/header image used on the login page, start page, and configuration pages. Defaults match the current dark theme.</p>
@@ -23743,10 +24163,40 @@ function renderEditAppConfigPage(appUi, err) {
       <div class="el-theme-row"><label for="theme-text">Text</label><input type="color" id="theme-text" value="${escapeHtml(text)}"><input type="text" id="theme-text-hex" value="${escapeHtml(text)}" placeholder="#e6edf3"></div>
       <div class="el-theme-row"><label for="theme-label">Label</label><input type="color" id="theme-label" value="${escapeHtml(label)}"><input type="text" id="theme-label-hex" value="${escapeHtml(label)}" placeholder="#8b949e"></div>
       <div class="el-theme-row"><label for="theme-link">Link</label><input type="color" id="theme-link" value="${escapeHtml(link)}"><input type="text" id="theme-link-hex" value="${escapeHtml(link)}" placeholder="#58a6ff"></div>
+      <div class="el-theme-row"><label for="theme-backNavColor">Return link (← Start)</label><input type="color" id="theme-backNavColor" value="${escapeHtml(backNavColor)}"><input type="text" id="theme-backNavColor-hex" value="${escapeHtml(backNavColor)}" placeholder="#58a6ff"></div>
       <div class="el-theme-row"><label for="theme-tableBg">Table background</label><input type="color" id="theme-tableBg" value="${escapeHtml(tableBg)}"><input type="text" id="theme-tableBg-hex" value="${escapeHtml(tableBg)}" placeholder="#161b22"></div>
       <div class="el-theme-row"><label for="theme-tableHeaderBg">Table header bg</label><input type="color" id="theme-tableHeaderBg" value="${escapeHtml(tableHeaderBg)}"><input type="text" id="theme-tableHeaderBg-hex" value="${escapeHtml(tableHeaderBg)}" placeholder="#21262d"></div>
       <div class="el-theme-row"><label for="theme-tableHeaderText">Table header text</label><input type="color" id="theme-tableHeaderText" value="${escapeHtml(tableHeaderText)}"><input type="text" id="theme-tableHeaderText-hex" value="${escapeHtml(tableHeaderText)}" placeholder="#8b949e"></div>
       <div class="el-theme-row"><label for="theme-tableBorder">Table border</label><input type="color" id="theme-tableBorder" value="${escapeHtml(tableBorder)}"><input type="text" id="theme-tableBorder-hex" value="${escapeHtml(tableBorder)}" placeholder="#21262d"></div>
+    </div>
+    <h2>Main buttons</h2>
+    <p class="sub" style="margin-top:0;">Primary actions (green by default): Save, Create, Log in, etc.</p>
+    <div class="el-theme-colours">
+      <div class="el-theme-row"><label for="theme-btnPrimaryBg">Background</label><input type="color" id="theme-btnPrimaryBg" value="${escapeHtml(btnPrimaryBg)}"><input type="text" id="theme-btnPrimaryBg-hex" value="${escapeHtml(btnPrimaryBg)}" placeholder="#238636"></div>
+      <div class="el-theme-row"><label for="theme-btnPrimaryText">Text</label><input type="color" id="theme-btnPrimaryText" value="${escapeHtml(btnPrimaryText)}"><input type="text" id="theme-btnPrimaryText-hex" value="${escapeHtml(btnPrimaryText)}" placeholder="#ffffff"></div>
+      <div class="el-theme-row"><label for="theme-btnPrimaryHoverBg">Hover background</label><input type="color" id="theme-btnPrimaryHoverBg" value="${escapeHtml(btnPrimaryHoverBg)}"><input type="text" id="theme-btnPrimaryHoverBg-hex" value="${escapeHtml(btnPrimaryHoverBg)}" placeholder="#2ea043"></div>
+    </div>
+    <h2>Secondary buttons</h2>
+    <p class="sub" style="margin-top:0;">Cancel, Select entries, toolbar actions, etc.</p>
+    <div class="el-theme-colours">
+      <div class="el-theme-row"><label for="theme-btnSecondaryBg">Background</label><input type="color" id="theme-btnSecondaryBg" value="${escapeHtml(btnSecondaryBg)}"><input type="text" id="theme-btnSecondaryBg-hex" value="${escapeHtml(btnSecondaryBg)}" placeholder="#21262d"></div>
+      <div class="el-theme-row"><label for="theme-btnSecondaryText">Text</label><input type="color" id="theme-btnSecondaryText" value="${escapeHtml(btnSecondaryText)}"><input type="text" id="theme-btnSecondaryText-hex" value="${escapeHtml(btnSecondaryText)}" placeholder="#ffffff"></div>
+      <div class="el-theme-row"><label for="theme-btnSecondaryHoverBg">Hover background</label><input type="color" id="theme-btnSecondaryHoverBg" value="${escapeHtml(btnSecondaryHoverBg)}"><input type="text" id="theme-btnSecondaryHoverBg-hex" value="${escapeHtml(btnSecondaryHoverBg)}" placeholder="#30363d"></div>
+    </div>
+    <h2>Main page menus / buttons</h2>
+    <p class="sub" style="margin-top:0;">Start page: Admin / Flow / Special dropdowns and Log out.</p>
+    <div class="el-theme-colours">
+      <div class="el-theme-row"><label for="theme-mainNavBg">Background</label><input type="color" id="theme-mainNavBg" value="${escapeHtml(mainNavBg)}"><input type="text" id="theme-mainNavBg-hex" value="${escapeHtml(mainNavBg)}" placeholder="#21262d"></div>
+      <div class="el-theme-row"><label for="theme-mainNavText">Text</label><input type="color" id="theme-mainNavText" value="${escapeHtml(mainNavText)}"><input type="text" id="theme-mainNavText-hex" value="${escapeHtml(mainNavText)}" placeholder="#ffffff"></div>
+      <div class="el-theme-row"><label for="theme-mainNavBorder">Border</label><input type="color" id="theme-mainNavBorder" value="${escapeHtml(mainNavBorder)}"><input type="text" id="theme-mainNavBorder-hex" value="${escapeHtml(mainNavBorder)}" placeholder="#30363d"></div>
+      <div class="el-theme-row"><label for="theme-mainNavHoverBg">Hover background</label><input type="color" id="theme-mainNavHoverBg" value="${escapeHtml(mainNavHoverBg)}"><input type="text" id="theme-mainNavHoverBg-hex" value="${escapeHtml(mainNavHoverBg)}" placeholder="#30363d"></div>
+    </div>
+    <div class="theme-preview-bar" aria-hidden="true">
+      <a href="#" class="app-back-start" tabindex="-1" onclick="return false;">← Start</a>
+      <button type="button" class="btn btn-primary" tabindex="-1">Main</button>
+      <button type="button" class="btn btn-secondary" tabindex="-1">Secondary</button>
+      <select class="nav-select" tabindex="-1"><option>Menu</option></select>
+      <span class="btn-logout" style="display:inline-block;padding:0.35rem 0.75rem;border-radius:6px;font-size:0.9rem;">Log out</span>
     </div>
     <label for="logoUrl">Logo / header image URL</label>
     <input type="text" id="logoUrl" name="logoUrl" placeholder="/logo.png or https://…" value="${escapeHtml(logoUrl)}">
@@ -23771,10 +24221,10 @@ function renderEditAppConfigPage(appUi, err) {
         : ""
     }
     <label for="loginTextAbove">Login page text (above form)</label>
-    <textarea id="loginTextAbove" name="loginTextAbove" rows="3" placeholder="Optional. Shown below the logo, above the login fields. Markdown supported." style="width:100%;padding:0.5rem;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:1rem;font-family:inherit;resize:vertical;">${escapeHtml(loginTextAbove)}</textarea>
+    <textarea id="loginTextAbove" name="loginTextAbove" class="app-field-input" rows="3" placeholder="Optional. Shown below the logo, above the login fields. Markdown supported.">${escapeHtml(loginTextAbove)}</textarea>
     <p class="sub" style="margin-top:0.25rem;">Rendered as Markdown on the login page.</p>
     <label for="loginTextBelow" style="margin-top:1rem;">Login page text (below form)</label>
-    <textarea id="loginTextBelow" name="loginTextBelow" rows="3" placeholder="Optional. Shown below the login button. Markdown supported." style="width:100%;padding:0.5rem;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:1rem;font-family:inherit;resize:vertical;">${escapeHtml(loginTextBelow)}</textarea>
+    <textarea id="loginTextBelow" name="loginTextBelow" class="app-field-input" rows="3" placeholder="Optional. Shown below the login button. Markdown supported.">${escapeHtml(loginTextBelow)}</textarea>
     <p class="sub" style="margin-top:0.25rem;">Rendered as Markdown on the login page.</p>
   </form>
   <div id="msg" class="msg" style="display:none;"></div>
@@ -23799,31 +24249,68 @@ function renderEditAppConfigPage(appUi, err) {
       bindColorPair('theme-text', 'theme-text-hex');
       bindColorPair('theme-label', 'theme-label-hex');
       bindColorPair('theme-link', 'theme-link-hex');
+      bindColorPair('theme-backNavColor', 'theme-backNavColor-hex');
       bindColorPair('theme-tableBg', 'theme-tableBg-hex');
       bindColorPair('theme-tableHeaderBg', 'theme-tableHeaderBg-hex');
       bindColorPair('theme-tableHeaderText', 'theme-tableHeaderText-hex');
       bindColorPair('theme-tableBorder', 'theme-tableBorder-hex');
+      bindColorPair('theme-btnPrimaryBg', 'theme-btnPrimaryBg-hex');
+      bindColorPair('theme-btnPrimaryText', 'theme-btnPrimaryText-hex');
+      bindColorPair('theme-btnPrimaryHoverBg', 'theme-btnPrimaryHoverBg-hex');
+      bindColorPair('theme-btnSecondaryBg', 'theme-btnSecondaryBg-hex');
+      bindColorPair('theme-btnSecondaryText', 'theme-btnSecondaryText-hex');
+      bindColorPair('theme-btnSecondaryHoverBg', 'theme-btnSecondaryHoverBg-hex');
+      bindColorPair('theme-mainNavBg', 'theme-mainNavBg-hex');
+      bindColorPair('theme-mainNavText', 'theme-mainNavText-hex');
+      bindColorPair('theme-mainNavBorder', 'theme-mainNavBorder-hex');
+      bindColorPair('theme-mainNavHoverBg', 'theme-mainNavHoverBg-hex');
 
-      var defaultTheme = {
-        background: '#0f1419',
-        text: '#e6edf3',
-        label: '#8b949e',
-        link: '#58a6ff',
-        tableBg: '#161b22',
-        tableHeaderBg: '#21262d',
-        tableHeaderText: '#8b949e',
-        tableBorder: '#21262d'
-      };
-      var setDefaultBtn = document.getElementById('set-default-theme-btn');
-      if (setDefaultBtn) {
-        setDefaultBtn.onclick = function() {
-          ['background', 'text', 'label', 'link', 'tableBg', 'tableHeaderBg', 'tableHeaderText', 'tableBorder'].forEach(function(key) {
-            var colorEl = document.getElementById('theme-' + key);
-            var hexEl = document.getElementById('theme-' + key + '-hex');
-            var val = defaultTheme[key];
-            if (colorEl) colorEl.value = val;
-            if (hexEl) hexEl.value = val;
-          });
+      var themeCssVarKeys = [
+        ['background', '--app-bg'],
+        ['text', '--app-text'],
+        ['label', '--app-label'],
+        ['link', '--app-link'],
+        ['backNavColor', '--app-back-nav-color'],
+        ['tableBg', '--app-table-bg'],
+        ['tableHeaderBg', '--app-table-header-bg'],
+        ['tableHeaderText', '--app-table-header-text'],
+        ['tableBorder', '--app-table-border'],
+        ['btnPrimaryBg', '--app-btn-primary-bg'],
+        ['btnPrimaryText', '--app-btn-primary-text'],
+        ['btnPrimaryHoverBg', '--app-btn-primary-hover-bg'],
+        ['btnSecondaryBg', '--app-btn-secondary-bg'],
+        ['btnSecondaryText', '--app-btn-secondary-text'],
+        ['btnSecondaryHoverBg', '--app-btn-secondary-hover-bg'],
+        ['mainNavBg', '--app-main-nav-bg'],
+        ['mainNavText', '--app-main-nav-text'],
+        ['mainNavBorder', '--app-main-nav-border'],
+        ['mainNavHoverBg', '--app-main-nav-hover-bg']
+      ];
+      function syncThemePreviewFromForm() {
+        var root = document.documentElement;
+        themeCssVarKeys.forEach(function(pair) {
+          var hexEl = document.getElementById('theme-' + pair[0] + '-hex');
+          if (hexEl && hexEl.value.trim()) root.style.setProperty(pair[1], hexEl.value.trim());
+        });
+      }
+      themeCssVarKeys.forEach(function(pair) {
+        var hexEl = document.getElementById('theme-' + pair[0] + '-hex');
+        if (hexEl) hexEl.addEventListener('input', syncThemePreviewFromForm);
+      });
+
+      var darkDefaultTheme = ${darkThemePresetJson};
+      var brightDefaultTheme = ${brightThemePresetJson};
+      var themeFieldKeys = Object.keys(darkDefaultTheme);
+      function applyThemePreset(preset, clearBranding) {
+        themeFieldKeys.forEach(function(key) {
+          var colorEl = document.getElementById('theme-' + key);
+          var hexEl = document.getElementById('theme-' + key + '-hex');
+          var val = preset[key];
+          if (val == null || val === '') return;
+          if (colorEl) colorEl.value = val;
+          if (hexEl) hexEl.value = val;
+        });
+        if (clearBranding) {
           var logoUrlEl = document.getElementById('logoUrl');
           var logoWidthEl = document.getElementById('logoWidth');
           var logoHeightEl = document.getElementById('logoHeight');
@@ -23834,7 +24321,16 @@ function renderEditAppConfigPage(appUi, err) {
           var loginTextBelowEl = document.getElementById('loginTextBelow');
           if (loginTextAboveEl) loginTextAboveEl.value = '';
           if (loginTextBelowEl) loginTextBelowEl.value = '';
-        };
+        }
+        syncThemePreviewFromForm();
+      }
+      var darkDefaultBtn = document.getElementById('dark-default-theme-btn');
+      if (darkDefaultBtn) {
+        darkDefaultBtn.onclick = function() { applyThemePreset(darkDefaultTheme, true); };
+      }
+      var brightDefaultBtn = document.getElementById('bright-default-theme-btn');
+      if (brightDefaultBtn) {
+        brightDefaultBtn.onclick = function() { applyThemePreset(brightDefaultTheme, false); };
       }
 
       var form = document.getElementById('app-config-form');
@@ -23850,10 +24346,21 @@ function renderEditAppConfigPage(appUi, err) {
           text: document.getElementById('theme-text-hex').value.trim() || '${escapeHtml(text)}',
           label: document.getElementById('theme-label-hex').value.trim() || '${escapeHtml(label)}',
           link: document.getElementById('theme-link-hex').value.trim() || '${escapeHtml(link)}',
+          backNavColor: document.getElementById('theme-backNavColor-hex').value.trim() || '${escapeHtml(backNavColor)}',
           tableBg: document.getElementById('theme-tableBg-hex').value.trim() || '${escapeHtml(tableBg)}',
           tableHeaderBg: document.getElementById('theme-tableHeaderBg-hex').value.trim() || '${escapeHtml(tableHeaderBg)}',
           tableHeaderText: document.getElementById('theme-tableHeaderText-hex').value.trim() || '${escapeHtml(tableHeaderText)}',
-          tableBorder: document.getElementById('theme-tableBorder-hex').value.trim() || '${escapeHtml(tableBorder)}'
+          tableBorder: document.getElementById('theme-tableBorder-hex').value.trim() || '${escapeHtml(tableBorder)}',
+          btnPrimaryBg: document.getElementById('theme-btnPrimaryBg-hex').value.trim() || '${escapeHtml(btnPrimaryBg)}',
+          btnPrimaryText: document.getElementById('theme-btnPrimaryText-hex').value.trim() || '${escapeHtml(btnPrimaryText)}',
+          btnPrimaryHoverBg: document.getElementById('theme-btnPrimaryHoverBg-hex').value.trim() || '${escapeHtml(btnPrimaryHoverBg)}',
+          btnSecondaryBg: document.getElementById('theme-btnSecondaryBg-hex').value.trim() || '${escapeHtml(btnSecondaryBg)}',
+          btnSecondaryText: document.getElementById('theme-btnSecondaryText-hex').value.trim() || '${escapeHtml(btnSecondaryText)}',
+          btnSecondaryHoverBg: document.getElementById('theme-btnSecondaryHoverBg-hex').value.trim() || '${escapeHtml(btnSecondaryHoverBg)}',
+          mainNavBg: document.getElementById('theme-mainNavBg-hex').value.trim() || '${escapeHtml(mainNavBg)}',
+          mainNavText: document.getElementById('theme-mainNavText-hex').value.trim() || '${escapeHtml(mainNavText)}',
+          mainNavBorder: document.getElementById('theme-mainNavBorder-hex').value.trim() || '${escapeHtml(mainNavBorder)}',
+          mainNavHoverBg: document.getElementById('theme-mainNavHoverBg-hex').value.trim() || '${escapeHtml(mainNavHoverBg)}'
         };
         var loginTextAboveEl = document.getElementById('loginTextAbove');
         var loginTextBelowEl = document.getElementById('loginTextBelow');
@@ -23979,7 +24486,7 @@ function renderDebugPage(appUi, logData, err) {
   <meta charset="UTF-8">
   ${FAVICON_LINKS}
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Elenko – Debug / flow log</title>
+  <title>Elenko – Debug / Flow Log</title>
   <style>
     ${themeVars}
     * { box-sizing: border-box; }
@@ -24012,11 +24519,10 @@ function renderDebugPage(appUi, logData, err) {
 </head>
 <body>
   <div class="actions">
-    <a href="/">← Start</a>
+    <a href="/" class="app-back-start">← Start</a>
     <button type="button" id="save-log-config-btn" class="btn btn-primary">Save log level</button>
-    <a href="/application-properties" class="btn btn-secondary">Application properties</a>
   </div>
-  <h1>Debug / flow log</h1>
+  <h1>Debug / Flow Log</h1>
   <p class="sub">Admin-only view of the JSON-lines flow log (flows, timers, API calls, script logs). Useful on remote instances without shell access.</p>
   ${msgErr}
   <div class="panel">
@@ -24195,11 +24701,8 @@ function renderApplicationPropertiesPage(appUi, err) {
     input[type="text"], input[type="number"] { width: 100%; max-width: 24rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
     select { width: 100%; max-width: 24rem; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
-    .btn-primary { background: #238636; color: #fff; margin-top: 1rem; }
-    .btn-secondary { background: var(--app-table-header-bg, #21262d); color: var(--app-text, #e6edf3); text-decoration: none; margin-left: 0.5rem; border: 1px solid var(--app-table-border, #30363d); }
-    .actions { margin-bottom: 1.5rem; }
-    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
-    .actions a:hover { text-decoration: underline; }
+    .btn-primary { background: #238636; color: #fff; }
+    .actions .btn-primary { margin-top: 0; }
     .panel { background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 8px; padding: 1rem; margin-top: 1rem; font-size: 0.9rem; }
     .panel code { word-break: break-all; font-size: 0.85em; }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
@@ -24209,9 +24712,9 @@ function renderApplicationPropertiesPage(appUi, err) {
 </head>
 <body>
   <div class="actions">
-    <a href="/" class="btn-secondary" style="display:inline-block;padding:0.5rem 1rem;">← Start</a>
-    <button type="submit" form="app-props-form" class="btn btn-primary" style="margin-left:1rem;">Save</button>
-    <a href="/" class="btn btn-secondary">Cancel</a>
+    <a href="/" class="app-back-start">← Start</a>
+    <button type="submit" form="app-props-form" class="btn btn-primary">Save</button>
+    <a href="/" class="form-cancel" style="margin-top:0;margin-left:0.75rem;">Cancel</a>
   </div>
   <h1>Application properties</h1>
   <p class="sub">Operational settings independent of theme. Flow log lines always include <code>ts</code> (UTC ISO). When configured below, a second field <code>tsDisplay</code> is added for your local or business timezone.</p>
@@ -24328,34 +24831,6 @@ function renderDataExportImportPage(profiles, appUi) {
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
     .btn-primary { background: #238636; color: #fff; }
     .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-    .actions { margin-bottom: 1.5rem; }
-    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
-    .actions .back-nav {
-      display: inline-block;
-      padding: 0.5rem 1rem;
-      border-radius: 6px;
-      background: var(--app-bg, #0f1419);
-      color: var(--app-link, #58a6ff);
-      border: 1px solid transparent;
-    }
-    .actions .back-nav:hover { text-decoration: underline; background: var(--app-bg, #0f1419); color: var(--app-link, #58a6ff); }
-    .actions > a:first-of-type {
-      font-size: 1.35rem;
-      line-height: 1;
-    }
-    @media (max-width: 768px) {
-      .actions > a:first-of-type {
-        font-size: 1.9rem;
-        line-height: 1;
-        padding: 0.45rem 0.65rem;
-        margin: -0.45rem 0.5rem -0.45rem 0;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: 2.75rem;
-        min-height: 2.75rem;
-      }
-    }
     .section { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--app-table-border, #30363d); }
     .radio-group { margin-top: 0.5rem; }
     .radio-group label { display: inline; margin-top: 0; }
@@ -24365,7 +24840,7 @@ function renderDataExportImportPage(profiles, appUi) {
 </head>
 <body>
   <div class="actions">
-    <a href="/" class="back-nav">← Profiles</a>
+    <a href="/" class="app-back-start">← Start</a>
   </div>
   <h1>Export / Import data</h1>
   <p class="sub">Export entry data from an Elenko database, import rows from a semicolon-separated CSV file, or import multiple pictures into file-type profile fields.</p>
@@ -24824,6 +25299,15 @@ function renderDataExportImportPage(profiles, appUi) {
 </html>`;
 }
 
+function buildFolderExportSelectOptions(layout) {
+  const groups = normalizeProfileListLayout(layout).filter((x) => x.kind === "group");
+  if (!groups.length) return '<option value="">No folders in layout</option>';
+  return (
+    '<option value="">— Select folder —</option>' +
+    groups.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.label || g.id)}</option>`).join("")
+  );
+}
+
 function renderConfigExportImportPage(profiles, appUi) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
@@ -24831,6 +25315,7 @@ function renderConfigExportImportPage(profiles, appUi) {
     ? '<option value="__app__">Elenko App Design</option><option value="">— Select database —</option>' +
         profiles.map((p) => `<option value="${escapeHtml(p._id)}">${escapeHtml(p.name || p._id)}</option>`).join("")
     : '<option value="__app__">Elenko App Design</option><option value="">No databases</option>';
+  const folderOptions = buildFolderExportSelectOptions(appUi && appUi.profileListLayout);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -24850,34 +25335,6 @@ function renderConfigExportImportPage(profiles, appUi) {
     .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.875rem; text-decoration: none; }
     .btn-primary { background: #238636; color: #fff; }
     .btn-primary:hover { background: #2ea043; }
-    .actions { margin-bottom: 1.5rem; }
-    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; }
-    .actions .back-nav {
-      display: inline-block;
-      padding: 0.5rem 1rem;
-      border-radius: 6px;
-      background: var(--app-bg, #0f1419);
-      color: var(--app-link, #58a6ff);
-      border: 1px solid transparent;
-    }
-    .actions .back-nav:hover { text-decoration: underline; background: var(--app-bg, #0f1419); color: var(--app-link, #58a6ff); }
-    .actions > a:first-of-type {
-      font-size: 1.35rem;
-      line-height: 1;
-    }
-    @media (max-width: 768px) {
-      .actions > a:first-of-type {
-        font-size: 1.9rem;
-        line-height: 1;
-        padding: 0.45rem 0.65rem;
-        margin: -0.45rem 0.5rem -0.45rem 0;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: 2.75rem;
-        min-height: 2.75rem;
-      }
-    }
     .section { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--app-table-border, #30363d); }
     .msg { margin-top: 1rem; padding: 0.5rem; border-radius: 6px; }
     .msg.err { background: #3d1f1f; color: #f85149; }
@@ -24889,7 +25346,7 @@ function renderConfigExportImportPage(profiles, appUi) {
 </head>
 <body>
   <div class="actions">
-    <a href="/" class="back-nav">← Profiles</a>
+    <a href="/" class="app-back-start">← Start</a>
   </div>
   <h1>Export / Import configuration</h1>
   <p class="sub">Export configuration to a JSON file or import from a previously exported file. User data, API keys, and passwords are never exported.</p>
@@ -24904,13 +25361,19 @@ function renderConfigExportImportPage(profiles, appUi) {
       <label for="export-scope">Scope</label>
       <select id="export-scope">
         <option value="profile">One Elenko database</option>
+        <option value="folder">Start page folder (application package)</option>
         <option value="all">All configuration documents</option>
       </select>
-      <p class="sub" style="margin-top:0.25rem;">"One Elenko database" exports the selected profile, its linked entry forms and flows, timers that target this profile (and their flows), linked queries, and APIs / JS Processing used by those flows. "All" also includes the Application design document.</p>
+      <p class="sub" style="margin-top:0.25rem;" id="export-scope-hint">"One Elenko database" exports the selected profile, its linked entry forms and flows, timers that target this profile (and their flows), linked queries, and APIs / JS Processing used by those flows. "All" also includes the Application design document.</p>
     </div>
     <div class="section" id="export-profile-wrap">
       <label for="export-profile">Elenko database</label>
       <select id="export-profile">${profileOptions}</select>
+    </div>
+    <div class="section" id="export-folder-wrap" style="display:none;">
+      <label for="export-folder">Start page folder</label>
+      <select id="export-folder">${folderOptions}</select>
+      <p class="sub" style="margin-top:0.25rem;">Exports every database in this folder plus folder name, colour, and icon. Application theme is not included. An empty folder exports only the folder definition (template).</p>
     </div>
     <div class="section">
       <button type="button" id="export-btn" class="btn btn-primary">Download export file</button>
@@ -24921,7 +25384,7 @@ function renderConfigExportImportPage(profiles, appUi) {
     <div class="section">
       <label for="import-file">Export file (JSON)</label>
       <input type="file" id="import-file" accept=".json,application/json">
-      <p class="sub" style="margin-top:0.25rem;">Select a file that was exported from this page. Existing configuration will be overwritten.</p>
+      <p class="sub" style="margin-top:0.25rem;">Select a file that was exported from this page. Database and flow documents are overwritten by <code>_id</code>. Folder packages merge into your start page layout and do not change your application theme.</p>
     </div>
     <div class="section">
       <label><input type="checkbox" id="import-backup" checked> Backup original configuration</label>
@@ -24952,7 +25415,10 @@ function renderConfigExportImportPage(profiles, appUi) {
       var importSection = document.getElementById('import-section');
       var exportScope = document.getElementById('export-scope');
       var exportProfileWrap = document.getElementById('export-profile-wrap');
+      var exportFolderWrap = document.getElementById('export-folder-wrap');
       var exportProfile = document.getElementById('export-profile');
+      var exportFolder = document.getElementById('export-folder');
+      var exportScopeHint = document.getElementById('export-scope-hint');
       var exportBtn = document.getElementById('export-btn');
       var importFile = document.getElementById('import-file');
       var importBackup = document.getElementById('import-backup');
@@ -24987,31 +25453,66 @@ function renderConfigExportImportPage(profiles, appUi) {
         var isExport = modeExport && modeExport.checked;
         exportSection.style.display = isExport ? 'block' : 'none';
         importSection.style.display = isExport ? 'none' : 'block';
-        exportProfileWrap.style.display = (exportScope && exportScope.value === 'profile') ? 'block' : 'none';
+        setExportScopeVisibility();
         msgEl.style.display = 'none';
       }
-      function setProfileVisibility() {
-        exportProfileWrap.style.display = (exportScope && exportScope.value === 'profile') ? 'block' : 'none';
+      function setExportScopeVisibility() {
+        var scopeVal = exportScope ? exportScope.value : 'profile';
+        if (exportProfileWrap) {
+          exportProfileWrap.style.display = scopeVal === 'profile' ? 'block' : 'none';
+        }
+        if (exportFolderWrap) {
+          exportFolderWrap.style.display = scopeVal === 'folder' ? 'block' : 'none';
+        }
+        if (exportScopeHint) {
+          if (scopeVal === 'folder') {
+            exportScopeHint.textContent = 'Application packages include all databases in the folder (with forms, flows, and related config) plus folder layout and icon. Theme and login branding are not exported.';
+          } else if (scopeVal === 'all') {
+            exportScopeHint.textContent = '"All" exports every Elenko database and the full Application design document (theme and layout).';
+          } else {
+            exportScopeHint.textContent = '"One Elenko database" exports the selected profile, its linked entry forms and flows, timers that target this profile (and their flows), linked queries, and APIs / JS Processing used by those flows.';
+          }
+        }
       }
       if (modeExport) modeExport.addEventListener('change', setMode);
       if (modeImport) modeImport.addEventListener('change', setMode);
-      if (exportScope) exportScope.addEventListener('change', setProfileVisibility);
+      if (exportScope) exportScope.addEventListener('change', setExportScopeVisibility);
+      try {
+        var urlParams = new URLSearchParams(window.location.search);
+        var preGroup = urlParams.get('groupId');
+        if (preGroup && exportScope && exportFolder) {
+          exportScope.value = 'folder';
+          exportFolder.value = preGroup;
+          setExportScopeVisibility();
+        }
+      } catch (_) {}
 
       if (exportBtn) exportBtn.addEventListener('click', async function() {
         msgEl.style.display = 'none';
-        var scope = exportScope && exportScope.value === 'all' ? 'all' : 'profile';
+        var scopeVal = exportScope ? exportScope.value : 'profile';
+        var scope = scopeVal === 'all' ? 'all' : scopeVal === 'folder' ? 'folder' : 'profile';
         var profileId = scope === 'profile' && exportProfile ? exportProfile.value : null;
+        var groupId = scope === 'folder' && exportFolder ? exportFolder.value : null;
         if (scope === 'profile' && !profileId) {
           msgEl.textContent = 'Select an Elenko database to export.';
           msgEl.className = 'msg err';
           msgEl.style.display = 'block';
           return;
         }
+        if (scope === 'folder' && !groupId) {
+          msgEl.textContent = 'Select a start page folder to export.';
+          msgEl.className = 'msg err';
+          msgEl.style.display = 'block';
+          return;
+        }
         try {
+          var body = { scope: scope };
+          if (scope === 'profile') body.profileId = profileId;
+          if (scope === 'folder') body.groupId = groupId;
           var r = await fetch('/api/config-export', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ scope: scope, profileId: profileId })
+            body: JSON.stringify(body)
           });
           var data = await r.json();
           if (!r.ok) {
@@ -25023,7 +25524,11 @@ function renderConfigExportImportPage(profiles, appUi) {
           var blob = new Blob([JSON.stringify(data.data, null, 2)], { type: 'application/json' });
           var a = document.createElement('a');
           a.href = URL.createObjectURL(blob);
-          a.download = 'elenko-config-export-' + (data.data.scope === 'all' ? 'all' : (data.data.profileId || 'profile')) + '-' + (data.data.exportedAt || '').slice(0, 10) + '.json';
+          var fileStem = 'elenko-config-export-';
+          if (data.data.scope === 'all') fileStem += 'all';
+          else if (data.data.scope === 'folder') fileStem += 'folder-' + (data.data.groupId || 'folder');
+          else fileStem += (data.data.profileId || 'profile');
+          a.download = fileStem + '-' + (data.data.exportedAt || '').slice(0, 10) + '.json';
           a.click();
           URL.revokeObjectURL(a.href);
           var c = summarizeExportCounts(data.data);
@@ -25267,7 +25772,7 @@ function renderManageUsersPage(users, currentUsername, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/">← Profiles</a> <a href="/account/users/create" class="btn">Create user</a></div>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a> <a href="/account/users/create" class="btn">Create user</a></div>
   <h1>Manage users</h1>
   <p class="sub">Change role, key file, enforce key login, set password, or delete users. Upload an existing <code>elenko-&lt;username&gt;.key</code> file to register the same key on this instance (user must have no key yet).</p>
   <table>
@@ -25525,12 +26030,12 @@ function renderUnlockKeyFilePage(errorMessage, appUi, session) {
     label { display: block; margin-top: 1rem; margin-bottom: 0.25rem; color: var(--app-label, #8b949e); }
     input[type="file"] { width: 100%; color: var(--app-label, #8b949e); }
     .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
-    .btn-secondary { display: inline-block; margin-top: 0.5rem; background: #21262d; color: #e6edf3; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; }
     .login-err { color: #f85149; margin-top: 1rem; }
     .msg.ok { color: #3fb950; margin-top: 1rem; }
   </style>
 </head>
 <body>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a></div>
   <h1>Provide key file</h1>
   ${status}
   ${err}
@@ -25539,7 +26044,7 @@ function renderUnlockKeyFilePage(errorMessage, appUi, session) {
     <input type="file" id="keyFile" name="keyFile" accept=".key,application/octet-stream" required>
     <button type="submit" class="btn">Load key file</button>
   </form>` : ""}
-  <a href="/" class="btn-secondary">Back to start</a>
+  <a href="/" class="form-cancel">Cancel</a>
 </body>
 </html>`;
 }
@@ -25573,8 +26078,6 @@ function renderCreateUserPage(errorMessage, created, appUi, keyfileToken) {
     select { width: 100%; padding: 0.5rem; background: var(--app-table-bg, #161b22); border: 1px solid var(--app-table-border, #30363d); border-radius: 6px; color: var(--app-text, #e6edf3); font-size: 1rem; }
     .btn { width: 100%; padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 1rem; margin-top: 1rem; background: #238636; color: #fff; }
     .btn:hover { background: #2ea043; }
-    .btn-secondary { display: inline-block; margin-top: 0.5rem; background: #21262d; color: #e6edf3; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; }
-    .btn-secondary:hover { background: #30363d; }
     .login-err { color: #f85149; margin-top: 1rem; }
     .msg.ok { color: #3fb950; margin-top: 1rem; }
     .checkbox-row { margin-top: 1rem; }
@@ -25583,8 +26086,8 @@ function renderCreateUserPage(errorMessage, created, appUi, keyfileToken) {
   </style>
 </head>
 <body>
-  <h1>Elenko</h1>
-  <p class="sub">Create new user</p>
+  <div class="actions"><a href="/" class="app-back-start">← Start</a></div>
+  <h1>Create user</h1>
   ${createdMsg}
   ${keyDownloadMsg}
   ${err}
@@ -25609,7 +26112,7 @@ function renderCreateUserPage(errorMessage, created, appUi, keyfileToken) {
     </div>
     <button type="submit" class="btn">Create user</button>
   </form>
-  <a href="/" class="btn-secondary">Back to start</a>
+  <a href="/account/users" class="form-cancel">← Manage users</a>
 </body>
 </html>`;
 }
