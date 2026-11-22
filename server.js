@@ -2893,7 +2893,17 @@ function apiKeyLookupErrorInfo(err) {
 /** Stored on `elenko_api.apiAuthType`. Legacy docs without it use bearer when `apiKeyRef` is set, else none. */
 function normalizeElenkoApiAuthType(apiDoc) {
   const t = apiDoc && typeof apiDoc.apiAuthType === "string" ? apiDoc.apiAuthType.trim().toLowerCase() : "";
-  if (t === "none" || t === "bearer" || t === "x-api-key" || t === "basic" || t === "digest" || t === "fritz") return t;
+  if (
+    t === "none" ||
+    t === "bearer" ||
+    t === "x-api-key" ||
+    t === "x-goog-api-key" ||
+    t === "basic" ||
+    t === "digest" ||
+    t === "fritz"
+  ) {
+    return t;
+  }
   const kr = apiDoc && typeof apiDoc.apiKeyRef === "string" ? apiDoc.apiKeyRef.trim() : "";
   return kr ? "bearer" : "none";
 }
@@ -2930,7 +2940,7 @@ async function resolveApiWorkerAuthBundle(apiDoc) {
     }
   }
 
-  if (authType === "bearer" || authType === "x-api-key") {
+  if (authType === "bearer" || authType === "x-api-key" || authType === "x-goog-api-key") {
     apiKeyRef = apiDoc && typeof apiDoc.apiKeyRef === "string" ? apiDoc.apiKeyRef.trim() : "";
     if (apiKeyRef) {
       const r = await loadRef(apiKeyRef);
@@ -5702,11 +5712,26 @@ function mergeFolderPackageIntoProfileListLayout(existingLayout, incomingSlice) 
   return normalizeProfileListLayout(layout);
 }
 
+const PROFILE_LIST_UNLINKED_GROUP_ID = "__elenko_unlinked_profiles__";
+
+function canonicalizeProfileListLayoutWithProfiles(layout, profiles) {
+  const list = normalizeProfileListLayout(layout);
+  const out = [];
+  for (const item of list) {
+    if (item.kind === "group") {
+      out.push(item);
+      continue;
+    }
+    const p = findProfileInListForLayoutRef(profiles, item.profileId);
+    out.push(p ? { kind: "profile", profileId: p._id } : item);
+  }
+  return normalizeProfileListLayout(out);
+}
+
 /** Ordered sections for home / profiles list (groups, loose blocks, unlisted profiles at end). */
-function buildProfileListSections(profiles, layout) {
+function buildProfileListSections(profiles, layout, opts) {
   const list = Array.isArray(profiles) ? profiles : [];
-  const byId = new Map(list.map((p) => [p._id, p]));
-  const layoutNorm = normalizeProfileListLayout(layout);
+  const layoutNorm = canonicalizeProfileListLayoutWithProfiles(layout, list);
   const placedIds = new Set();
   const sections = [];
   let currentGroup = null;
@@ -5737,9 +5762,9 @@ function buildProfileListSections(profiles, layout) {
       };
       sections.push(currentGroup);
     } else {
-      placedIds.add(item.profileId);
-      const p = byId.get(item.profileId);
+      const p = findProfileInListForLayoutRef(list, item.profileId);
       if (!p) continue;
+      placedIds.add(p._id);
       const entry = profileListSectionEntry(p);
       if (currentGroup) currentGroup.profiles.push(entry);
       else ensureLoose().profiles.push(entry);
@@ -5752,10 +5777,26 @@ function buildProfileListSections(profiles, layout) {
     .filter((p) => !placedIds.has(p._id))
     .sort((a, b) => String(a.name || a._id).localeCompare(String(b.name || b._id), undefined, { sensitivity: "base" }));
   if (unlisted.length > 0) {
-    sections.push({
-      kind: "profiles",
-      profiles: unlisted.map((p) => profileListSectionEntry(p)),
-    });
+  const unlistedEntries = unlisted.map((p) => profileListSectionEntry(p));
+    if (opts && opts.unlinkedAsGroup) {
+      sections.push({
+        kind: "group",
+        id: PROFILE_LIST_UNLINKED_GROUP_ID,
+        label:
+          typeof opts.unlinkedGroupLabel === "string" && opts.unlinkedGroupLabel.trim()
+            ? opts.unlinkedGroupLabel.trim()
+            : "Unlinked (not on start page layout)",
+        listColor: "",
+        iconFile: "",
+        profiles: unlistedEntries,
+        unlinked: true,
+      });
+    } else {
+      sections.push({
+        kind: "profiles",
+        profiles: unlistedEntries,
+      });
+    }
   }
 
   return sections.filter((s) => (s.kind === "group" ? s.profiles.length > 0 : s.profiles.length > 0));
@@ -5765,28 +5806,43 @@ function renderProfileListTableRow(p, opts) {
   const adminMode = !!(opts && opts.adminMode);
   const mobileHideDate = !!(opts && opts.mobileHideDate);
   const groupId = opts && opts.groupId ? String(opts.groupId) : "";
+  const showLinkToStart = !!(opts && opts.showLinkToStart);
   const createdDate = p.createdAt ? formatDateOnly(p.createdAt) : "—";
   const truncate = (s, max) => (s && s.length > max ? s.slice(0, max) + "…" : s || "");
   const href = adminMode
     ? `/profile/${encodeURIComponent(p._id)}/edit`
     : `/profile/${encodeURIComponent(p._id)}`;
-  const nameCell = `<a href="${href}">${escapeHtml(p.name || p._id)}</a>`;
+  const indexGapNote =
+    p && p._elenkoIndexGap
+      ? ` <span class="profile-index-gap" title="Found via CouchDB view, not the profile search index">[index gap]</span>`
+      : "";
+  const nameCell = `<a href="${href}">${escapeHtml(p.name || p._id)}</a>${indexGapNote}`;
+  let descText = p.description || "";
+  if (adminMode && p._elenkoIndexGap) {
+    const note = "Not returned by profile index; still in CouchDB.";
+    descText = descText ? descText + " — " + note : note;
+  }
   const descCell = adminMode
-    ? escapeHtml(truncate(p.description || "", 80))
+    ? escapeHtml(truncate(descText, 100))
     : escapeHtml(p.description || "—");
   const dateTd = mobileHideDate
     ? `<td class="col-mobile-hidden">${escapeHtml(createdDate)}</td>`
     : `<td>${escapeHtml(createdDate)}</td>`;
+  const hideMember = groupId && opts && opts.groupInitiallyHidden;
   const groupAttrs = groupId
-    ? ` class="profile-group-member" data-group-id="${escapeHtml(groupId)}" hidden`
+    ? ` class="profile-group-member" data-group-id="${escapeHtml(groupId)}"${hideMember ? " hidden" : ""}`
     : "";
   if (adminMode) {
+    const linkStartBtn = showLinkToStart
+      ? `<button type="button" class="copy-btn icon-action profile-link-start-btn" data-id="${escapeHtml(p._id)}" aria-label="Add to start page layout" title="Add to start page layout">⊕</button>`
+      : "";
     return (
       `<tr${groupAttrs}>` +
       `<td>${nameCell}</td>` +
       `<td>${descCell}</td>` +
       dateTd +
       `<td class="row-actions"><a href="/profile/${encodeURIComponent(p._id)}/edit" class="edit-link icon-action" aria-label="Edit" title="Edit">✎</a>` +
+      linkStartBtn +
       `<button type="button" class="copy-btn icon-action profile-copy-btn" data-id="${escapeHtml(p._id)}" aria-label="Copy" title="Copy">⧉</button>` +
       `<button type="button" class="delete-btn icon-action delete-profile-btn" data-id="${escapeHtml(p._id)}" data-rev="${escapeHtml(p._rev || "")}" aria-label="Delete" title="Delete">✕</button></td>` +
       `</tr>`
@@ -5805,14 +5861,27 @@ function renderGroupedProfileListBody(sections, opts) {
       const gid = escapeHtml(section.id);
       const label = escapeHtml(section.label);
       const count = section.profiles.length;
+      const isUnlinked = !!(section.unlinked || section.id === PROFILE_LIST_UNLINKED_GROUP_ID);
+      const expanded = isUnlinked;
+      const toggleClass = expanded ? "profile-group-toggle" : "profile-group-toggle collapsed";
+      const ariaExpanded = expanded ? "true" : "false";
+      const headerExtra = isUnlinked
+        ? ' <span class="profile-group-hint">Profile documents not linked on the start page layout</span>'
+        : "";
       html +=
-        `<tr class="profile-group-header" data-group-id="${gid}"><td colspan="${colspan}">` +
-        `<button type="button" class="profile-group-toggle collapsed" data-group-id="${gid}" aria-expanded="false">` +
+        `<tr class="profile-group-header${isUnlinked ? " profile-group-header--unlinked" : ""}" data-group-id="${gid}"><td colspan="${colspan}">` +
+        `<button type="button" class="${toggleClass}" data-group-id="${gid}" aria-expanded="${ariaExpanded}">` +
         `<span class="profile-group-chevron" aria-hidden="true">▶</span> ${label} ` +
-        `<span class="profile-group-count">(${count})</span></button></td></tr>`;
+        `<span class="profile-group-count">(${count})</span></button>${headerExtra}</td></tr>`;
       for (const entry of section.profiles) {
         const p = profileDocFromListSectionEntry(entry);
-        html += renderProfileListTableRow(p, { adminMode, mobileHideDate, groupId: section.id });
+        html += renderProfileListTableRow(p, {
+          adminMode,
+          mobileHideDate,
+          groupId: section.id,
+          showLinkToStart: isUnlinked,
+          groupInitiallyHidden: !expanded,
+        });
       }
     } else {
       for (const entry of section.profiles) {
@@ -5832,6 +5901,12 @@ const PROFILE_LIST_GROUP_STYLES = `
     .profile-group-chevron { display: inline-block; width: 1rem; color: var(--app-label, #8b949e); }
     .profile-group-toggle:not(.collapsed) .profile-group-chevron { transform: rotate(90deg); }
     .profile-group-count { color: var(--app-label, #8b949e); font-weight: 400; font-size: 0.92em; }
+    .profile-group-header--unlinked td { border-top: 2px solid var(--app-table-border, #21262d); }
+    .profile-group-hint { display: block; margin-top: 0.25rem; font-size: 0.85rem; font-weight: 400; color: var(--app-label, #8b949e); }
+    .profile-index-gap { font-size: 0.75rem; color: #d29922; margin-left: 0.35rem; vertical-align: middle; }
+    .btn-secondary { background: #21262d; color: var(--app-text, #e6edf3); border: 1px solid var(--app-table-border, #30363d); padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font: inherit; margin-bottom: 1rem; }
+    .btn-secondary:hover { background: #30363d; }
+    .profiles-unlinked-toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; margin-bottom: 0.75rem; }
 `;
 
 const PROFILE_LIST_GROUP_SCRIPT = `
@@ -6074,8 +6149,7 @@ const START_PAGE_ICON_SCRIPT = `
 async function saveProfileListLayoutToAppConfig(layout) {
   if (!configDb) throw new Error("Config store not available");
   const normalized = normalizeProfileListLayout(layout);
-  const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
-  let doc = result.docs && result.docs[0];
+  let doc = await findCanonicalAppConfigDoc();
   if (!doc || doc.type !== "elenko_app_config") {
     doc = { type: "elenko_app_config", theme: { ...DEFAULT_APP_THEME } };
   }
@@ -6084,22 +6158,94 @@ async function saveProfileListLayoutToAppConfig(layout) {
   invalidateAppUiConfigCache();
 }
 
-async function removeProfileFromListLayout(profileId) {
+async function removeProfileFromListLayout(profileId, profileName) {
   if (!configDb || !profileId) return;
+  const pid = String(profileId).trim();
+  const nameTrim = profileName != null ? String(profileName).trim() : "";
   try {
-    const result = await configDb.find({ selector: { type: "elenko_app_config" }, limit: 1 });
-    const doc = result.docs && result.docs[0];
+    const doc = await findCanonicalAppConfigDoc();
     if (!doc || doc.type !== "elenko_app_config" || !Array.isArray(doc.profileListLayout)) return;
-    const next = normalizeProfileListLayout(doc.profileListLayout).filter(
-      (item) => !(item.kind === "profile" && item.profileId === profileId)
-    );
-    if (next.length === normalizeProfileListLayout(doc.profileListLayout).length) return;
+    const before = normalizeProfileListLayout(doc.profileListLayout);
+    const next = before.filter((item) => {
+      if (item.kind !== "profile") return true;
+      if (item.profileId === pid) return false;
+      if (nameTrim && item.profileId === nameTrim) return false;
+      return true;
+    });
+    if (next.length === before.length) return;
     doc.profileListLayout = next;
     await configDb.insert(doc);
     invalidateAppUiConfigCache();
   } catch (e) {
     console.warn("removeProfileFromListLayout:", e.message || e);
   }
+}
+
+/** Layout rows may use legacy profile name instead of _id; fix that profile's row after rename. */
+async function syncProfileListLayoutProfileRef(profileDoc, previousName) {
+  if (!configDb || !profileDoc || !profileDoc._id) return;
+  const pid = String(profileDoc._id).trim();
+  const prevName = previousName != null ? String(previousName).trim() : "";
+  const newName = profileDoc.name != null ? String(profileDoc.name).trim() : "";
+  const doc = await findCanonicalAppConfigDoc();
+  if (!doc || doc.type !== "elenko_app_config" || !Array.isArray(doc.profileListLayout)) return;
+  const prevNorm = normalizeProfileListLayout(doc.profileListLayout);
+  let layout = prevNorm.slice();
+  const nameAliases = new Set([pid]);
+  if (prevName) nameAliases.add(prevName);
+  if (newName) nameAliases.add(newName);
+  layout = layout.map((item) => {
+    if (item.kind !== "profile") return item;
+    if (nameAliases.has(item.profileId)) return { kind: "profile", profileId: pid };
+    return item;
+  });
+  const next = normalizeProfileListLayout(layout);
+  if (JSON.stringify(next) === JSON.stringify(prevNorm)) return;
+  doc.profileListLayout = next;
+  await configDb.insert(doc);
+  invalidateAppUiConfigCache();
+}
+
+/** Index for a new ungrouped database: before the first folder, or at end if there are no folders. */
+function insertIndexForUngroupedProfileLayout(layout) {
+  const list = normalizeProfileListLayout(layout);
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].kind === "group") return i;
+  }
+  return list.length;
+}
+
+async function ensureProfileListedInLayoutById(profileDoc) {
+  if (!configDb || !profileDoc || !profileDoc._id) return;
+  const pid = String(profileDoc._id).trim();
+  const doc = await findCanonicalAppConfigDoc();
+  const layout = normalizeProfileListLayout(doc ? doc.profileListLayout : []);
+  const listed = layout.some((item) => item.kind === "profile" && item.profileId === pid);
+  if (listed) return;
+  await insertUngroupedProfileIntoListLayoutIfMissing(profileDoc);
+}
+
+async function insertUngroupedProfileIntoListLayoutIfMissing(profileDoc) {
+  if (!configDb || !profileDoc || !profileDoc._id) return;
+  const pid = String(profileDoc._id).trim();
+  const nameTrim = profileDoc.name != null ? String(profileDoc.name).trim() : "";
+  let doc = await findCanonicalAppConfigDoc();
+  if (!doc) {
+    doc = { type: "elenko_app_config", theme: { ...DEFAULT_APP_THEME }, profileListLayout: [] };
+  }
+  let layout = normalizeProfileListLayout(doc.profileListLayout);
+  const already = layout.some(
+    (item) =>
+      item.kind === "profile" &&
+      (item.profileId === pid || (nameTrim && item.profileId === nameTrim))
+  );
+  if (already) return;
+  const insertAt = insertIndexForUngroupedProfileLayout(layout);
+  layout.splice(insertAt, 0, { kind: "profile", profileId: pid });
+  doc.profileListLayout = layout;
+  if (doc.type !== "elenko_app_config") doc.type = "elenko_app_config";
+  await configDb.insert(doc);
+  invalidateAppUiConfigCache();
 }
 
 async function getAppUiConfig() {
@@ -6119,11 +6265,7 @@ async function getAppUiConfig() {
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 200 * attempt));
-      const result = await configDb.find({
-        selector: { type: "elenko_app_config" },
-        limit: 1,
-      });
-      const doc = (result.docs && result.docs[0]) || null;
+      const doc = (await findCanonicalAppConfigDoc()) || null;
       if (!doc) {
         cachedAppConfig = defaultAppUiConfigObject();
       } else {
@@ -7841,6 +7983,215 @@ function filterProfilesVisibleToUser(req, profiles) {
   return (profiles || []).filter((p) => canUserSeePersonalEncryptedProfile(req, p));
 }
 
+const ELENKO_PROFILES_LIST_LIMIT = 5000;
+
+async function loadElenkoProfileDocByLayoutRef(dbInstance, ref, fields) {
+  const key = ref != null ? String(ref).trim() : "";
+  if (!dbInstance || !key) return null;
+  try {
+    const full = await dbInstance.get(key);
+    if (full && full.type === "elenko_profile") return pickElenkoProfileFields(full, fields);
+  } catch (e) {
+    if (e && e.statusCode !== 404) throw e;
+  }
+  try {
+    const byName = await dbInstance.find({
+      selector: { type: "elenko_profile", name: key },
+      limit: 2,
+    });
+    const hits = (byName.docs || []).filter((d) => d && d.type === "elenko_profile" && d._id);
+    if (hits.length === 1) return pickElenkoProfileFields(hits[0], fields);
+  } catch (_) {}
+  return null;
+}
+
+const ELENKO_PROFILES_DESIGN_DOC = "_design/elenko_profiles";
+
+async function ensureElenkoProfilesDesignView(dbInstance) {
+  if (!dbInstance) return false;
+  try {
+    await dbInstance.get(ELENKO_PROFILES_DESIGN_DOC);
+    return true;
+  } catch (e) {
+    if (e && e.statusCode !== 404) return false;
+  }
+  try {
+    await dbInstance.insert({
+      _id: ELENKO_PROFILES_DESIGN_DOC,
+      views: {
+        all: {
+          map: "function(doc) { if (doc.type === 'elenko_profile') emit(doc._id, null); }",
+        },
+      },
+    });
+    return true;
+  } catch (e) {
+    return e && e.statusCode === 409;
+  }
+}
+
+async function loadElenkoProfilesFromView(dbInstance, fields) {
+  const byId = new Map();
+  if (!dbInstance) return byId;
+  await ensureElenkoProfilesDesignView(dbInstance);
+  const pageSize = 500;
+  let skip = 0;
+  try {
+    for (let page = 0; page < 40; page++) {
+      const result = await dbInstance.view("elenko_profiles", "all", {
+        include_docs: true,
+        limit: pageSize,
+        skip,
+      });
+      const rows = result.rows || [];
+      for (const row of rows) {
+        const d = row && row.doc;
+        if (!d || d.type !== "elenko_profile" || !d._id) continue;
+        byId.set(String(d._id), pickElenkoProfileFields(d, fields));
+      }
+      if (rows.length < pageSize) break;
+      skip += rows.length;
+      if (skip >= ELENKO_PROFILES_LIST_LIMIT) break;
+    }
+  } catch (_) {}
+  return byId;
+}
+
+function pickElenkoProfileFields(doc, fields) {
+  if (!doc || typeof doc !== "object") return doc;
+  if (!Array.isArray(fields) || fields.length === 0) return doc;
+  const out = {};
+  for (const key of fields) {
+    if (key && doc[key] !== undefined) out[key] = doc[key];
+  }
+  if (doc._id !== undefined) out._id = doc._id;
+  if (doc._rev !== undefined) out._rev = doc._rev;
+  if (doc.type !== undefined) out.type = doc.type;
+  return out;
+}
+
+/**
+ * Mango defaults to limit 25; load all profiles for start page and admin lists.
+ * Merge Mango, _view (complete), and layout refs — [type,name] index can miss docs after renames.
+ */
+async function findAllElenkoProfiles(dbInstance, opts = {}) {
+  if (!dbInstance) return [];
+  const fields = opts.fields;
+  const pageLimit = 500;
+  const base = { selector: { type: "elenko_profile" }, limit: pageLimit };
+  if (Array.isArray(fields) && fields.length > 0) base.fields = fields;
+
+  const mergeDoc = (byId, d) => {
+    if (!d || !d._id) return;
+    const id = String(d._id);
+    if (!byId.has(id)) byId.set(id, pickElenkoProfileFields(d, fields));
+  };
+
+  const runFindPaged = async (extra) => {
+    const out = [];
+    let bookmark;
+    for (let page = 0; page < 40; page++) {
+      const q = { ...base, ...(extra || {}) };
+      if (bookmark) q.bookmark = bookmark;
+      try {
+        const result = await dbInstance.find(q);
+        const batch = Array.isArray(result.docs) ? result.docs : [];
+        out.push(...batch);
+        if (!result.bookmark || batch.length < pageLimit) break;
+        bookmark = result.bookmark;
+      } catch (_) {
+        break;
+      }
+    }
+    return out;
+  };
+
+  const byId = new Map();
+  const mangoIds = new Set();
+  const fromView = await loadElenkoProfilesFromView(dbInstance, fields);
+  for (const [id, doc] of fromView) {
+    if (!byId.has(id)) byId.set(id, doc);
+  }
+
+  const indexAttempts = [{ use_index: ["by-type-id"] }, { use_index: ["by-type"] }, {}];
+  for (const extra of indexAttempts) {
+    const docs = await runFindPaged(extra);
+    for (const d of docs) {
+      if (d && d._id) mangoIds.add(String(d._id));
+      mergeDoc(byId, d);
+    }
+  }
+  try {
+    const appDoc = await findCanonicalAppConfigDoc();
+    const layout = normalizeProfileListLayout(appDoc && appDoc.profileListLayout);
+    for (const item of layout) {
+      if (!item || item.kind !== "profile" || !item.profileId) continue;
+      const ref = String(item.profileId).trim();
+      if (!ref || byId.has(ref)) continue;
+      const full = await loadElenkoProfileDocByLayoutRef(dbInstance, ref, fields);
+      if (full && full._id) byId.set(String(full._id), full);
+    }
+  } catch (_) {}
+
+  for (const id of fromView.keys()) {
+    if (mangoIds.has(id)) continue;
+    const doc = byId.get(id);
+    if (!doc) continue;
+    const picked = pickElenkoProfileFields(doc, fields);
+    picked._elenkoIndexGap = true;
+    byId.set(id, picked);
+  }
+
+  let docs = [...byId.values()];
+  for (const d of docs) {
+    if (d && (d.name == null || String(d.name).trim() === "") && d._id) {
+      d.name = String(d._id);
+    }
+  }
+  docs.sort((a, b) =>
+    String(a && a.name ? a.name : a && a._id).localeCompare(
+      String(b && b.name ? b.name : b && b._id),
+      undefined,
+      { sensitivity: "base" }
+    )
+  );
+  return docs;
+}
+
+/** Profile _ids that the start-page layout successfully resolves to a profile doc. */
+function computePlacedProfileIds(profiles, layout) {
+  const list = Array.isArray(profiles) ? profiles : [];
+  const layoutNorm = canonicalizeProfileListLayoutWithProfiles(layout, list);
+  const placed = new Set();
+  for (const item of layoutNorm) {
+    if (!item || item.kind !== "profile") continue;
+    const p = findProfileInListForLayoutRef(list, item.profileId);
+    if (p && p._id) placed.add(String(p._id));
+  }
+  return placed;
+}
+
+function filterUnlinkedElenkoProfiles(profiles, layout) {
+  const placed = computePlacedProfileIds(profiles, layout);
+  return (profiles || []).filter((p) => p && p._id && !placed.has(String(p._id)));
+}
+
+/** Admin list: merge CouchDB view so profile docs missing from Mango still appear. */
+async function findElenkoProfilesForAdminList(dbInstance) {
+  const fields = ["_id", "_rev", "name", "description", "createdAt"];
+  return findAllElenkoProfiles(dbInstance, { fields });
+}
+
+function findProfileInListForLayoutRef(profiles, layoutRef) {
+  const ref = layoutRef != null ? String(layoutRef).trim() : "";
+  if (!ref || !Array.isArray(profiles)) return null;
+  const byId = profiles.find((p) => p && p._id === ref);
+  if (byId) return byId;
+  const byName = profiles.filter((p) => p && String(p.name || "").trim() === ref);
+  if (byName.length === 1) return byName[0];
+  return null;
+}
+
 function respondEncryptionAccessDenied(res, encAccess, format = "json") {
   if (encAccess && encAccess.hidden) {
     if (format === "html") return res.status(404).send(renderErrorPage("Profile not found"));
@@ -8558,6 +8909,19 @@ async function initCouch(options) {
     if (e.statusCode !== 409) throw e;
   }
 
+  try {
+    await db.insert({
+      _id: "_design/elenko_profiles",
+      views: {
+        all: {
+          map: "function(doc) { if (doc.type === 'elenko_profile') emit(doc._id, null); }",
+        },
+      },
+    });
+  } catch (e) {
+    if (e.statusCode !== 409) throw e;
+  }
+
   // Index for pending-deletions list and all-documents list
   try {
     await db.createIndex({
@@ -9042,6 +9406,30 @@ async function hydrateKeyFileSession(req, res, next) {
 
 app.use(hydrateKeyFileSession);
 
+const ELENKO_SERVER_BUILD_ID = "2026-11-10-unlinked-profiles";
+
+async function sendUnlinkedProfilesPage(res) {
+  const fields = ["_id", "_rev", "name", "description", "createdAt"];
+  const profiles = await findAllElenkoProfiles(db, { fields });
+  const appUi = await getAppUiConfig();
+  const layout = appUi && appUi.profileListLayout;
+  const unlinked = filterUnlinkedElenkoProfiles(profiles, layout);
+  const placedCount = computePlacedProfileIds(profiles, layout).size;
+  res.set("Content-Type", "text/html; charset=utf-8");
+  res.send(renderUnlinkedProfilesPage(unlinked, profiles.length, placedCount, appUi));
+}
+
+app.get("/api/admin/capabilities", requireAdmin, (req, res) => {
+  res.json({
+    ok: true,
+    buildId: ELENKO_SERVER_BUILD_ID,
+    routes: {
+      unlinkedProfilesHtml: ["/unlinked-profiles", "/profiles/unlinked"],
+      linkToStartLayout: "POST /api/profiles/:id/link-to-start-layout",
+    },
+  });
+});
+
 function buildKeyFileNoticeHtml(session) {
   if (!session || !session.keyFileRegistered || session.keyFileUnlocked) return "";
   return `<p class="keyfile-banner" style="background:#3d2e00;color:#f0c040;padding:0.75rem 1rem;border-radius:6px;margin:0 0 1rem;">Your key file is not loaded. <a href="/account/unlock-keyfile" style="color:#ffe066;">Provide key file</a> for encrypted database access (when enabled).</p>`;
@@ -9049,11 +9437,7 @@ function buildKeyFileNoticeHtml(session) {
 
 app.get("/", async (req, res) => {
   try {
-    const result = await db.find({
-      selector: { type: "elenko_profile" },
-      sort: [{ name: "asc" }],
-    });
-    const profiles = filterProfilesVisibleToUser(req, result.docs || []);
+    const profiles = filterProfilesVisibleToUser(req, await findAllElenkoProfiles(db));
     const appUi = await getAppUiConfig();
     let appConfigAttachments = {};
     if (configDb) {
@@ -9078,18 +9462,49 @@ app.get("/", async (req, res) => {
 
 app.get("/profiles", requireAdmin, async (req, res) => {
   try {
-    const result = await db.find({
-      selector: { type: "elenko_profile" },
-      fields: ["_id", "_rev", "name", "description", "createdAt"],
-      sort: [{ name: "asc" }],
-    });
-    const profiles = result.docs || [];
+    const profiles = await findElenkoProfilesForAdminList(db);
     const appUi = await getAppUiConfig();
+    const unlinkedOnly = String(req.query.show || "").trim().toLowerCase() === "unlinked";
     res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(renderProfilesListPage(profiles, appUi));
+    res.send(renderProfilesListPage(profiles, appUi, { unlinkedOnly }));
   } catch (err) {
     console.error("Error loading profiles list:", err);
     res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/unlinked-profiles", requireAdmin, async (req, res) => {
+  try {
+    await sendUnlinkedProfilesPage(res);
+  } catch (err) {
+    console.error("Error loading unlinked profiles:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.get("/profiles/unlinked", requireAdmin, async (req, res) => {
+  try {
+    await sendUnlinkedProfilesPage(res);
+  } catch (err) {
+    console.error("Error loading unlinked profiles:", err);
+    res.status(500).send(renderErrorPage(err.message));
+  }
+});
+
+app.post("/api/profiles/:id/link-to-start-layout", requireAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const doc = await db.get(id);
+    if (!doc || doc.type !== "elenko_profile") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    await insertUngroupedProfileIntoListLayoutIfMissing(doc);
+    invalidateAppUiConfigCache();
+    res.json({ ok: true, id: doc._id, name: doc.name || doc._id });
+  } catch (err) {
+    if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
+    console.error("link-to-start-layout:", err);
+    res.status(500).json({ error: err.message || "Failed" });
   }
 });
 
@@ -9224,12 +9639,9 @@ app.get("/application-properties", requireAdmin, async (req, res) => {
 
 app.get("/profile-list-layout", requireAdmin, async (req, res) => {
   try {
-    const result = await db.find({
-      selector: { type: "elenko_profile" },
+    const profiles = await findAllElenkoProfiles(db, {
       fields: ["_id", "name", "description"],
-      sort: [{ name: "asc" }],
     });
-    const profiles = result.docs || [];
     const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(renderProfileListLayoutPage(profiles, appUi, null));
@@ -9241,7 +9653,11 @@ app.get("/profile-list-layout", requireAdmin, async (req, res) => {
 
 app.post("/api/profile-list-layout", requireAdmin, async (req, res) => {
   try {
-    const layout = normalizeProfileListLayout(req.body && req.body.profileListLayout);
+    const profiles = await findAllElenkoProfiles(db, { fields: ["_id", "name"] });
+    const layout = canonicalizeProfileListLayoutWithProfiles(
+      req.body && req.body.profileListLayout,
+      profiles
+    );
     await saveProfileListLayoutToAppConfig(layout);
     res.json({ ok: true, profileListLayout: layout });
   } catch (err) {
@@ -9578,12 +9994,7 @@ app.post("/api/application-properties", requireAdmin, async (req, res) => {
 
 app.get("/config-export-import", requireAdmin, async (req, res) => {
   try {
-    const result = await db.find({
-      selector: { type: "elenko_profile" },
-      fields: ["_id", "name"],
-      sort: [{ name: "asc" }],
-    });
-    const profiles = result.docs || [];
+    const profiles = await findAllElenkoProfiles(db, { fields: ["_id", "name"] });
     const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(renderConfigExportImportPage(profiles, appUi));
@@ -9595,12 +10006,7 @@ app.get("/config-export-import", requireAdmin, async (req, res) => {
 
 app.get("/data-export-import", requireAdmin, async (req, res) => {
   try {
-    const result = await db.find({
-      selector: { type: "elenko_profile" },
-      fields: ["_id", "name"],
-      sort: [{ name: "asc" }],
-    });
-    const profiles = result.docs || [];
+    const profiles = await findAllElenkoProfiles(db, { fields: ["_id", "name"] });
     const appUi = await getAppUiConfig();
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(renderDataExportImportPage(profiles, appUi));
@@ -10474,12 +10880,10 @@ app.delete("/api/account/users/:id", requireAdmin, async (req, res) => {
 
 app.get("/api/profiles", async (req, res) => {
   try {
-    const result = await db.find({
-      selector: { type: "elenko_profile" },
+    const profiles = await findAllElenkoProfiles(db, {
       fields: ["_id", "_rev", "name", "description", "createdAt", "encryption"],
-      sort: [{ name: "asc" }],
     });
-    res.json({ profiles: filterProfilesVisibleToUser(req, result.docs || []) });
+    res.json({ profiles: filterProfilesVisibleToUser(req, profiles) });
   } catch (err) {
     console.error("Error loading profiles:", err);
     res.status(500).json({ error: err.message });
@@ -12769,11 +13173,10 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
         version: 1,
       };
     }
-    const nameNormChanged =
-      normalizeProfileNameForDbCode(previousName) !== normalizeProfileNameForDbCode(doc.name);
-    if (!doc.dbCode8 || nameNormChanged) {
+    if (!doc.dbCode8) {
       doc.dbCode8 = await assignDbCode8(db, doc.name, doc._id);
     }
+    doc.type = "elenko_profile";
     const result = await db.insert(doc);
     const latest = await db.get(id);
     const encNewlyEnabled = !prevEncEnabled && isProfilePersonalEncryptionEnabled(latest);
@@ -12801,6 +13204,9 @@ app.put("/api/profiles/:id", requireAdmin, async (req, res) => {
         await recomputePrimaryKeysForProfileRecords(db, profileAfter);
       }
     }
+    await syncProfileListLayoutProfileRef(latest, previousName);
+    await ensureProfileListedInLayoutById(latest);
+    invalidateAppUiConfigCache();
     clearProfileListCache(id);
     res.json({
       ok: true,
@@ -14031,6 +14437,8 @@ app.post("/api/profiles/:id/copy", requireAdmin, async (req, res) => {
       }
     }
     created = await ensureProfileDbCode8(db, created);
+    await insertUngroupedProfileIntoListLayoutIfMissing(created);
+    invalidateAppUiConfigCache();
     res.status(201).json({ ok: true, id: result.id, rev: created._rev, name: newName });
   } catch (err) {
     if (err?.statusCode === 404) return res.status(404).json({ error: "Profile not found" });
@@ -14058,7 +14466,7 @@ app.post("/api/profiles/:id/delete", requireAdmin, async (req, res) => {
     });
     const entries = (recordsResult.docs || []).map((r) => ({ id: r._id, rev: r._rev }));
     await db.destroy(id, _rev);
-    await removeProfileFromListLayout(id);
+    await removeProfileFromListLayout(id, doc.name);
     let redirect = "/";
     if (entries.length > 0) {
       await db.insert({
@@ -17871,17 +18279,140 @@ function renderFlowsListPage(flows, appUi) {
 </html>`;
 }
 
-function renderProfilesListPage(profiles, appUi) {
+function renderUnlinkedProfilesPage(unlinked, totalCount, placedCount, appUi) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
-  const sections = buildProfileListSections(profiles, appUi && appUi.profileListLayout);
+  const rows =
+    unlinked.length > 0
+      ? unlinked
+          .map((p) => renderProfileListTableRow(p, { adminMode: true, mobileHideDate: false, showLinkToStart: true }))
+          .join("")
+      : `<tr><td colspan="4" class="empty">Every profile document is linked on the start page layout.</td></tr>`;
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  ${FAVICON_LINKS}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elenko – Unlinked profiles</title>
+  <style>
+    ${themeVars}
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: var(--app-bg, #0f1419); color: var(--app-text, #e6edf3); max-width: 56rem; }
+    h1 { font-weight: 600; margin-bottom: 0.5rem; }
+    .sub { color: var(--app-label, #8b949e); margin-bottom: 1.5rem; }
+    .actions { margin-bottom: 1.5rem; }
+    .actions a { color: var(--app-link, #58a6ff); text-decoration: none; margin-right: 1rem; }
+    table { width: 100%; border-collapse: collapse; background: var(--app-table-bg, #161b22); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--app-table-border, #21262d); }
+    th { background: var(--app-table-header-bg, #21262d); color: var(--app-table-header-text, #8b949e); font-weight: 600; }
+    .empty { color: var(--app-label, #8b949e); font-style: italic; }
+    .stats { margin-bottom: 1rem; color: var(--app-label, #8b949e); }
+    .profile-index-gap { font-size: 0.75rem; color: #d29922; margin-left: 0.35rem; }
+    #profiles-list-msg { margin-top: 0.75rem; font-size: 0.875rem; }
+    .row-actions .icon-action { display: inline-flex; align-items: center; justify-content: center; min-width: 2rem; min-height: 2rem; margin: 0 0.15rem; padding: 0.2rem 0.35rem; font-size: 1.15rem; border: none; background: none; cursor: pointer; border-radius: 4px; }
+    .edit-link { color: var(--app-link, #58a6ff); text-decoration: none; }
+    .copy-btn { color: var(--app-label, #8b949e); }
+    .delete-btn { color: #f85149; }
+  </style>
+</head>
+<body>
+  <!-- elenko-build ${ELENKO_SERVER_BUILD_ID} -->
+  <div class="actions"><a href="/profiles">← Elenko profiles</a> <a href="/profile-list-layout">List layout</a> <a href="/documents">All documents</a></div>
+  <h1>Unlinked profiles</h1>
+  <p class="sub">These <code>elenko_profile</code> documents exist in CouchDB but are <strong>not</strong> on the start page layout (or the layout row does not resolve). After copy/rename they often land here. Use ⊕ to add them to the layout, or edit layout manually.</p>
+  <p class="stats">Total profiles in database: ${totalCount}. On layout (resolved): ${placedCount}. Unlinked: ${unlinked.length}.</p>
+  <table>
+    <thead><tr><th>Name</th><th>Description</th><th>Creation date</th><th>Actions</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <div id="profiles-list-msg" style="display:none;"></div>
+  <script>
+    (function() {
+      var msgEl = document.getElementById('profiles-list-msg');
+      function showErr(t) {
+        if (!msgEl) return;
+        msgEl.style.display = 'block';
+        msgEl.style.color = '#f85149';
+        msgEl.textContent = t || 'Request failed';
+      }
+      document.querySelectorAll('.profile-link-start-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          fetch('/api/profiles/' + encodeURIComponent(id) + '/link-to-start-layout', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok) { window.location.reload(); return; }
+              showErr(o.data && o.data.error ? o.data.error : 'Could not add to start layout');
+            })
+            .catch(function(e) { btn.disabled = false; showErr(e.message || 'Request failed'); });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderProfilesListPage(profiles, appUi, pageOpts) {
+  const theme = normalizeAppTheme(appUi && appUi.theme);
+  const themeVars = getAppThemeVars(theme);
+  const layout = appUi && appUi.profileListLayout;
+  const unlinkedList = filterUnlinkedElenkoProfiles(profiles, layout);
+  const sections = buildProfileListSections(profiles, layout, {
+    unlinkedAsGroup: true,
+  });
+  const unlinkedOnly = !!(pageOpts && pageOpts.unlinkedOnly);
+  let sectionsForRender = sections;
+  if (unlinkedOnly) {
+    sectionsForRender = sections.filter(
+      (s) => s && s.kind === "group" && (s.unlinked || s.id === PROFILE_LIST_UNLINKED_GROUP_ID)
+    );
+    if (sectionsForRender.length === 0 && unlinkedList.length > 0) {
+      sectionsForRender = [
+        {
+          kind: "group",
+          id: PROFILE_LIST_UNLINKED_GROUP_ID,
+          label: "Unlinked (not on start page layout)",
+          profiles: unlinkedList.map((p) => profileListSectionEntry(p)),
+          unlinked: true,
+        },
+      ];
+    }
+  }
+  const unlinkedCount = unlinkedList.length;
+  if (!unlinkedOnly && unlinkedCount > 0) {
+    const hasUnlinkedSection = sectionsForRender.some(
+      (s) => s && s.kind === "group" && (s.unlinked || s.id === PROFILE_LIST_UNLINKED_GROUP_ID)
+    );
+    if (!hasUnlinkedSection) {
+      sectionsForRender = sectionsForRender.concat([
+        {
+          kind: "group",
+          id: PROFILE_LIST_UNLINKED_GROUP_ID,
+          label: "Unlinked (not on start page layout)",
+          profiles: unlinkedList.map((p) => profileListSectionEntry(p)),
+          unlinked: true,
+        },
+      ]);
+    }
+  }
   const rows =
     profiles.length > 0
-      ? renderGroupedProfileListBody(sections, { adminMode: true, mobileHideDate: false })
+      ? renderGroupedProfileListBody(sectionsForRender, { adminMode: true, mobileHideDate: false })
       : `
         <tr>
           <td colspan="4" class="empty">No Elenko database profiles yet. <a href="/profile/create">Create one</a>.</td>
         </tr>`;
+  const unlinkedToggleHref = unlinkedOnly ? "/profiles" : "/profiles?show=unlinked";
+  const unlinkedToggleLabel = unlinkedOnly ? "Show all profiles" : "Show unlinked only";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -17968,9 +18499,15 @@ function renderProfilesListPage(profiles, appUi) {
   </style>
 </head>
 <body>
-  <div class="actions"><a href="/" class="app-back-start">← Start</a><a href="/profile/create" class="btn">Create Elenko database</a><a href="/profile-list-layout">List layout</a></div>
+  <!-- elenko-build ${ELENKO_SERVER_BUILD_ID} -->
+  <div class="actions"><a href="/" class="app-back-start">← Start</a><a href="/profile/create" class="btn">Create Elenko database</a><a href="/unlinked-profiles">Unlinked profiles</a><a href="/profile-list-layout">List layout</a></div>
   <h1>Elenko profiles</h1>
-  <p class="sub">All database profiles. Folders match the start page layout (<a href="/profile-list-layout">edit layout</a>). Name opens the profile edit page (not the entry list). Use ⧉ to duplicate a profile (entries are not copied).</p>
+  <p class="sub">All database profiles. Folders match the start page layout (<a href="/profile-list-layout">edit layout</a>). Name opens the profile edit page (not the entry list). Use ⧉ to duplicate a profile (entries are not copied). Profiles missing from the start page appear under <strong>Unlinked</strong> at the bottom; use ⊕ to add them to the layout.</p>
+  <div class="profiles-unlinked-toolbar">
+    <a href="${escapeHtml(unlinkedToggleHref)}" class="btn-secondary" style="text-decoration:none;display:inline-block;">${escapeHtml(unlinkedToggleLabel)}</a>
+    <a href="/unlinked-profiles" class="btn-secondary" style="text-decoration:none;display:inline-block;">Unlinked profiles page</a>
+    <span class="sub" style="margin:0;">Unlinked count: ${unlinkedCount}</span>
+  </div>
   <table>
     <thead><tr><th>Name</th><th>Description</th><th>Creation date</th><th>Actions</th></tr></thead>
     <tbody>${rows}
@@ -18035,6 +18572,32 @@ function renderProfilesListPage(profiles, appUi) {
             .catch(function(e) {
               btn.disabled = false;
               showErr(e.message || 'Delete failed');
+            });
+        });
+      });
+      document.querySelectorAll('.profile-link-start-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          if (msgEl) { msgEl.style.display = 'none'; msgEl.textContent = ''; }
+          fetch('/api/profiles/' + encodeURIComponent(id) + '/link-to-start-layout', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+          })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(o) {
+              btn.disabled = false;
+              if (o.ok) {
+                window.location.reload();
+                return;
+              }
+              showErr(o.data && o.data.error ? o.data.error : 'Could not add to start layout');
+            })
+            .catch(function(e) {
+              btn.disabled = false;
+              showErr(e.message || 'Request failed');
             });
         });
       });
@@ -20570,6 +21133,7 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef, prefillU
       <option value="none"${authTypeStored === "none" ? " selected" : ""}>None</option>
       <option value="bearer"${authTypeStored === "bearer" ? " selected" : ""}>Bearer or API key (Authorization + api-key headers)</option>
       <option value="x-api-key"${authTypeStored === "x-api-key" ? " selected" : ""}>X-API-Key header only (no Bearer)</option>
+      <option value="x-goog-api-key"${authTypeStored === "x-goog-api-key" ? " selected" : ""}>Google Gemini / Generative Language (X-goog-api-key)</option>
       <option value="basic"${authTypeStored === "basic" ? " selected" : ""}>HTTP Basic (username + password documents)</option>
       <option value="digest"${authTypeStored === "digest" ? " selected" : ""}>HTTP Digest (username + password documents)</option>
       <option value="fritz"${authTypeStored === "fritz" ? " selected" : ""}>FRITZ!Box session (login_sid.lua + sid — use for /api/v0/smarthome)</option>
@@ -20664,6 +21228,10 @@ function renderEditApiPage(doc, err, returnTo, appUi, prefillApiKeyRef, prefillU
         upBlock.style.display = 'none';
       } else if (v === 'x-api-key') {
         hint.textContent = 'The secret document value is sent only in the X-API-Key header. No Authorization header is sent.';
+        bBlock.style.display = 'block';
+        upBlock.style.display = 'none';
+      } else if (v === 'x-goog-api-key') {
+        hint.textContent = 'The secret document value is sent as the X-goog-api-key header (Google Generative Language / Gemini REST API). No Authorization header is sent.';
         bBlock.style.display = 'block';
         upBlock.style.display = 'none';
       } else if (v === 'fritz') {
@@ -22085,7 +22653,7 @@ function renderStartPage(profiles, role, appUi, keyFileNotice, appConfigAttachme
   const actionsAdmin = '<a href="/profile/create" class="btn">Create Elenko database</a>';
   const actionsUser = "";
   const userAdminOptions = '<option value="" disabled selected>Admin</option><option value="/account/change-password">Change password</option><option value="/account/unlock-keyfile">Provide key file</option>' + (isAdmin ? '<option value="/account/couchdb-password">CouchDB password</option><option value="/account/users">Manage users</option><option value="/account/users/create">Create user</option>' : '');
-  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/debug">Debug / Flow Log</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/federation">Federation</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
+  const specialOptions = '<option value="" disabled selected>Special</option><option value="/app-config">Application design / theme</option><option value="/application-properties">Application properties</option><option value="/debug">Debug / Flow Log</option><option value="/profile-list-layout">Database list layout</option><option value="/config-export-import">Export / Import configuration</option><option value="/data-export-import">Export / Import data</option><option value="/profiles">Elenko profiles</option><option value="/unlinked-profiles">Unlinked profiles</option><option value="/entry-forms">Single Entry forms</option><option value="/queries">Linked queries</option><option value="/federation">Federation</option><option value="/documents">All documents</option><option value="/deletions">Marked for deletion</option>';
   const actionsCommon = '<a href="/logout" class="btn-logout">Log out</a>';
 
   return `<!DOCTYPE html>
@@ -26301,29 +26869,18 @@ app.use((err, req, res, next) => {
 
 async function main() {
   await initCouch();
-  await getAppUiConfig();
-  startApiWorker();
-  startFederationWorker();
-  startFlowWorker();
-  await applyFlowLogLevelFromConfig();
-  startTimerWorker();
-  await syncTimersFromDb();
-  setInterval(() => {
-    syncTimersFromDb().catch((e) => console.error("syncTimersFromDb:", e));
-  }, 5 * 60 * 1000);
-  console.log(
-    "Flow logging configured for",
-    process.env.FLOW_LOG_FILE || path.join(__dirname, "logs", "flow.log")
-  );
+
   const server = app.listen(PORT, "0.0.0.0", () => {
     const browserUrl = `http://127.0.0.1:${PORT}`;
     const altUrl = `http://localhost:${PORT}`;
     const openInBrowserMsg = `Open in browser: ${browserUrl} or ${altUrl}`;
     console.log(`Elenko server listening on http://0.0.0.0:${PORT}`);
+    console.log(`Elenko server build: ${ELENKO_SERVER_BUILD_ID}`);
     console.log(openInBrowserMsg);
     sendFlowMessage("system.start", {
       pid: process.pid,
       port: PORT,
+      buildId: ELENKO_SERVER_BUILD_ID,
       message: openInBrowserMsg,
       browserUrl,
       altUrl,
@@ -26337,6 +26894,25 @@ async function main() {
     }
     process.exit(1);
   });
+
+  try {
+    await getAppUiConfig();
+    startApiWorker();
+    startFederationWorker();
+    startFlowWorker();
+    await applyFlowLogLevelFromConfig();
+    startTimerWorker();
+    await syncTimersFromDb();
+    setInterval(() => {
+      syncTimersFromDb().catch((e) => console.error("syncTimersFromDb:", e));
+    }, 5 * 60 * 1000);
+    console.log(
+      "Flow logging configured for",
+      process.env.FLOW_LOG_FILE || path.join(__dirname, "logs", "flow.log")
+    );
+  } catch (err) {
+    console.error("Workers / config startup error (HTTP still up):", err);
+  }
 }
 
 main().catch((err) => {

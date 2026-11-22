@@ -616,6 +616,15 @@ async function fetchWithElenkoAuth(finalUrl, method, bodyPayload, authType, apiK
     });
   }
 
+  if (authType === "x-goog-api-key" && apiKey && String(apiKey).trim()) {
+    const key = String(apiKey).trim();
+    return fetch(finalUrl, {
+      method,
+      headers: merge({ "X-goog-api-key": key }),
+      body: bodyPayload,
+    });
+  }
+
   if (authType === "basic" && apiUsername != null && apiPassword != null) {
     const auth = Buffer.from(String(apiUsername) + ":" + String(apiPassword), "utf8").toString("base64");
     return fetch(finalUrl, {
@@ -693,6 +702,7 @@ if (parentPort) parentPort.on("message", (msg) => {
     authTypeRaw === "none" ||
     authTypeRaw === "bearer" ||
     authTypeRaw === "x-api-key" ||
+    authTypeRaw === "x-goog-api-key" ||
     authTypeRaw === "basic" ||
     authTypeRaw === "digest" ||
     authTypeRaw === "fritz"
