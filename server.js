@@ -113,10 +113,20 @@ const startIconUpload = multer({
   limits: { fileSize: MAX_START_ICON_BYTES },
 });
 
-const MAX_KEYFILE_BYTES = 4096;
+/** v1 ELNK file: 12-byte header + 32-byte payload (see ELNK_HEADER_LEN / ELNK_PAYLOAD_V1_LEN). Bump when the format grows. */
+const ELNK_KEYFILE_FORMAT_MAX_BYTES = 12 + 32;
+const ELNK_KEYFILE_UPLOAD_MAX_BYTES = (() => {
+  const defaultMax = ELNK_KEYFILE_FORMAT_MAX_BYTES * 10;
+  return parseBoundedInt(
+    process.env.ELNK_KEYFILE_UPLOAD_MAX_BYTES,
+    defaultMax,
+    ELNK_KEYFILE_FORMAT_MAX_BYTES,
+    defaultMax
+  );
+})();
 const keyFileUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_KEYFILE_BYTES },
+  limits: { fileSize: ELNK_KEYFILE_UPLOAD_MAX_BYTES },
 });
 
 /** PNG names must match files in public/ (see README-favicon.txt). Order: sized PNGs first, then .ico fallback — works reliably in Firefox + Chrome. */
@@ -5469,6 +5479,8 @@ function defaultAppUiConfigObject() {
     flowLogUtcOffsetMinutes: 0,
     flowLogDockerAdjustMinutes: 0,
     flowLogLevel: "normal",
+    sessionInactivityMinutes: null,
+    enforceKeyFilesForAllUsers: null,
     profileListLayout: [],
   };
 }
@@ -6285,6 +6297,14 @@ async function getAppUiConfig() {
           flowLogUtcOffsetMinutes: parseBoundedInt(doc.flowLogUtcOffsetMinutes, 0, -840, 840),
           flowLogDockerAdjustMinutes: parseBoundedInt(doc.flowLogDockerAdjustMinutes, 0, -10080, 10080),
           flowLogLevel: normalizeFlowLogLevel(doc.flowLogLevel),
+          sessionInactivityMinutes:
+            doc.sessionInactivityMinutes !== undefined && doc.sessionInactivityMinutes !== null
+              ? normalizeSessionInactivityMinutes(doc.sessionInactivityMinutes)
+              : null,
+          enforceKeyFilesForAllUsers:
+            doc.enforceKeyFilesForAllUsers !== undefined && doc.enforceKeyFilesForAllUsers !== null
+              ? !!doc.enforceKeyFilesForAllUsers
+              : null,
           profileListLayout: normalizeProfileListLayout(doc.profileListLayout),
         };
       }
@@ -6309,8 +6329,185 @@ async function getAppUiConfig() {
   if (cachedAppConfig && typeof cachedAppConfig.loginTextAbove !== "string") cachedAppConfig.loginTextAbove = "";
   if (cachedAppConfig && typeof cachedAppConfig.loginTextBelow !== "string") cachedAppConfig.loginTextBelow = "";
   if (cachedAppConfig && typeof cachedAppConfig.couchdbPassword !== "string") cachedAppConfig.couchdbPassword = "";
-  if (cachedAppConfig) ensureAppUiTimeFields(cachedAppConfig);
+  if (cachedAppConfig) {
+    ensureAppUiTimeFields(cachedAppConfig);
+    if (
+      cachedAppConfig.sessionInactivityMinutes !== null &&
+      cachedAppConfig.sessionInactivityMinutes !== undefined
+    ) {
+      cachedAppConfig.sessionInactivityMinutes = normalizeSessionInactivityMinutes(
+        cachedAppConfig.sessionInactivityMinutes
+      );
+    }
+  }
   return cachedAppConfig;
+}
+
+const SESSION_INACTIVITY_MINUTES_MAX = 10080; // 7 days
+
+function normalizeSessionInactivityMinutes(raw) {
+  return parseBoundedInt(raw, 0, 0, SESSION_INACTIVITY_MINUTES_MAX);
+}
+
+/** Minutes; 0 = disabled. Saved app config wins; else SESSION_INACTIVITY_MINUTES in .env. */
+function resolveSessionInactivityMinutes() {
+  if (cachedAppConfig && cachedAppConfigAuthoritative) {
+    const cfgVal = cachedAppConfig.sessionInactivityMinutes;
+    if (cfgVal !== null && cfgVal !== undefined) {
+      return normalizeSessionInactivityMinutes(cfgVal);
+    }
+  }
+  const envRaw = process.env.SESSION_INACTIVITY_MINUTES;
+  if (envRaw != null && String(envRaw).trim() !== "") {
+    return normalizeSessionInactivityMinutes(envRaw);
+  }
+  return 0;
+}
+
+function resolveSessionInactivityMs() {
+  const mins = resolveSessionInactivityMinutes();
+  return mins > 0 ? mins * 60 * 1000 : 0;
+}
+
+function parseEnvBoolOptional(raw) {
+  if (raw == null || String(raw).trim() === "") return null;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+/** Require a registered key file at login for every user (unless disabled here or in .env). Default: on. */
+function resolveEnforceKeyFilesForAllUsers() {
+  if (cachedAppConfig && cachedAppConfigAuthoritative) {
+    const cfgVal = cachedAppConfig.enforceKeyFilesForAllUsers;
+    if (cfgVal !== null && cfgVal !== undefined) return !!cfgVal;
+  }
+  const envVal = parseEnvBoolOptional(process.env.ENFORCE_KEY_FILES_FOR_ALL_USERS);
+  if (envVal !== null) return envVal;
+  return true;
+}
+
+function isSessionInactivityExemptPath(reqPath) {
+  const p = typeof reqPath === "string" ? reqPath : "";
+  if (p === "/login" || p === "/logout") return true;
+  if (p === "/setup" || p === "/setup/change-couchdb-password") return true;
+  return false;
+}
+
+function touchSessionActivity(req) {
+  if (req && req.session) req.session.lastActivityAt = Date.now();
+}
+
+function destroySessionForInactivity(req, res) {
+  const sid = req.sessionID;
+  clearUserMasterKey(sid);
+  req.session.destroy((err) => {
+    if (err) console.warn("session destroy (inactivity):", err.message || err);
+    if (wantsJsonApiResponse(req)) {
+      return res.status(401).json({
+        error: "Session expired due to inactivity",
+        code: "session_inactive",
+      });
+    }
+    res.redirect("/login?reason=inactivity");
+  });
+}
+
+function getSecurityLogClientMeta(req) {
+  if (!req) return { ip: "", userAgent: "" };
+  let ip = "";
+  const xff = req.get && req.get("x-forwarded-for");
+  if (xff && typeof xff === "string") ip = xff.split(",")[0].trim();
+  if (!ip && req.socket && req.socket.remoteAddress) ip = String(req.socket.remoteAddress);
+  if (ip.startsWith("::ffff:")) ip = ip.slice(7);
+  const userAgent =
+    req.get && typeof req.get === "function" ? String(req.get("user-agent") || "").slice(0, 512) : "";
+  return { ip, userAgent };
+}
+
+const LOGIN_FAILURE_COOLDOWN_SECONDS_MAX = 3600;
+/** ip (or session) → cooldown end timestamp (ms) */
+const loginFailureCooldownByKey = new Map();
+
+function resolveLoginFailureCooldownMs() {
+  const sec = parseBoundedInt(process.env.LOGIN_FAILURE_COOLDOWN_SECONDS, 10, 0, LOGIN_FAILURE_COOLDOWN_SECONDS_MAX);
+  return sec > 0 ? sec * 1000 : 0;
+}
+
+function loginThrottleKey(req) {
+  const { ip } = getSecurityLogClientMeta(req);
+  if (ip) return `ip:${ip}`;
+  return `sess:${req.sessionID || "anon"}`;
+}
+
+function getLoginThrottleWaitMs(req) {
+  const until = loginFailureCooldownByKey.get(loginThrottleKey(req));
+  if (!until) return 0;
+  const left = until - Date.now();
+  if (left <= 0) {
+    loginFailureCooldownByKey.delete(loginThrottleKey(req));
+    return 0;
+  }
+  return left;
+}
+
+function recordLoginFailureThrottle(req) {
+  const ms = resolveLoginFailureCooldownMs();
+  if (!ms) return;
+  const key = loginThrottleKey(req);
+  loginFailureCooldownByKey.set(key, Date.now() + ms);
+  if (loginFailureCooldownByKey.size > 2048) {
+    const now = Date.now();
+    for (const [k, until] of loginFailureCooldownByKey) {
+      if (until <= now) loginFailureCooldownByKey.delete(k);
+    }
+  }
+}
+
+function clearLoginFailureThrottle(req) {
+  loginFailureCooldownByKey.delete(loginThrottleKey(req));
+}
+
+async function completeFailedLogin(req, res, appUi, detail, userMessage) {
+  logFailedLoginAttempt(req, detail);
+  recordLoginFailureThrottle(req);
+  return res
+    .set("Content-Type", "text/html; charset=utf-8")
+    .send(renderLoginPage(userMessage, appUi));
+}
+
+/** Records failed sign-in attempts in the flow log (elenko.log); never logs passwords. */
+function logFailedLoginAttempt(req, detail) {
+  const d = detail && typeof detail === "object" ? detail : {};
+  const { ip, userAgent } = getSecurityLogClientMeta(req);
+  const username = d.username != null ? String(d.username).trim().slice(0, 128) : "";
+  const reason = d.reason != null ? String(d.reason).trim().slice(0, 64) : "bad_credentials";
+  const payload = { reason };
+  if (username) payload.username = username;
+  if (ip) payload.ip = ip;
+  if (userAgent) payload.userAgent = userAgent;
+  if (d.error != null && String(d.error).trim()) {
+    payload.error = String(d.error).trim().slice(0, 256);
+  }
+  sendFlowMessage("auth.loginFailed", payload);
+}
+
+function enforceSessionInactivityTimeout(req, res, next) {
+  if (!req.session || !req.session.user) return next();
+  if (isSessionInactivityExemptPath(req.path)) return next();
+  const maxMs = resolveSessionInactivityMs();
+  if (!maxMs) {
+    touchSessionActivity(req);
+    return next();
+  }
+  const now = Date.now();
+  const last =
+    typeof req.session.lastActivityAt === "number" && Number.isFinite(req.session.lastActivityAt)
+      ? req.session.lastActivityAt
+      : now;
+  if (now - last > maxMs) {
+    return destroySessionForInactivity(req, res);
+  }
+  touchSessionActivity(req);
+  next();
 }
 
 const FLOW_LOG_DISPLAY_MODES = new Set(["utc", "iana", "utc_offset"]);
@@ -7820,6 +8017,11 @@ function userEnforceKeyLogin(userDoc) {
   return !!(userDoc && userDoc.enforceKeyLogin === true);
 }
 
+function isKeyLoginEnforcedForUser(userDoc) {
+  if (resolveEnforceKeyFilesForAllUsers()) return true;
+  return userEnforceKeyLogin(userDoc);
+}
+
 function buildElnkKeyBlob(masterKey) {
   if (!Buffer.isBuffer(masterKey) || masterKey.length !== ELNK_MASTER_KEY_LEN) {
     throw new Error("Master key must be 32 bytes");
@@ -7831,6 +8033,9 @@ function buildElnkKeyBlob(masterKey) {
 
 function parseElnkKeyBlob(buffer) {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+  if (buf.length > ELNK_KEYFILE_UPLOAD_MAX_BYTES) {
+    throw new Error("Key file is too large");
+  }
   if (buf.length < ELNK_HEADER_LEN) {
     throw new Error("Key file is too short");
   }
@@ -7842,13 +8047,20 @@ function parseElnkKeyBlob(buffer) {
     throw new Error(`Unsupported key file version: ${version}`);
   }
   const payloadLen = buf.readUInt32BE(8);
-  const payload = buf.subarray(ELNK_HEADER_LEN, ELNK_HEADER_LEN + payloadLen);
-  if (payload.length !== payloadLen) {
+  if (!Number.isInteger(payloadLen) || payloadLen < 0) {
+    throw new Error("Invalid key file header");
+  }
+  const totalLen = ELNK_HEADER_LEN + payloadLen;
+  if (!Number.isSafeInteger(totalLen) || totalLen > ELNK_KEYFILE_UPLOAD_MAX_BYTES) {
+    throw new Error("Key file payload is too large");
+  }
+  if (buf.length !== totalLen) {
+    if (buf.length > totalLen) {
+      throw new Error("Key file contains trailing data");
+    }
     throw new Error("Key file length does not match header");
   }
-  if (buf.length !== ELNK_HEADER_LEN + payloadLen) {
-    throw new Error("Key file contains trailing data");
-  }
+  const payload = buf.subarray(ELNK_HEADER_LEN, totalLen);
   if (version === "0001" && payloadLen !== ELNK_PAYLOAD_V1_LEN) {
     throw new Error("Invalid v1 key payload length");
   }
@@ -7904,8 +8116,12 @@ function verifyKeyFileBlob(buffer, keyFileDoc) {
   if (!keyFileDoc || keyFileDoc.registered !== true) {
     return { ok: false, error: "No key file registered for this user" };
   }
+  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+  if (buf.length > ELNK_KEYFILE_UPLOAD_MAX_BYTES) {
+    return { ok: false, error: "Key file is too large" };
+  }
   try {
-    const parsed = parseElnkKeyBlob(buffer);
+    const parsed = parseElnkKeyBlob(buf);
     if (parsed.payload.length !== keyFileDoc.payloadLength) {
       return { ok: false, error: "Key file payload length mismatch" };
     }
@@ -8533,17 +8749,46 @@ function peekKeyFileDownloadToken(token) {
   return entry;
 }
 
+function loginKeyFileTooLargeMessage() {
+  return `Key file is too large (maximum ${ELNK_KEYFILE_UPLOAD_MAX_BYTES} bytes).`;
+}
+
 function loginKeyFileParser(req, res, next) {
   const ct = req.get("content-type") || "";
   if (ct.includes("multipart/form-data")) {
-    return keyFileUpload.single("keyFile")(req, res, next);
+    return keyFileUpload.single("keyFile")(req, res, (err) => {
+      if (!err) return next();
+      if (err.name === "MulterError" && err.code === "LIMIT_FILE_SIZE") {
+        if (wantsJsonApiResponse(req)) {
+          return res.status(400).json({ error: loginKeyFileTooLargeMessage() });
+        }
+        const unlockPath = (req.path || "") === "/account/unlock-keyfile";
+        return getAppUiConfig()
+          .then((appUi) => {
+            const msg = loginKeyFileTooLargeMessage();
+            if (unlockPath) {
+              const sess = req.session || {};
+              return res
+                .status(400)
+                .set("Content-Type", "text/html; charset=utf-8")
+                .send(renderUnlockKeyFilePage(msg, appUi, sess));
+            }
+            return res
+              .status(400)
+              .set("Content-Type", "text/html; charset=utf-8")
+              .send(renderLoginPage(msg, appUi));
+          })
+          .catch((e) => next(e));
+      }
+      return next(err);
+    });
   }
   next();
 }
 
 function applyKeyFileToSession(req, userDoc, uploadedBuffer) {
   const registered = userKeyFileRegistered(userDoc);
-  const enforce = userEnforceKeyLogin(userDoc);
+  const enforce = isKeyLoginEnforcedForUser(userDoc);
   req.session.keyFileRegistered = registered;
   req.session.enforceKeyLogin = enforce;
   req.session.keyFileUnlocked = false;
@@ -8553,6 +8798,12 @@ function applyKeyFileToSession(req, userDoc, uploadedBuffer) {
     if (uploadedBuffer && uploadedBuffer.length > 0) {
       return { ok: false, error: "This user has no registered key file" };
     }
+    if (enforce) {
+      return {
+        ok: false,
+        error: "A key file is required for this account. Contact an administrator to register one.",
+      };
+    }
     return { ok: true };
   }
 
@@ -8561,6 +8812,9 @@ function applyKeyFileToSession(req, userDoc, uploadedBuffer) {
       return { ok: false, error: "Key file is required for this account" };
     }
     return { ok: true, keyFileMissing: true };
+  }
+  if (uploadedBuffer.length > ELNK_KEYFILE_UPLOAD_MAX_BYTES) {
+    return { ok: false, error: "Key file is too large" };
   }
 
   const verified = verifyKeyFileBlob(uploadedBuffer, userDoc.keyFile);
@@ -9004,6 +9258,8 @@ app.use(
   })
 );
 
+app.use(enforceSessionInactivityTimeout);
+
 app.use(async (req, res, next) => {
   const isSetupPath = req.path === "/setup" || req.path === "/setup/change-couchdb-password";
   if (!db) {
@@ -9169,7 +9425,11 @@ app.post("/setup/change-couchdb-password", async (req, res) => {
 app.get("/login", async (req, res) => {
   if (req.session && req.session.user) return res.redirect("/");
   const appUi = await getAppUiConfig();
-  res.set("Content-Type", "text/html; charset=utf-8").send(renderLoginPage(null, appUi));
+  let loginMsg = null;
+  if (req.query && String(req.query.reason || "").trim() === "inactivity") {
+    loginMsg = "You were logged out after a period of inactivity. Please sign in again.";
+  }
+  res.set("Content-Type", "text/html; charset=utf-8").send(renderLoginPage(loginMsg, appUi));
 });
 
 app.post("/login", loginKeyFileParser, async (req, res) => {
@@ -9177,10 +9437,18 @@ app.post("/login", loginKeyFileParser, async (req, res) => {
   const username = String((req.body && req.body.username) || "").trim();
   const password = (req.body && req.body.password) || "";
   const uploadedKey = req.file && req.file.buffer ? req.file.buffer : null;
-  if (!username) {
+  const throttleWait = getLoginThrottleWaitMs(req);
+  if (throttleWait > 0) {
+    const secs = Math.ceil(throttleWait / 1000);
+    logFailedLoginAttempt(req, { reason: "login_throttled", username: username || undefined });
     return res
       .set("Content-Type", "text/html; charset=utf-8")
-      .send(renderLoginPage("Invalid username or password.", appUi));
+      .send(
+        renderLoginPage(`Please wait ${secs} second${secs === 1 ? "" : "s"} before trying again.`, appUi)
+      );
+  }
+  if (!username) {
+    return completeFailedLogin(req, res, appUi, { reason: "missing_username" }, "Invalid username or password.");
   }
   try {
     const result = await db.find({
@@ -9189,18 +9457,28 @@ app.post("/login", loginKeyFileParser, async (req, res) => {
     });
     const user = result.docs && result.docs[0];
     if (!user || !verifyPassword(password, user.passwordHash, user.salt)) {
-      return res
-        .set("Content-Type", "text/html; charset=utf-8")
-        .send(renderLoginPage("Invalid username or password.", appUi));
+      return completeFailedLogin(
+        req,
+        res,
+        appUi,
+        { reason: "bad_credentials", username },
+        "Invalid username or password."
+      );
     }
     const keyResult = applyKeyFileToSession(req, user, uploadedKey);
     if (!keyResult.ok) {
-      return res
-        .set("Content-Type", "text/html; charset=utf-8")
-        .send(renderLoginPage(keyResult.error || "Invalid key file.", appUi));
+      return completeFailedLogin(
+        req,
+        res,
+        appUi,
+        { reason: "key_file_rejected", username },
+        keyResult.error || "Invalid key file."
+      );
     }
+    clearLoginFailureThrottle(req);
     req.session.user = user.username;
     req.session.role = (user.role === "user" ? "editor" : user.role) || "editor";
+    touchSessionActivity(req);
     if (keyResult.keyFileUnlocked && user.keyFile) {
       try {
         user.keyFile.lastUsedAt = new Date().toISOString();
@@ -9217,9 +9495,11 @@ app.post("/login", loginKeyFileParser, async (req, res) => {
     return res.redirect("/?fresh=1");
   } catch (err) {
     console.error("Login error:", err);
-    return res
-      .set("Content-Type", "text/html; charset=utf-8")
-      .send(renderLoginPage("Invalid username or password.", appUi));
+    return completeFailedLogin(req, res, appUi, {
+      reason: "login_error",
+      username,
+      error: err && err.message ? err.message : String(err),
+    }, "Invalid username or password.");
   }
 });
 
@@ -9398,7 +9678,7 @@ async function hydrateKeyFileSession(req, res, next) {
     });
     const user = result.docs && result.docs[0];
     req.session.keyFileRegistered = userKeyFileRegistered(user);
-    req.session.enforceKeyLogin = userEnforceKeyLogin(user);
+    req.session.enforceKeyLogin = isKeyLoginEnforcedForUser(user);
     req.session.keyFileUnlocked = !!getUserMasterKey(req.sessionID);
   } catch (_) {}
   next();
@@ -9963,6 +10243,13 @@ app.post("/api/application-properties", requireAdmin, async (req, res) => {
     const iana = typeof body.flowLogIana === "string" ? body.flowLogIana.trim() : "";
     const utcOff = parseBoundedInt(body.flowLogUtcOffsetMinutes, 0, -840, 840);
     const dockAdj = parseBoundedInt(body.flowLogDockerAdjustMinutes, 0, -10080, 10080);
+    const inactivityMin = normalizeSessionInactivityMinutes(body.sessionInactivityMinutes);
+    const enforceKeyAll = !!(
+      body.enforceKeyFilesForAllUsers === true ||
+      body.enforceKeyFilesForAllUsers === 1 ||
+      body.enforceKeyFilesForAllUsers === "1" ||
+      body.enforceKeyFilesForAllUsers === "on"
+    );
 
     let doc = null;
     const id = typeof body._id === "string" && body._id.trim() ? body._id.trim() : "";
@@ -9983,9 +10270,11 @@ app.post("/api/application-properties", requireAdmin, async (req, res) => {
     doc.flowLogIana = iana;
     doc.flowLogUtcOffsetMinutes = utcOff;
     doc.flowLogDockerAdjustMinutes = dockAdj;
+    doc.sessionInactivityMinutes = inactivityMin;
+    doc.enforceKeyFilesForAllUsers = enforceKeyAll;
     const ins = await configDb.insert(doc);
     invalidateAppUiConfigCache();
-    res.json({ ok: true, id: ins.id, rev: ins.rev });
+    res.json({ ok: true, id: ins.id, rev: ins.rev, enforceKeyFilesForAllUsers: enforceKeyAll });
   } catch (err) {
     console.error("Error saving application properties:", err);
     res.status(500).json({ error: err.message });
@@ -25238,6 +25527,13 @@ function renderApplicationPropertiesPage(appUi, err) {
   const ianaVal = typeof appUi.flowLogIana === "string" ? appUi.flowLogIana : "";
   const utcOffVal = Number.isFinite(appUi.flowLogUtcOffsetMinutes) ? String(appUi.flowLogUtcOffsetMinutes) : "0";
   const dockAdjVal = Number.isFinite(appUi.flowLogDockerAdjustMinutes) ? String(appUi.flowLogDockerAdjustMinutes) : "0";
+  const inactivityMinVal = String(
+    appUi.sessionInactivityMinutes !== null && appUi.sessionInactivityMinutes !== undefined
+      ? normalizeSessionInactivityMinutes(appUi.sessionInactivityMinutes)
+      : resolveSessionInactivityMinutes()
+  );
+  const enforceKeyAllEffective = resolveEnforceKeyFilesForAllUsers();
+  const enforceKeyAllChecked = enforceKeyAllEffective ? " checked" : "";
   const id = appUi && appUi._id ? String(appUi._id) : "";
   const rev = appUi && appUi._rev ? String(appUi._rev) : "";
   const msgErr = err ? `<p class="msg err">${escapeHtml(err)}</p>` : "";
@@ -25313,6 +25609,15 @@ function renderApplicationPropertiesPage(appUi, err) {
     <label for="flowLogDockerAdjustMinutes">Docker clock correction (minutes)</label>
     <input type="number" id="flowLogDockerAdjustMinutes" name="flowLogDockerAdjustMinutes" min="-10080" max="10080" step="1" value="${escapeHtml(dockAdjVal)}">
     <p class="sub" style="margin-top:0.25rem;">Added to the event time <em>before</em> formatting <code>tsDisplay</code> (e.g. if the container wall clock is two hours slow but you cannot change <code>TZ</code>, try <code>+120</code>). Does not change <code>ts</code>.</p>
+    <h2>Session security</h2>
+    <label for="sessionInactivityMinutes">Automatic logout after inactivity (minutes)</label>
+    <input type="number" id="sessionInactivityMinutes" name="sessionInactivityMinutes" min="0" max="${SESSION_INACTIVITY_MINUTES_MAX}" step="1" value="${escapeHtml(inactivityMinVal)}">
+    <p class="sub" style="margin-top:0.25rem;"><code>0</code> = disabled. Until you save here, <code>SESSION_INACTIVITY_MINUTES</code> in <code>.env</code> applies if set. Each HTTP request resets the idle timer; when exceeded, the session and unlocked key file are cleared.</p>
+    <label style="display:flex;align-items:center;gap:0.5rem;margin-top:1.25rem;">
+      <input type="checkbox" id="enforceKeyFilesForAllUsers" name="enforceKeyFilesForAllUsers"${enforceKeyAllChecked}>
+      Require key file at login for every user
+    </label>
+    <p class="sub" style="margin-top:0.25rem;">When enabled, each account must have a registered key file and submit it when signing in (default). Per-user &quot;Enforce key login&quot; on the Users page still applies when this is off. Until you save here, <code>ENFORCE_KEY_FILES_FOR_ALL_USERS</code> in <code>.env</code> applies if set; otherwise this is on.</p>
   </form>
   <div class="panel">
     <strong>Preview at save time</strong>
@@ -25333,7 +25638,9 @@ function renderApplicationPropertiesPage(appUi, err) {
           flowLogDisplayMode: document.getElementById('flowLogDisplayMode').value,
           flowLogIana: document.getElementById('flowLogIana').value.trim(),
           flowLogUtcOffsetMinutes: document.getElementById('flowLogUtcOffsetMinutes').value,
-          flowLogDockerAdjustMinutes: document.getElementById('flowLogDockerAdjustMinutes').value
+          flowLogDockerAdjustMinutes: document.getElementById('flowLogDockerAdjustMinutes').value,
+          sessionInactivityMinutes: document.getElementById('sessionInactivityMinutes').value,
+          enforceKeyFilesForAllUsers: !!document.getElementById('enforceKeyFilesForAllUsers').checked
         };
         var idEl = document.getElementById('appPropsId');
         var revEl = document.getElementById('appPropsRev');
@@ -26856,6 +27163,10 @@ app.use((err, req, res, next) => {
   console.error("[api] error", req.method, req.path, err && err.message);
   if (err && err.name === "MulterError") {
     if (err.code === "LIMIT_FILE_SIZE") {
+      const pathStr = typeof req.path === "string" ? req.path : "";
+      if (pathStr.includes("keyfile") || pathStr.includes("key-file")) {
+        return res.status(400).json({ error: loginKeyFileTooLargeMessage() });
+      }
       return res.status(400).json({
         error: "File too large (max " + Math.round(MAX_ENTRY_IMAGE_BYTES / 1024) + " KiB).",
       });

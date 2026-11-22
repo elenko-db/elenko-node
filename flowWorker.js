@@ -32,6 +32,7 @@ function shouldLogMessage(msg) {
     return logLevel === "verbose";
   }
   if (logLevel === "minimal") {
+    if (type === "auth.loginFailed") return true;
     if (
       /Error|error|callRejected|keyLookupError|pipelineError|scriptError|purgeOldError|refreshError|appendRepeatError|console\.error/i.test(
         type
