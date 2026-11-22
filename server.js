@@ -11,6 +11,7 @@ const nano = require("nano");
 const multer = require("multer");
 const sharp = require("sharp");
 const { buildApiRequestTarget, applyTemplate, urlHasFieldPlaceholders } = require("./apiWorker");
+const { validateUserPassword, getUserPasswordPolicyHint } = require("./userPasswordPolicy");
 
 const originalConsoleError = console.error.bind(console);
 
@@ -134,7 +135,8 @@ const FAVICON_LINKS =
   '<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">' +
   '<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">' +
   '<link rel="icon" href="/favicon.ico" sizes="any" type="image/x-icon">' +
-  '<link rel="apple-touch-icon" href="/apple-touch-icon.png">';
+  '<link rel="apple-touch-icon" href="/apple-touch-icon.png">' +
+  '<script src="/csrf.js"></script>';
 
 function normalizeFieldDefaultSources(fieldNames, raw) {
   const len = Array.isArray(fieldNames) ? fieldNames.length : 0;
@@ -8771,7 +8773,7 @@ function loginKeyFileParser(req, res, next) {
               return res
                 .status(400)
                 .set("Content-Type", "text/html; charset=utf-8")
-                .send(renderUnlockKeyFilePage(msg, appUi, sess));
+                .send(renderUnlockKeyFilePage(msg, appUi, sess, getClientCsrfToken(req)));
             }
             return res
               .status(400)
@@ -9247,18 +9249,233 @@ async function initCouch(options) {
   }
 }
 
-app.use(express.json({ limit: "15mb" }));
-app.use(express.urlencoded({ extended: true, limit: "15mb" }));
+const WEAK_SESSION_SECRETS = new Set(["elenko-session-secret", "change-me", "secret"]);
+const SESSION_SECRET_MIN_LEN = 32;
+
+function resolveTrustProxySetting() {
+  const raw = process.env.TRUST_PROXY;
+  if (raw == null || String(raw).trim() === "") return 1;
+  const s = String(raw).trim().toLowerCase();
+  if (/^(0|false|no|off)$/.test(s)) return false;
+  if (/^(1|true|yes|on)$/.test(s)) return 1;
+  const n = parseInt(s, 10);
+  if (Number.isFinite(n) && n >= 0) return n;
+  return 1;
+}
+
+function assertSessionSecretConfigured() {
+  const allowInsecure = /^(1|true|yes)$/i.test(String(process.env.ELENKO_ALLOW_INSECURE_SESSION || "").trim());
+  const trimmed =
+    process.env.SESSION_SECRET != null ? String(process.env.SESSION_SECRET).trim() : "";
+  if (!trimmed) {
+    if (allowInsecure) return "elenko-insecure-dev-session";
+    throw new Error(
+      "SESSION_SECRET is required. Set it in .env (install scripts generate one) or set ELENKO_ALLOW_INSECURE_SESSION=1 for local development only."
+    );
+  }
+  if (trimmed.length < SESSION_SECRET_MIN_LEN) {
+    throw new Error(`SESSION_SECRET must be at least ${SESSION_SECRET_MIN_LEN} characters.`);
+  }
+  if (WEAK_SESSION_SECRETS.has(trimmed.toLowerCase()) && !allowInsecure) {
+    throw new Error("SESSION_SECRET is a known weak default; generate a random value.");
+  }
+  return trimmed;
+}
+
+function resolveSessionCookieOptions() {
+  const secureRaw = process.env.ELENKO_SESSION_COOKIE_SECURE;
+  let secure = "auto";
+  if (secureRaw != null && String(secureRaw).trim() !== "") {
+    const s = String(secureRaw).trim().toLowerCase();
+    if (/^(0|false|no|off)$/.test(s)) secure = false;
+    else if (/^(1|true|yes|on)$/.test(s)) secure = true;
+    else if (s === "auto") secure = "auto";
+  }
+  let sameSite = "lax";
+  const ssRaw = process.env.ELENKO_SESSION_COOKIE_SAMESITE;
+  if (ssRaw != null && String(ssRaw).trim() !== "") {
+    const s = String(ssRaw).trim().toLowerCase();
+    if (s === "strict" || s === "lax" || s === "none") sameSite = s;
+  }
+  return { httpOnly: true, secure, sameSite };
+}
+
+function regenerateSessionAsync(req) {
+  return new Promise((resolve, reject) => {
+    if (!req.session) return resolve();
+    req.session.regenerate((err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+const CSRF_CLIENT_COOKIE = "elenko-csrf";
+const CSRF_UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+function csrfProtectionEnabled() {
+  const raw = process.env.ELENKO_CSRF_PROTECTION;
+  if (raw == null || String(raw).trim() === "") return true;
+  return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+function ensureSessionCsrfToken(req) {
+  if (!req.session) return;
+  if (!req.session.csrfToken || typeof req.session.csrfToken !== "string") {
+    req.session.csrfToken = crypto.randomBytes(32).toString("hex");
+  }
+}
+
+function rotateSessionCsrfToken(req) {
+  if (!req.session) return;
+  req.session.csrfToken = crypto.randomBytes(32).toString("hex");
+}
+
+function getClientCsrfToken(req) {
+  if (!req || !req.session || !req.session.user) return "";
+  ensureSessionCsrfToken(req);
+  return req.session.csrfToken || "";
+}
+
+function csrfHiddenInputField(token) {
+  const t = typeof token === "string" ? token.trim() : "";
+  if (!t) return "";
+  return `<input type="hidden" name="_csrf" value="${escapeHtml(t)}">`;
+}
+
+function appendCsrfClientCookie(req, res, token) {
+  const parts = [`${CSRF_CLIENT_COOKIE}=${encodeURIComponent(token)}`, "Path=/", "SameSite=Lax"];
+  const cookieOpts = resolveSessionCookieOptions();
+  if (cookieOpts.secure === true || (cookieOpts.secure === "auto" && req.secure)) {
+    parts.push("Secure");
+  }
+  res.append("Set-Cookie", parts.join("; "));
+}
+
+function clearCsrfClientCookie(req, res) {
+  const parts = [`${CSRF_CLIENT_COOKIE}=`, "Path=/", "Max-Age=0", "SameSite=Lax"];
+  const cookieOpts = resolveSessionCookieOptions();
+  if (cookieOpts.secure === true || (cookieOpts.secure === "auto" && req && req.secure)) {
+    parts.push("Secure");
+  }
+  res.append("Set-Cookie", parts.join("; "));
+}
+
+function isCsrfExemptRequest(req) {
+  const p = typeof req.path === "string" ? req.path : "";
+  if (p === "/login" || p === "/logout") return true;
+  if (p === "/setup" || p === "/setup/change-couchdb-password") return true;
+  if (p === "/api/federation/inbox") return true;
+  return false;
+}
+
+function getSubmittedCsrfToken(req) {
+  const h = req.get("X-CSRF-Token") || req.get("x-csrf-token");
+  if (h && String(h).trim()) return String(h).trim();
+  if (req.body && req.body._csrf != null && String(req.body._csrf).trim() !== "") {
+    return String(req.body._csrf).trim();
+  }
+  return "";
+}
+
+function csrfTokensEqual(a, b) {
+  const ba = Buffer.from(String(a), "utf8");
+  const bb = Buffer.from(String(b), "utf8");
+  if (ba.length !== bb.length) return false;
+  try {
+    return crypto.timingSafeEqual(ba, bb);
+  } catch (_) {
+    return false;
+  }
+}
+
+function csrfTokenMiddleware(req, res, next) {
+  if (!csrfProtectionEnabled()) return next();
+  if (req.session && req.session.user) {
+    ensureSessionCsrfToken(req);
+    appendCsrfClientCookie(req, res, req.session.csrfToken);
+  }
+  next();
+}
+
+function enforceCsrfToken(req, res, next) {
+  if (!csrfProtectionEnabled()) return next();
+  if (!CSRF_UNSAFE_METHODS.has(req.method)) return next();
+  if (isCsrfExemptRequest(req)) return next();
+  if (!req.session || !req.session.user) return next();
+  ensureSessionCsrfToken(req);
+  const expected = req.session.csrfToken;
+  const submitted = getSubmittedCsrfToken(req);
+  if (!expected || !submitted || !csrfTokensEqual(submitted, expected)) {
+    if (wantsJsonApiResponse(req)) {
+      return res.status(403).json({ error: "Invalid or missing CSRF token", code: "csrf_invalid" });
+    }
+    return res
+      .status(403)
+      .set("Content-Type", "text/html; charset=utf-8")
+      .send(renderErrorPage("Invalid or missing security token. Reload the page and try again."));
+  }
+  next();
+}
+
+let SESSION_SECRET_VALUE;
+try {
+  SESSION_SECRET_VALUE = assertSessionSecretConfigured();
+} catch (e) {
+  console.error(e && e.message ? e.message : e);
+  process.exit(1);
+}
+
+app.set("trust proxy", resolveTrustProxySetting());
+
+function resolveHttpBodyLimitDefault() {
+  const raw = process.env.HTTP_BODY_LIMIT_DEFAULT;
+  return raw != null && String(raw).trim() ? String(raw).trim() : "512kb";
+}
+
+function resolveHttpBodyLimitImport() {
+  const raw = process.env.HTTP_BODY_LIMIT_IMPORT;
+  return raw != null && String(raw).trim() ? String(raw).trim() : "15mb";
+}
+
+const jsonBodyParserDefault = express.json({ limit: resolveHttpBodyLimitDefault() });
+const jsonBodyParserLarge = express.json({ limit: resolveHttpBodyLimitImport() });
+const urlencodedBodyParserDefault = express.urlencoded({
+  extended: true,
+  limit: resolveHttpBodyLimitDefault(),
+});
+
+/** Routes that may send large JSON (imports). Add future data-import paths here. */
+function requestUsesLargeJsonBody(req) {
+  const method = req.method;
+  if (method !== "POST" && method !== "PUT" && method !== "PATCH") return false;
+  const p = typeof req.path === "string" ? req.path : "";
+  if (p === "/api/config-import") return true;
+  if (p === "/api/federation/inbox") return true;
+  if (p === "/api/federation/peers/import-config") return true;
+  if (/^\/api\/profiles\/[^/]+\/import-data$/.test(p)) return true;
+  return false;
+}
+
+function parseRequestJsonBody(req, res, next) {
+  const parser = requestUsesLargeJsonBody(req) ? jsonBodyParserLarge : jsonBodyParserDefault;
+  parser(req, res, next);
+}
+
+app.use(parseRequestJsonBody);
+app.use(urlencodedBodyParserDefault);
 app.use(
   session({
-    secret: process.env.SESSION_SECRET || "elenko-session-secret",
+    secret: SESSION_SECRET_VALUE,
     resave: false,
     saveUninitialized: false,
-    cookie: { httpOnly: true },
+    cookie: resolveSessionCookieOptions(),
   })
 );
 
 app.use(enforceSessionInactivityTimeout);
+app.use(csrfTokenMiddleware);
+app.use(enforceCsrfToken);
 
 app.use(async (req, res, next) => {
   const isSetupPath = req.path === "/setup" || req.path === "/setup/change-couchdb-password";
@@ -9465,6 +9682,7 @@ app.post("/login", loginKeyFileParser, async (req, res) => {
         "Invalid username or password."
       );
     }
+    await regenerateSessionAsync(req);
     const keyResult = applyKeyFileToSession(req, user, uploadedKey);
     if (!keyResult.ok) {
       return completeFailedLogin(
@@ -9478,6 +9696,7 @@ app.post("/login", loginKeyFileParser, async (req, res) => {
     clearLoginFailureThrottle(req);
     req.session.user = user.username;
     req.session.role = (user.role === "user" ? "editor" : user.role) || "editor";
+    rotateSessionCsrfToken(req);
     touchSessionActivity(req);
     if (keyResult.keyFileUnlocked && user.keyFile) {
       try {
@@ -9505,6 +9724,7 @@ app.post("/login", loginKeyFileParser, async (req, res) => {
 
 app.get("/logout", (req, res) => {
   clearUserMasterKey(req.sessionID);
+  clearCsrfClientCookie(req, res);
   req.session.destroy(() => {});
   res.redirect("/login");
 });
@@ -9512,18 +9732,20 @@ app.get("/logout", (req, res) => {
 app.get("/account/unlock-keyfile", async (req, res) => {
   if (!req.session || !req.session.user) return res.redirect("/login");
   const appUi = await getAppUiConfig();
-  res.set("Content-Type", "text/html; charset=utf-8").send(renderUnlockKeyFilePage(null, appUi, req.session));
+  const csrf = getClientCsrfToken(req);
+  res.set("Content-Type", "text/html; charset=utf-8").send(renderUnlockKeyFilePage(null, appUi, req.session, csrf));
 });
 
 app.post("/account/unlock-keyfile", loginKeyFileParser, async (req, res) => {
   if (!req.session || !req.session.user) return res.redirect("/login");
   const appUi = await getAppUiConfig();
+  const csrf = getClientCsrfToken(req);
   const username = req.session.user;
   const uploadedKey = req.file && req.file.buffer ? req.file.buffer : null;
   if (!uploadedKey || uploadedKey.length === 0) {
     return res
       .set("Content-Type", "text/html; charset=utf-8")
-      .send(renderUnlockKeyFilePage("Choose your key file.", appUi, req.session));
+      .send(renderUnlockKeyFilePage("Choose your key file.", appUi, req.session, csrf));
   }
   try {
     const result = await db.find({ selector: { type: "elenko_user", username }, limit: 1 });
@@ -9531,18 +9753,18 @@ app.post("/account/unlock-keyfile", loginKeyFileParser, async (req, res) => {
     if (!user) {
       return res
         .set("Content-Type", "text/html; charset=utf-8")
-        .send(renderUnlockKeyFilePage("User not found.", appUi, req.session));
+        .send(renderUnlockKeyFilePage("User not found.", appUi, req.session, csrf));
     }
     if (!userKeyFileRegistered(user)) {
       return res
         .set("Content-Type", "text/html; charset=utf-8")
-        .send(renderUnlockKeyFilePage("No key file is registered for your account.", appUi, req.session));
+        .send(renderUnlockKeyFilePage("No key file is registered for your account.", appUi, req.session, csrf));
     }
     const verified = verifyKeyFileBlob(uploadedKey, user.keyFile);
     if (!verified.ok) {
       return res
         .set("Content-Type", "text/html; charset=utf-8")
-        .send(renderUnlockKeyFilePage(verified.error || "Invalid key file.", appUi, req.session));
+        .send(renderUnlockKeyFilePage(verified.error || "Invalid key file.", appUi, req.session, csrf));
     }
     setUserMasterKey(req.sessionID, verified.masterKey);
     req.session.keyFileRegistered = true;
@@ -9558,7 +9780,7 @@ app.post("/account/unlock-keyfile", loginKeyFileParser, async (req, res) => {
     console.error("Unlock key file error:", err);
     return res
       .set("Content-Type", "text/html; charset=utf-8")
-      .send(renderUnlockKeyFilePage("Could not verify key file.", appUi, req.session));
+      .send(renderUnlockKeyFilePage("Could not verify key file.", appUi, req.session, csrf));
   }
 });
 
@@ -9790,11 +10012,13 @@ app.post("/api/profiles/:id/link-to-start-layout", requireAdmin, async (req, res
 
 app.get("/account/change-password", async (req, res) => {
   const appUi = await getAppUiConfig();
-  res.set("Content-Type", "text/html; charset=utf-8").send(renderChangePasswordPage(null, appUi));
+  const csrf = getClientCsrfToken(req);
+  res.set("Content-Type", "text/html; charset=utf-8").send(renderChangePasswordPage(null, appUi, csrf));
 });
 
 app.post("/account/change-password", async (req, res) => {
   const appUi = await getAppUiConfig();
+  const csrf = getClientCsrfToken(req);
   const current = (req.body && req.body.currentPassword) || "";
   const newPass = (req.body && req.body.newPassword) || "";
   const confirm = (req.body && req.body.confirmPassword) || "";
@@ -9803,12 +10027,12 @@ app.post("/account/change-password", async (req, res) => {
   if (!newPass || newPass.length < 1) {
     return res
       .set("Content-Type", "text/html; charset=utf-8")
-      .send(renderChangePasswordPage("New password is required.", appUi));
+      .send(renderChangePasswordPage("New password is required.", appUi, csrf));
   }
   if (newPass !== confirm) {
     return res
       .set("Content-Type", "text/html; charset=utf-8")
-      .send(renderChangePasswordPage("New password and confirmation do not match.", appUi));
+      .send(renderChangePasswordPage("New password and confirmation do not match.", appUi, csrf));
   }
   try {
     const result = await db.find({ selector: { type: "elenko_user", username }, limit: 1 });
@@ -9816,7 +10040,13 @@ app.post("/account/change-password", async (req, res) => {
     if (!user || !verifyPassword(current, user.passwordHash, user.salt)) {
       return res
         .set("Content-Type", "text/html; charset=utf-8")
-        .send(renderChangePasswordPage("Current password is incorrect.", appUi));
+        .send(renderChangePasswordPage("Current password is incorrect.", appUi, csrf));
+    }
+    const policy = validateUserPassword(newPass, { username });
+    if (!policy.ok) {
+      return res
+        .set("Content-Type", "text/html; charset=utf-8")
+        .send(renderChangePasswordPage(policy.error, appUi, csrf));
     }
     const { hash, salt } = hashPassword(newPass);
     user.passwordHash = hash;
@@ -9827,7 +10057,7 @@ app.post("/account/change-password", async (req, res) => {
     console.error("Change password error:", err);
     res
       .set("Content-Type", "text/html; charset=utf-8")
-      .send(renderChangePasswordPage("An error occurred. Please try again.", appUi));
+      .send(renderChangePasswordPage("An error occurred. Please try again.", appUi, csrf));
   }
 });
 
@@ -9835,7 +10065,8 @@ app.get("/account/couchdb-password", requireAdmin, async (req, res) => {
   const appUi = await getAppUiConfig();
   const err = typeof req.query.err === "string" ? req.query.err : null;
   const ok = typeof req.query.ok === "string" ? req.query.ok : null;
-  res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, err, ok));
+  const csrf = getClientCsrfToken(req);
+  res.set("Content-Type", "text/html; charset=utf-8").send(renderCouchDbPasswordPage(appUi, err, ok, undefined, false, csrf));
 });
 
 app.post("/account/couchdb-password", requireAdmin, async (req, res) => {
@@ -10919,9 +11150,10 @@ app.get("/account/users/create", requireAdmin, async (req, res) => {
   const appUi = await getAppUiConfig();
   const created = req.query.created === "1";
   const keyfileToken = typeof req.query.keyfileToken === "string" ? req.query.keyfileToken.trim() : "";
+  const csrf = getClientCsrfToken(req);
   res
     .set("Content-Type", "text/html; charset=utf-8")
-    .send(renderCreateUserPage(null, created, appUi, keyfileToken));
+    .send(renderCreateUserPage(null, created, appUi, keyfileToken, csrf));
 });
 
 app.get("/account/users/keyfile-download", requireAdmin, (req, res) => {
@@ -10949,16 +11181,21 @@ app.post("/account/users/create", requireAdmin, async (req, res) => {
   const generateKeyFile = !!(req.body && (req.body.generateKeyFile === "1" || req.body.generateKeyFile === "on" || req.body.generateKeyFile === true));
   const enforceKeyLogin = !!(req.body && (req.body.enforceKeyLogin === "1" || req.body.enforceKeyLogin === "on" || req.body.enforceKeyLogin === true));
   const appUi = await getAppUiConfig();
+  const csrf = getClientCsrfToken(req);
   if (!username) {
-    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username is required.", false, appUi));
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username is required.", false, appUi, "", csrf));
   }
   if (password.length < 1) {
-    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Password is required.", false, appUi));
+    return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Password is required.", false, appUi, "", csrf));
   }
   try {
     const existing = await db.find({ selector: { type: "elenko_user", username }, limit: 1 });
     if (existing.docs && existing.docs.length > 0) {
-      return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username already exists.", false, appUi));
+      return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("Username already exists.", false, appUi, "", csrf));
+    }
+    const policy = validateUserPassword(password, { username });
+    if (!policy.ok) {
+      return res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage(policy.error, false, appUi, "", csrf));
     }
     const { hash, salt } = hashPassword(password);
     const userDoc = {
@@ -10983,7 +11220,7 @@ app.post("/account/users/create", requireAdmin, async (req, res) => {
     res.redirect("/account/users/create?created=1");
   } catch (err) {
     console.error("Create user error:", err);
-    res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("An error occurred. Please try again.", false, appUi));
+    res.set("Content-Type", "text/html; charset=utf-8").send(renderCreateUserPage("An error occurred. Please try again.", false, appUi, "", csrf));
   }
 });
 
@@ -11019,6 +11256,10 @@ app.put("/api/account/users/:id", requireAdmin, async (req, res) => {
       doc.enforceKeyLogin = !!req.body.enforceKeyLogin;
     }
     if (typeof newPassword === "string" && newPassword.length > 0) {
+      const policy = validateUserPassword(newPassword, { username: doc.username });
+      if (!policy.ok) {
+        return res.status(400).json({ error: policy.error });
+      }
       const { hash, salt } = hashPassword(newPassword);
       doc.passwordHash = hash;
       doc.salt = salt;
@@ -24803,10 +25044,12 @@ function renderLoginPage(errorMessage, appUi) {
 </html>`;
 }
 
-function renderChangePasswordPage(errorMessage, appUi) {
+function renderChangePasswordPage(errorMessage, appUi, csrfToken) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const err = errorMessage ? `<p class="login-err">${escapeHtml(errorMessage)}</p>` : "";
+  const pwHint = escapeHtml(getUserPasswordPolicyHint());
+  const csrfField = csrfHiddenInputField(csrfToken);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -24833,10 +25076,12 @@ function renderChangePasswordPage(errorMessage, appUi) {
   <h1>Change password</h1>
   ${err}
   <form method="post" action="/account/change-password">
+    ${csrfField}
     <label for="currentPassword">Current password</label>
     <input type="password" id="currentPassword" name="currentPassword" required autofocus>
     <label for="newPassword">New password</label>
     <input type="password" id="newPassword" name="newPassword" required>
+    <p class="sub" style="margin-top:0.25rem;">${pwHint}</p>
     <label for="confirmPassword">Confirm new password</label>
     <input type="password" id="confirmPassword" name="confirmPassword" required>
     <button type="submit" class="btn">Change password</button>
@@ -24846,12 +25091,13 @@ function renderChangePasswordPage(errorMessage, appUi) {
 </html>`;
 }
 
-function renderCouchDbPasswordPage(appUi, errorMessage, successMessage, formAction, isSetupFlow) {
+function renderCouchDbPasswordPage(appUi, errorMessage, successMessage, formAction, isSetupFlow, csrfToken) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const err = errorMessage ? `<p class="msg err">${escapeHtml(errorMessage)}</p>` : "";
   const ok = successMessage ? `<p class="msg ok">${escapeHtml(successMessage)}</p>` : "";
   const action = formAction || "/account/couchdb-password";
+  const csrfField = isSetupFlow ? "" : csrfHiddenInputField(csrfToken);
   const sub = isSetupFlow
     ? "You are connected with the default password. Set a new password below; it will be saved to CouchDB and to the bootstrap file so the app can connect after restart."
     : "Change the password for the CouchDB <code>admin</code> user. The new password is written to CouchDB, then verified by reconnecting. The encrypted bootstrap file and Application config are updated so the app can connect after restart.";
@@ -24887,6 +25133,7 @@ function renderCouchDbPasswordPage(appUi, errorMessage, successMessage, formActi
   ${err}
   ${ok}
   <form method="post" action="${escapeHtml(action)}">
+    ${csrfField}
     <label for="currentPassword">Current CouchDB password</label>
     <input type="password" id="currentPassword" name="currentPassword" required autofocus autocomplete="current-password"${isSetupFlow ? ' placeholder="admin"' : ""}>
     <label for="newPassword">New password</label>
@@ -26649,7 +26896,7 @@ function renderManageUsersPage(users, currentUsername, appUi) {
 <body>
   <div class="actions"><a href="/" class="app-back-start">← Start</a> <a href="/account/users/create" class="btn">Create user</a></div>
   <h1>Manage users</h1>
-  <p class="sub">Change role, key file, enforce key login, set password, or delete users. Upload an existing <code>elenko-&lt;username&gt;.key</code> file to register the same key on this instance (user must have no key yet).</p>
+  <p class="sub">Change role, key file, enforce key login, set password, or delete users. Upload an existing <code>elenko-&lt;username&gt;.key</code> file to register the same key on this instance (user must have no key yet). Password rules: ${escapeHtml(getUserPasswordPolicyHint())}</p>
   <table>
     <thead>
       <tr>
@@ -26878,10 +27125,11 @@ function renderKeyFileDownloadPage(filename, token) {
 </html>`;
 }
 
-function renderUnlockKeyFilePage(errorMessage, appUi, session) {
+function renderUnlockKeyFilePage(errorMessage, appUi, session, csrfToken) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const err = errorMessage ? `<p class="login-err">${escapeHtml(errorMessage)}</p>` : "";
+  const csrfField = csrfHiddenInputField(csrfToken);
   const registered = session && session.keyFileRegistered;
   const unlocked = session && session.keyFileUnlocked;
   const status = unlocked
@@ -26915,6 +27163,7 @@ function renderUnlockKeyFilePage(errorMessage, appUi, session) {
   ${status}
   ${err}
   ${registered && !unlocked ? `<form method="post" action="/account/unlock-keyfile" enctype="multipart/form-data">
+    ${csrfField}
     <label for="keyFile">Key file</label>
     <input type="file" id="keyFile" name="keyFile" accept=".key,application/octet-stream" required>
     <button type="submit" class="btn">Load key file</button>
@@ -26924,10 +27173,12 @@ function renderUnlockKeyFilePage(errorMessage, appUi, session) {
 </html>`;
 }
 
-function renderCreateUserPage(errorMessage, created, appUi, keyfileToken) {
+function renderCreateUserPage(errorMessage, created, appUi, keyfileToken, csrfToken) {
   const theme = normalizeAppTheme(appUi && appUi.theme);
   const themeVars = getAppThemeVars(theme);
   const err = errorMessage ? `<p class="login-err">${escapeHtml(errorMessage)}</p>` : "";
+  const pwHint = escapeHtml(getUserPasswordPolicyHint());
+  const csrfField = csrfHiddenInputField(csrfToken);
   const createdMsg = created ? '<p class="msg ok">User created.</p>' : "";
   const token = typeof keyfileToken === "string" ? keyfileToken.trim() : "";
   const keyDownloadMsg =
@@ -26967,10 +27218,12 @@ function renderCreateUserPage(errorMessage, created, appUi, keyfileToken) {
   ${keyDownloadMsg}
   ${err}
   <form method="post" action="/account/users/create">
+    ${csrfField}
     <label for="username">Username</label>
     <input type="text" id="username" name="username" required autofocus>
     <label for="password">Password</label>
     <input type="password" id="password" name="password" required>
+    <p class="sub" style="margin-top:0.25rem;">${pwHint}</p>
     <label for="role">Role</label>
     <select id="role" name="role">
       <option value="editor">editor</option>
@@ -27125,6 +27378,17 @@ function slugifyForApiKeyId(name) {
 
 /** Log JSON body parse failures (e.g. strict mode, invalid token at position 1) and return JSON for /api/*. */
 app.use((err, req, res, next) => {
+  if (err && err.type === "entity.too.large") {
+    const large = requestUsesLargeJsonBody(req);
+    const limitHint = large ? resolveHttpBodyLimitImport() : resolveHttpBodyLimitDefault();
+    if (wantsJsonApiResponse(req)) {
+      return res.status(413).json({
+        error: `Request body too large (limit ${limitHint} for this route).`,
+      });
+    }
+    if (res.headersSent) return next(err);
+    return res.status(413).send(renderErrorPage(`Request body too large (limit ${limitHint}).`));
+  }
   if (err && err.status === 400 && err.type === "entity.parse.failed") {
     const raw = typeof err.body === "string" ? err.body : "";
     const first = raw.length > 0 ? raw[0] : "";
